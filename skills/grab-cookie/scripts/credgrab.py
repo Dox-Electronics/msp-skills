@@ -94,7 +94,9 @@ def resolve_path(p: str, base: Path) -> Path:
     keeps $HOMEDRIVE and $HOMEPATH intact for expandvars to handle.
     """
     p = _HOME_VAR.sub(lambda _: str(Path.home()), p) if "HOME" not in os.environ else p
-    expanded = os.path.expandvars(p)
+    # expanduser too: `~/.config/x` is the other way a profile names the home
+    # directory, and Path() never expands it -- it would land at <base>/~/...
+    expanded = os.path.expanduser(os.path.expandvars(p))
     q = Path(expanded)
     return q if q.is_absolute() else (base / q)
 
@@ -261,7 +263,10 @@ def render_wire(wire: dict, values: dict[str, str]) -> str:
 
 
 def _placeholders(template: str) -> list[str]:
-    return re.findall(r"\{([A-Z0-9_]+)\}", template)
+    # Case-insensitive: a store_as derived from a cookie name such as
+    # `SDLR_DEV_COOKIE_sdLastLoginMethod` was never substituted, and the
+    # consumer file shipped the literal placeholder as the cookie value.
+    return re.findall(r"\{([A-Za-z0-9_]+)\}", template)
 
 
 
@@ -686,6 +691,14 @@ def cmd_selfcheck(live: bool = False) -> int:
         "lines": ["A={A}", "B={B}"],
     }
     assert render_wire(wire_env, {"A": "1"}) == "# test\nA=1\nB=\n", render_wire(wire_env, {"A": "1"})
+    # A store_as taken from a mixed-case cookie name must still substitute;
+    # the uppercase-only scanner shipped the literal placeholder as the value.
+    mixed = {"type": "template-file", "template": "c={SESSION_sdLastLogin}\n"}
+    got = render_wire(mixed, {"SESSION_sdLastLogin": "v1"})
+    assert got == "c=v1\n", got
+    # `~` must resolve to the home directory, never to <base>/~.
+    tilde = resolve_path("~/credgrab-selfcheck.txt", Path("/nonexistent-base"))
+    assert tilde == Path.home() / "credgrab-selfcheck.txt", tilde
     # An env-file is regenerated from scratch, so do_wire must REFUSE to
     # overwrite a file holding settings this profile does not own rather than
     # silently destroying them.

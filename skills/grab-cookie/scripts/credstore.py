@@ -57,6 +57,14 @@ def target_name(service: str, account: str) -> str:
     return f"credgrab/{service}/{account}"
 
 
+def keychain_service(service: str) -> str:
+    """macOS Keychain service name. A generic password is keyed on the
+    (account, service) pair, so the bare service name collided with connect-tool
+    storing the same service/account -- and `-U` would silently overwrite its
+    entry. Same `credgrab/` prefix as target_name() on Windows."""
+    return f"credgrab/{service}"
+
+
 # Below this length, the last 4 characters are a meaningful FRACTION of the
 # secret (at 4 they are the whole thing), so the receipt omits them.
 MIN_LEN_FOR_LAST4 = 12
@@ -86,7 +94,7 @@ def _mac_store(service: str, account: str, value: str) -> None:
     # -U updates in place. The value is in argv here; that is the documented,
     # accepted local-only residual (references/security-model.md).
     r = subprocess.run(["/usr/bin/security", "add-generic-password", "-U",
-                        "-a", account, "-s", service, "-w", value],
+                        "-a", account, "-s", keychain_service(service), "-w", value],
                        capture_output=True, text=True, shell=False)
     if r.returncode != 0:
         raise CredError("keychain write failed")
@@ -106,7 +114,7 @@ def _mac_fetch(service: str, account: str) -> str | None:
     decode. Both outputs are captured and neither is ever printed.
     """
     g = subprocess.run(["/usr/bin/security", "find-generic-password",
-                        "-a", account, "-s", service, "-g"],
+                        "-a", account, "-s", keychain_service(service), "-g"],
                        capture_output=True, shell=False)
     if g.returncode != 0:
         return None
@@ -116,7 +124,7 @@ def _mac_fetch(service: str, account: str) -> str | None:
         except (ValueError, UnicodeDecodeError):
             raise CredError("stored credential is not valid UTF-8")
     r = subprocess.run(["/usr/bin/security", "find-generic-password",
-                        "-a", account, "-s", service, "-w"],
+                        "-a", account, "-s", keychain_service(service), "-w"],
                        capture_output=True, text=True, shell=False)
     if r.returncode != 0:
         return None
@@ -128,7 +136,7 @@ def _mac_fetch(service: str, account: str) -> str | None:
 
 def _mac_delete(service: str, account: str) -> bool:
     r = subprocess.run(["/usr/bin/security", "delete-generic-password",
-                        "-a", account, "-s", service],
+                        "-a", account, "-s", keychain_service(service)],
                        capture_output=True, text=True, shell=False)
     return r.returncode == 0
 
@@ -295,6 +303,16 @@ def _selfcheck(live: bool = False) -> None:
         pass
     assert target_name("HALOPSA_API_KEY", "halopsa") == \
         "credgrab/HALOPSA_API_KEY/halopsa"
+    # Keychain entries carry the same namespace, so they cannot collide with
+    # connect-tool's bare (account, service) pair on macOS.
+    assert keychain_service("HALOPSA_API_KEY") == "credgrab/HALOPSA_API_KEY"
+    # Every Keychain call must go through keychain_service(). One bare "-s"
+    # service left behind (a delete, say) would act on connect-tool's entry.
+    import inspect
+    for fn in (_mac_store, _mac_fetch, _mac_delete):
+        src = inspect.getsource(fn)
+        assert '"-s", service' not in src, f"{fn.__name__} bypasses keychain_service()"
+        assert '"-s", keychain_service(service)' in src, fn.__name__
 
     if not live:
         print("credstore.py selfcheck OK (offline: redaction + blob round-trip, no live creds)")

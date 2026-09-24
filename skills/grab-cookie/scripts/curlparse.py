@@ -127,6 +127,20 @@ def _iter_flag_values(text: str):
         c = text[i]
         # Skip a quoted run that is not preceded by one of our flags: whatever
         # is inside belongs to that value, not to the command line.
+        # An ANSI-C run ($'...') escapes its own quote as \', so the skip must
+        # step over a backslash and the character after it, exactly as the
+        # flag branch below does. Without this the skip stopped at \' and
+        # whatever followed inside the body (e.g. -H "authorization: ...")
+        # parsed as a real flag -- and Chrome puts --data-raw last, so it won.
+        if c == "$" and text.startswith("$'", i):
+            j = i + 2
+            while j < n and text[j] != "'":
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                j += 1
+            i = j + 1
+            continue
         if c == "'":
             j = i + 1
             while j < n and text[j] != "'":
@@ -279,7 +293,24 @@ def _selfcheck() -> None:
             '  -Headers @{"x-realm"="nope"; "authorization"="Bearer zzz"}')
     assert parse_headers(pwsh) == {}, "Invoke-WebRequest must not parse as curl"
 
-    print("curlparse.py selfcheck OK (bash/cmd/backtick quoting, ANSI-C, -b + cookie header)")
+    # 10. A request body cannot choose the credential. Chrome's bash flavour
+    #     writes a body containing ' in ANSI-C form with the quote escaped as
+    #     \', and puts --data-raw last. The skip over that body must honour the
+    #     escape, or the -H inside it parses as a real header and, by source
+    #     order, overrides the real one. (Reported on Servosity/msp-skills#206.)
+    attack = (r"""curl 'https://x' -H 'authorization: Bearer REAL' """
+              r"""--data-raw $'x\' -H "authorization: Bearer ATTACKER"'""")
+    h = parse_headers(attack)
+    assert h.get("authorization") == "Bearer REAL", h
+
+    # 11. Benign twin of 10: an escaped quote inside an ANSI-C body must not
+    #     swallow the real header that follows it.
+    benign = r"""curl 'https://x' --data-raw $'{"note":"it\'s done"}' -H 'x-realm: after'"""
+    h = parse_headers(benign)
+    assert h.get("x-realm") == "after", h
+
+    print("curlparse.py selfcheck OK (bash/cmd/backtick quoting, ANSI-C, -b + cookie header, "
+          "ANSI-C body cannot inject a header)")
 
 
 if __name__ == "__main__":

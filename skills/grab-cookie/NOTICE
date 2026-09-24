@@ -13,8 +13,10 @@ fork rather than a copy. The differences, so a reviewer does not have to
 assume a one-line edit:
 
 - **Credential-store namespace** in `target_name()`: `credgrab/<service>/<account>`
-  instead of `Servosity/connect-tool/<service>/<account>`, so the two Skills do
-  not write over each other's entries. This is also the prefix to search for in
+  instead of `Servosity/connect-tool/<service>/<account>`, and on macOS in
+  `keychain_service()`: Keychain service `credgrab/<service>` instead of the bare
+  service name, so the two Skills do not write over each other's entries on
+  either platform. This is also the prefix to search for in
   the Windows Credential Manager UI when you want to find or revoke an entry,
   and the entry's `Comment` field carries the bare literal `credgrab`.
 - **`_selfcheck(live=False)`**: the round-trip against the real credential store
