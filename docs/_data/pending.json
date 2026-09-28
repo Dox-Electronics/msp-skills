@@ -198,7 +198,7 @@
   "hubspot": {
     "state": "up-to-date",
     "version": "0.1.6",
-    "latest_tag": "hubspot-v0.1.6",
+    "latest_tag": "hubspot-v0.2.0",
     "current_hash": "sha256:9731f5877dcffc6043b0e60cd34155bc079fab63da62ad4f286ae3203188d927",
     "released_hash": "sha256:9731f5877dcffc6043b0e60cd34155bc079fab63da62ad4f286ae3203188d927"
   },
