@@ -23,6 +23,16 @@
         "https://github.com/Servosity/msp-skills/actions/runs/33463027952"
       ],
       "shipped_as": "xero-v0.1.4"
+    },
+    {
+      "tag": "sentinelone-v0.2.0",
+      "date": "2026-09-28",
+      "why": "release probe refused the build: MCP main lacked var version. The 4.32.5 reprint graft hardcoded \"0.0.0-dev\" in server.NewMCPServer, so -X main.version was a silent no-op and the linux-amd64 initialize probe answered serverInfo.version='0.0.0-dev'. The release never sealed; the stranded DRAFT (20 of 25 assets) was deleted. The git tag remains (ruleset-protected) and the number is retired.",
+      "evidence": [
+        "https://github.com/Servosity/msp-skills/actions/runs/36472932792",
+        "https://github.com/Servosity/msp-skills/pull/343"
+      ],
+      "shipped_as": "sentinelone-v0.2.1"
     }
   ]
 }

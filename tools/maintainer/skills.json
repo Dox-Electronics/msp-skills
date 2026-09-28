@@ -1418,8 +1418,8 @@
       "tagline": "Triage threats, find protection gaps, and catch overnight fleet drift across every SentinelOne tenant by asking.",
       "cli_hash": "sha256:e091267027efecd0d9afeefff3a166382f222094a425d9fecd2bbf0eef6d610b",
       "template_version": 3,
-      "version": "0.2.0",
-      "cli_hash_at_release": "sha256:e091267027efecd0d9afeefff3a166382f222094a425d9fecd2bbf0eef6d610b",
+      "version": "0.2.1",
+      "cli_hash_at_release": "sha256:58e4ac5b3a5aa8178e8570ee7730d59ed6b3a954c558a0352eff32f6ce135840",
       "has_video": true,
       "live_verified": {
         "status": "live-verified",

@@ -334,6 +334,31 @@
      "not_contains": "bfd9070c1afa88516d3cdfd722e62fe433e42bad"
     }
    ]
+  },
+  {
+   "id": "mcp-server-version-from-ldflags",
+   "summary": "cmd/sentinelone-mcp/main.go declares `var version = \"0.0.0-dev\"` and passes it to server.NewMCPServer, so release.yml's `-X main.version=<tag>` stamps the real release into serverInfo.version (issue #322, PR #323)",
+   "why": "The 4.32.5 reprint graft (PR #343) dropped the `var version` declaration and hardcoded \"0.0.0-dev\" in the NewMCPServer call, although the press template main_mcp.go.tmpl at v4.32.5 emits the var. The Go linker silently ignores -X for a symbol that does not exist (build exit 0, no warning), so release.yml's stamp could never land; the Release run for sentinelone-v0.2.0 (https://github.com/Servosity/msp-skills/actions/runs/36472932792) refused the build when the initialize probe answered serverInfo.version='0.0.0-dev', and 0.2.0 was burned. Proven locally with a real initialize JSON-RPC over stdio: after the fix `go build -ldflags '-X main.version=9.9.9'` answers 9.9.9. code_only because the explanatory comment above the var names the ldflags mechanism; the assert must be satisfied by the declaration itself.",
+   "status": "active",
+   "spec_encode_followup": "None needed at the press: main_mcp.go.tmpl already emits the var and passes it. The loss was in the reprint graft, so this entry guards the next graft; retire it after a reprint confirms the var survives natively.",
+   "asserts": [
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "contains": "var version = \"0.0.0-dev\"",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "contains": "\t\tversion,",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "not_contains": "\t\t\"0.0.0-dev\","
+    }
+   ]
   }
  ]
 }

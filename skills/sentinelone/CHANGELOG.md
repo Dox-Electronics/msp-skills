@@ -4,7 +4,9 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
-## [0.2.0] - 2026-09-28
+## [0.2.1] - 2026-09-28
+
+0.2.0 was tagged but never published: the release probe refused its MCP binary, which reported `serverInfo.version` 0.0.0-dev because the reprint dropped `var version` from the MCP entry point. That is restored (and recorded in `handfixes.json`), and 0.2.1 is the first release of this reprint.
 
 ### Changed
 - **Reprinted on cli-printing-press 4.32.5** (was 4.24.0). Every generated file under `cli/` was regenerated on the current engine and the connector's recorded hand-fixes were re-applied on top (`handfixes.json`; all entries pass). The SentinelOne analysis commands (`threats triage`, `threats mttr`, `threats verdicts`, `threats recurrence`, `threats blast-radius`, `fleet-health`, `coverage-gaps`, `exclusions-audit`, `posture`, `ranger-exposure`, `sites-risk`, `versions rollout`, `whatchanged`, `agents dossier`) are unchanged.
