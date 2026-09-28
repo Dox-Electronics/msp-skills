@@ -399,11 +399,11 @@
     "released_hash": "sha256:c74b9f70dfa00153c3082b954f8ff1439cf732a4019f6f2bd27419a4f4a99e90"
   },
   "sentinelone": {
-    "state": "up-to-date",
-    "version": "0.1.5",
+    "state": "version-pending",
+    "version": "0.2.0",
     "latest_tag": "sentinelone-v0.1.5",
-    "current_hash": "sha256:eafa613b1f738f42bb1f3e09fc2d57057638cf52af043f05415c9def2d296748",
-    "released_hash": "sha256:eafa613b1f738f42bb1f3e09fc2d57057638cf52af043f05415c9def2d296748"
+    "current_hash": "sha256:d7a9c09f299684621978a266b80b8c853c61c167640979917d8d070f68cd28cb",
+    "released_hash": "sha256:d7a9c09f299684621978a266b80b8c853c61c167640979917d8d070f68cd28cb"
   },
   "servosity": {
     "state": "up-to-date",

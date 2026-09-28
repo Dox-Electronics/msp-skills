@@ -4,6 +4,25 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.2.0] - 2026-09-28
+
+### Changed
+- **Reprinted on cli-printing-press 4.32.5** (was 4.24.0). Every generated file under `cli/` was regenerated on the current engine and the connector's recorded hand-fixes were re-applied on top (`handfixes.json`; all entries pass). The SentinelOne analysis commands (`threats triage`, `threats mttr`, `threats verdicts`, `threats recurrence`, `threats blast-radius`, `fleet-health`, `coverage-gaps`, `exclusions-audit`, `posture`, `ranger-exposure`, `sites-risk`, `versions rollout`, `whatchanged`, `agents dossier`) are unchanged.
+- **Breaking: three firewall-control commands moved.** On the old engine `firewall-control copy-rules`, `move-rules` and `set-location` were groups whose only subcommand was `by-category`, and the plain endpoints could not be reached. Now `firewall-control copy-rules` / `move-rules` / `set-location` call the plain endpoints, and the by-category operations are `firewall-control item-copy-rules by-category`, `item-move-rules by-category` and `item-set-location by-category`. The old spelling is refused with a message naming the new command, and nothing is sent. MCP tool names are unchanged.
+- **Two fleet security fixes are now engine-native instead of hand-carried.** MCP tool-call values travel glued to their flag (`--flag=value`, 0.1.5) and the MCP server refuses filesystem-destination arguments (`--db`, `--output`, ..., 0.1.4); both are emitted by the 4.32.5 engine. The connector still carries the wider destination floor, the usage-text rule that fails the build when a regeneration grows a new local-path flag, and its tests.
+- **`--agent` no longer implies `--yes`.** It still sets `--json --compact --no-input --no-color`; pass `--yes` explicitly when a command asks for confirmation.
+- **Companion CLI in the bundle and a real MCP version.** The `.mcpb` ships `sentinelone-cli` next to `sentinelone-mcp`, and `initialize` reports this release's version.
+
+### Added
+- **Remote transport.** `sentinelone-mcp --transport http` serves MCP over streamable HTTP behind `Authorization: Bearer <SENTINELONE_MCP_HTTP_TOKEN>`, binds loopback (`127.0.0.1:7777`) by default and refuses a plaintext bind on a non-loopback address unless `--tls-cert` / `--tls-key` are given. mcp-install.md describes the tunnel setup.
+- **Self-learning loop** (engine feature): `recall`, `teach`, `teach-pattern`, `teach-lookup`, `teach-playbook`, `learnings` (`list`, `candidates`, `confirm`, `reject`, `forget`, `purge`, `stats`) and `playbook` (`list`, `amend`). Everything it records stays in the local SQLite store; nothing is sent to SentinelOne or anywhere else. Opt out with `--no-learn` or `SENTINELONE_NO_LEARN=true`.
+- **Install prompts** now also declare the three optional variables the 4.32.5 binaries read: `SENTINELONE_MCP_HTTP_TOKEN` (bearer token for `--transport http`), `SENTINELONE_USER_AGENT` (User-Agent override; leave blank) and `PRINTING_PRESS_CLIENT_PROFILE` (only relevant to a tenant-gated profile; leave blank).
+
+### Fixed
+- **MCP HTTP listener sets a header-read deadline** (`ReadHeaderTimeout` 10s), so a client that opens a connection and never finishes its headers cannot pin the `--transport http` listener. Recorded in `handfixes.json`.
+- **`doctor` info rows.** The engine now skips informational keys natively when evaluating `--fail-on`; the connector's placeholder refusal and real credential probe are re-applied and gated by `check_doctor_truth.py`.
+- **Auth header.** SentinelOne requires `Authorization: ApiToken <token>`; the engine still emits the bare token, so the prefix is re-applied (and a token pasted with the prefix is not doubled). This was a silent hand-fix since the first print and is now recorded in `handfixes.json`.
+
 ## [0.1.5] - 2026-09-10
 
 ### Fixed
