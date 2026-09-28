@@ -685,10 +685,16 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
             value = as_literal(element)
             if value is not None:
                 out.add(value)
-            else:
-                # A non-literal element (`[]string{"A", secretName}`) is resolved
-                # like any other expression; dropping it would hide a read.
+            elif RE_IDENT.match(element.strip()):
+                # A named element (`[]string{"A", secretName}`) resolves through
+                # its binding; dropping it would hide a read.
                 out |= resolve(element, pkg, env_prefix, scope, depth + 1, seen)
+            else:
+                # Any other element (a call, a slice expression, a concat) is
+                # UNRESOLVED: the call resolver accepts trailing expressions
+                # (`pick()[:13]`), so recursing here could name the wrong
+                # variable and look complete.
+                out.add(UNRESOLVED)
         return out or {UNRESOLVED}
 
     parts = split_top(expr, "+")
@@ -1531,7 +1537,7 @@ _fixture(
     'var names = []string{\n\tpick([]string{"x"}),\n\t"COVE_PASSWORD",\n}\n'
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
-    {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
+    {"COVE_PASSWORD"}, {"name"},
 )
 _fixture(
     "multi-line []string with a quoted '}' is not truncated into a falsely complete binding",
@@ -1540,7 +1546,7 @@ _fixture(
     'var names = []string{\n\tpick("}"),\n\t"COVE_PASSWORD",\n}\n'
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
-    {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
+    {"COVE_PASSWORD"}, {"name"},
 )
 _fixture(
     "multi-line []string followed by an index/concat is not bound as the bare literal",
@@ -1548,6 +1554,15 @@ _fixture(
     'func a() string {\n\tname := []string{\n\t\t"CODEX_THREAD_ID",\n\t}[0] + "_PASSWORD"\n'
     '\treturn os.Getenv(name)\n}\n',
     set(), {"name"},
+)
+_fixture(
+    "multi-line []string with a sliced call element keeps the read reported",
+    'package cli\nimport "os"\n'
+    'func pick() string {\n\treturn "COVE_PASSWORD_UNUSED"\n}\n'
+    'var names = []string{\n\t"CODEX_THREAD_ID",\n\tpick()[:13],\n}\n'
+    'func a() string {\n\tfor _, name := range names {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
