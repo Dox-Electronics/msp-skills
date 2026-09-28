@@ -212,7 +212,7 @@
   "huntress": {
     "state": "up-to-date",
     "version": "0.1.5",
-    "latest_tag": "huntress-v0.1.5",
+    "latest_tag": "huntress-v0.1.6",
     "current_hash": "sha256:e99e0197119b3d680835f1851183baacf102334df778d9734fcbf861444196a3",
     "released_hash": "sha256:e99e0197119b3d680835f1851183baacf102334df778d9734fcbf861444196a3"
   },
