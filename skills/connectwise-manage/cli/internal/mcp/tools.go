@@ -733,7 +733,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 		"api":         "connectwise-manage",
 		"description": "Every ConnectWise PSA workflow from the terminal — with a typed conditions query builder, offline SQLite sync, and cross-entity views (unbilled work, account 360, board triage) the PSA web UI can't give you.",
 		"archetype":   "project-management",
-		"tool_count":  468,
+		"tool_count":  471,
 		// tool_surface tells agents which surface a capability lives on.
 		"tool_surface": "MCP exposes typed endpoint tools plus a runtime mirror of user-facing CLI commands. Endpoint tools keep typed schemas; command-mirror tools shell out to the companion connectwise-manage-cli binary.",
 		"auth": map[string]any{
@@ -766,7 +766,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 			{
 				"name":        "procurement",
 				"description": "Manage procurement",
-				"endpoints":   []string{"delete-products-by-id", "delete-purchaseorders-by-id", "delete-purchaseorders-by-parent-id-lineitems", "get-products", "get-products-by-id", "get-products-by-parent-id-components", "get-products-by-parent-id-picking-shipping-details", "get-products-count", "get-purchaseorders", "get-purchaseorders-by-id", "get-purchaseorders-by-id-info", "get-purchaseorders-by-parent-id-lineitems", "get-purchaseorders-count", "get-purchaseorders-info", "get-purchaseorders-info-count", "patch-products-by-id", "patch-purchaseorders-by-id", "post-products", "post-products-by-id-detach", "post-products-by-parent-id-components", "post-products-by-parent-id-picking-shipping-details", "post-purchaseorders", "post-purchaseorders-by-id-copy", "post-purchaseorders-by-id-rebatch", "post-purchaseorders-by-id-unbatch", "post-purchaseorders-by-parent-id-lineitems", "post-purchaseorders-by-parent-id-notes", "put-products-by-id", "put-purchaseorders-by-id"},
+				"endpoints":   []string{"delete-products-by-id", "delete-purchaseorders-by-id", "delete-purchaseorders-by-parent-id-lineitems", "get-catalog", "get-catalog-by-id", "get-catalog-count", "get-products", "get-products-by-id", "get-products-by-parent-id-components", "get-products-by-parent-id-picking-shipping-details", "get-products-count", "get-purchaseorders", "get-purchaseorders-by-id", "get-purchaseorders-by-id-info", "get-purchaseorders-by-parent-id-lineitems", "get-purchaseorders-count", "get-purchaseorders-info", "get-purchaseorders-info-count", "patch-products-by-id", "patch-purchaseorders-by-id", "post-products", "post-products-by-id-detach", "post-products-by-parent-id-components", "post-products-by-parent-id-picking-shipping-details", "post-purchaseorders", "post-purchaseorders-by-id-copy", "post-purchaseorders-by-id-rebatch", "post-purchaseorders-by-id-unbatch", "post-purchaseorders-by-parent-id-lineitems", "post-purchaseorders-by-parent-id-notes", "put-products-by-id", "put-purchaseorders-by-id"},
 				"syncable":    true,
 				"searchable":  true,
 			},

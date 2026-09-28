@@ -454,6 +454,54 @@
      "code_only": true
     }
    ]
+  },
+  {
+   "id": "procurement-catalog-endpoints",
+   "summary": "procurement get-catalog / get-catalog-by-id / get-catalog-count + MCP index entries + opt-in `procurement-catalog` sync resource (issue #335)",
+   "why": "The 2026-05-29 spec trim kept procurement/products and purchaseorders but dropped /procurement/catalog, so MSPs could not read the product catalog (#335). Grafted from a 4.24.0 regen of the trimmed spec widened with GET /procurement/catalog, /{id}, /count (manuscripts/connectwise-manage/20260928-issue335-catalog/cwm-spec.json). Deliberate divergences from that regen: the generator made `procurement` (the products sync resource) point at /procurement/catalog and renamed products to `procurement-products`, and moved the list/get aliases from products to catalog; both would silently break existing users, so the catalog is a NEW `procurement-catalog` resource and products keeps its name and aliases. The catalog commands also cache under `procurement-catalog` (not `procurement`) so write-through never lands catalog rows in the products table. A reprint must use the widened spec AND re-apply these divergences.",
+   "status": "active",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/procurement_get-catalog.go",
+     "contains": "\"auto\", \"procurement-catalog\", path",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/procurement_get-catalog-by-id.go",
+     "contains": "\"auto\", \"procurement-catalog\", path",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/procurement_get-catalog-count.go",
+     "contains": "\"auto\", \"procurement-catalog-count\", path",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/procurement.go",
+     "contains": "newProcurementGetCatalogCmd(flags)",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/procurement_get-products.go",
+     "contains": "Aliases:     []string{\"list\"}",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/sync.go",
+     "contains": "\"procurement-catalog\":                   \"/procurement/catalog\"",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/sync.go",
+     "contains": "\"procurement\":                           \"/procurement/products\"",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/mcp/code_orch.go",
+     "contains": "ID:             \"procurement.get-catalog\"",
+     "min_count": 1
+    }
+   ]
   }
  ]
 }

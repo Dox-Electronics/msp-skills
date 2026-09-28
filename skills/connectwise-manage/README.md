@@ -147,7 +147,7 @@ export CW_SITE=<region host, e.g. api-na.myconnectwise.net, or your on-prem host
 connectwise-manage-cli doctor
 ```
 
-`doctor` confirms the credentials work before you run anything that touches data. It exits 0 even when the credential is rejected, so scripts should add `--fail-on error`. The API Member's security role is the permission boundary - scope it to what you want the AI to reach.
+`doctor` confirms the credentials work before you run anything that touches data. It exits 0 even when the credential is rejected, so scripts should add `--fail-on error`. The API Member's security role is the permission boundary - scope it to what you want the AI to reach. Reading the product catalog (`procurement get-catalog`, `sync --resources procurement-catalog`) needs Procurement > Product Catalog inquire rights on that role, or ConnectWise refuses the catalog calls.
 
 
 ## What this skill does

@@ -293,6 +293,9 @@ These capabilities aren't available in any other tool for this API.
 - `connectwise-manage-cli procurement delete-products-by-id`  -  Delete ProductItem
 - `connectwise-manage-cli procurement delete-purchaseorders-by-id`  -  Delete PurchaseOrder
 - `connectwise-manage-cli procurement delete-purchaseorders-by-parent-id-lineitems`  -  Delete PurchaseOrderLineItem
+- `connectwise-manage-cli procurement get-catalog`  -  Get List of CatalogItem
+- `connectwise-manage-cli procurement get-catalog-by-id`  -  Get CatalogItem
+- `connectwise-manage-cli procurement get-catalog-count`  -  Get Count of CatalogItem
 - `connectwise-manage-cli procurement get-products`  -  Get List of ProductItem
 - `connectwise-manage-cli procurement get-products-by-id`  -  Get ProductItem
 - `connectwise-manage-cli procurement get-products-by-parent-id-components`  -  Get List of ProductComponent
