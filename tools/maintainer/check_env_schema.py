@@ -454,6 +454,13 @@ class GoPackage(Scope):
 
 
 RE_ASSIGN = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(.+?)[\t ]*$")
+# A package-level (or local) `var names = []string{` whose literal spans several
+# lines. RE_ASSIGN stops at the end of the first line and binds the useless
+# opener `[]string{`; this binds the whole literal so a reader that ranges over
+# the var (`for _, name := range JournalHarnessSessionEnvVars { os.Getenv(name) }`,
+# printing-press 4.32.5+ internal/learn/journal.go) resolves to its element
+# names instead of being reported as an unresolvable read.
+RE_ASSIGN_SLICE = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(\[\]string\s*\{[^}]*\})")
 RE_RANGE_LIT = re.compile(r"for\s+[\w,\s_]*?([A-Za-z_]\w*)\s*:=\s*range\s+(\[\]string\{[^}]*\}|[A-Za-z_]\w*)")
 RE_FUNC = re.compile(r"(?m)^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(")
 # A function LITERAL. Go's `name := func(args) { ... }` is a callable helper with
@@ -536,10 +543,17 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
         pkg.spans[path] = spans
         pkg.decl_sites[path] = decls
 
-        for regex, group in ((RE_ASSIGN, 2), (RE_RANGE_LIT, 2)):
+        for regex, group in ((RE_ASSIGN, 2), (RE_ASSIGN_SLICE, 2), (RE_RANGE_LIT, 2)):
             for m in regex.finditer(src):
+                rhs = m.group(group)
+                if regex is RE_ASSIGN and rhs.rstrip().endswith("{"):
+                    # An unterminated composite-literal opener (`[]string{` on a
+                    # line of its own); RE_ASSIGN_SLICE binds the whole literal.
+                    # Binding the opener too would make every element read look
+                    # partly unresolved.
+                    continue
                 scope = pkg.func_at(path, m.start()) or pkg
-                scope.bind(m.group(1), m.group(group))
+                scope.bind(m.group(1), rhs)
 
         for m in RE_FIELD.finditer(src):
             scope = pkg.func_at(path, m.start()) or pkg
@@ -1432,6 +1446,14 @@ _fixture(
     'package cli\nimport (\n\t"os"\n\t"strings"\n)\n'
     'func a() string { return os.Getenv(strings.Join([]string{"COVE", "PASSWORD"}, "_")) }\n',
     set(), {"strings.Join([]string{\"COVE\", \"PASSWORD\"}, \"_\")"},
+)
+_fixture(
+    "package-level multi-line []string var ranged by the reader (4.32.5 journal.go shape)",
+    'package learn\nimport "os"\n'
+    'var JournalHarnessSessionEnvVars = []string{\n\t"CODEX_THREAD_ID",\n\t"CLAUDE_SESSION_ID",\n}\n'
+    'func a() string {\n\tfor _, name := range JournalHarnessSessionEnvVars {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    {"CODEX_THREAD_ID", "CLAUDE_SESSION_ID"}, set(),
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
