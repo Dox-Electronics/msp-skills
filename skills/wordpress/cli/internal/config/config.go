@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,12 +17,13 @@ import (
 )
 
 type Config struct {
-	BaseURL            string            `toml:"base_url"`
-	AuthHeaderVal      string            `toml:"auth_header"`
-	Headers            map[string]string `toml:"headers,omitempty"`
-	AuthSource         string            `toml:"-"`
-	CredentialSource   string            `toml:"-"`
-	AgentcookieManaged bool              `toml:"-"`
+	BaseURL            string                      `toml:"base_url"`
+	AuthHeaderVal      string                      `toml:"auth_header"`
+	Headers            map[string]string           `toml:"headers,omitempty"`
+	AuthSource         string                      `toml:"-"`
+	CredentialSource   string                      `toml:"-"`
+	AgentcookieManaged bool                        `toml:"-"`
+	CredentialRefusals []cliutil.CredentialRefusal `toml:"-"`
 	// configOwner records which on-disk file parseConfigData populated this
 	// config from ("config-kind path" or "legacy config path") so the
 	// credential-source fallback below reports where config-stored
@@ -40,6 +42,20 @@ type Config struct {
 	envOverrides       map[string]bool `toml:"-"`
 	fileConfig         *Config         `toml:"-"`
 	WordpressBasicAuth string          `toml:"basic_auth"`
+	// credentialsFile is the sibling data/credentials.toml of an explicit
+	// config file. Load reads it first, so save and clear must use it too, or
+	// set-token writes one store while the next Load keeps reading a stale
+	// token from the other (hand-fix explicit-config-credentials-one-path).
+	credentialsFile string `toml:"-"`
+}
+
+// CredentialsFilePath is the credentials file this config reads and writes:
+// the explicit config's sibling data/credentials.toml, else the global one.
+func (c *Config) CredentialsFilePath() (string, error) {
+	if c != nil && c.credentialsFile != "" {
+		return c.credentialsFile, nil
+	}
+	return cliutil.CredentialsFilePath()
 }
 
 func Load(configPath string) (*Config, error) {
@@ -53,10 +69,35 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Path = path
+	if explicitConfigFile {
+		if credsPath, credsErr := cliutil.CredentialsFilePathForConfig(path); credsErr == nil {
+			cfg.credentialsFile = credsPath
+		}
+	}
 
 	if explicitConfigFile {
-		if err := readConfigFile(path, cfg, "config-kind path"); err != nil && !os.IsNotExist(err) {
-			return nil, err
+		// Keep non-secret settings from a readable config even when its permissions
+		// have drifted, but never trust credentials from that file. Canonicalizing
+		// first also makes a symlink inherit the target's permission verdict.
+		if real, evalErr := filepath.EvalSymlinks(path); evalErr == nil {
+			credentialPermErr := cliutil.VerifyCredsPerms(real)
+			parsed := *cfg
+			if err := readConfigFile(path, &parsed, "config-kind path"); err != nil {
+				if !os.IsNotExist(err) {
+					return nil, err
+				}
+			} else {
+				if credentialPermErr != nil && parsed.hasCredentialFields() {
+					parsed.addCredentialRefusal(cliutil.CredentialRefusal{
+						Source:             "config-kind path",
+						Path:               path,
+						Err:                credentialPermErr,
+						CredentialsPresent: true,
+					})
+					parsed.clearCredentialFields()
+				}
+				*cfg = parsed
+			}
 		}
 	} else {
 		legacyPath, err := LegacyConfigPath()
@@ -68,7 +109,8 @@ func Load(configPath string) (*Config, error) {
 			if !os.IsNotExist(err) {
 				return nil, err
 			}
-		} else {
+		} else if real, evalErr := filepath.EvalSymlinks(sourcePath); evalErr == nil {
+			credentialPermErr := cliutil.VerifyCredsPerms(real)
 			owner := "config-kind path"
 			if sourcePath == legacyPath {
 				owner = "legacy config path"
@@ -81,6 +123,15 @@ func Load(configPath string) (*Config, error) {
 					return nil, err
 				}
 			} else {
+				if credentialPermErr != nil && parsed.hasCredentialFields() {
+					parsed.addCredentialRefusal(cliutil.CredentialRefusal{
+						Source:             owner,
+						Path:               sourcePath,
+						Err:                credentialPermErr,
+						CredentialsPresent: true,
+					})
+					parsed.clearCredentialFields()
+				}
 				*cfg = parsed
 				if sourcePath == legacyPath {
 					cfg.legacySourcePath = legacyPath
@@ -92,16 +143,39 @@ func Load(configPath string) (*Config, error) {
 	if cfg.AgentcookieManagedByExternalStore() {
 		cfg.markAgentcookieManaged()
 	} else {
-		creds, ok, err := cliutil.LoadCredentials()
-		if err != nil {
-			return nil, err
-		}
-		if ok && creds.HasValues() {
-			cfg.clearCredentialFields()
-			cfg.applyCredentials(creds)
-			if cfg.hasCredentialFields() {
-				cfg.AuthSource = "config"
-				cfg.CredentialSource = "credentials file"
+		var creds *cliutil.Credentials
+		var ok bool
+		credentialsRefused := false
+		if !cfg.hasCompleteCredentialFields() {
+			if explicitConfigFile {
+				var status cliutil.CredentialLoadStatus
+				creds, status, err = cliutil.LoadCredentialsForConfigWithStatus(path)
+				if err != nil {
+					return nil, err
+				}
+				ok = status.Loaded
+				if status.Refusal != nil {
+					cfg.addCredentialRefusal(*status.Refusal)
+					credentialsRefused = status.Refusal.CredentialsPresent
+				}
+			}
+			if (!ok || creds == nil || !creds.HasValues()) && !credentialsRefused {
+				var status cliutil.CredentialLoadStatus
+				creds, status, err = cliutil.LoadCredentialsWithStatus()
+				if err != nil {
+					return nil, err
+				}
+				ok = status.Loaded
+				if status.Refusal != nil {
+					cfg.addCredentialRefusal(*status.Refusal)
+				}
+			}
+			if ok && creds.HasValues() {
+				cfg.applyCredentials(creds)
+				if cfg.hasCredentialFields() {
+					cfg.AuthSource = "config"
+					cfg.CredentialSource = "credentials file"
+				}
 			}
 		}
 	}
@@ -109,7 +183,7 @@ func Load(configPath string) (*Config, error) {
 	cfg.snapshotFileConfig()
 
 	// Env var overrides
-	if v := os.Getenv("WORDPRESS_BASIC_AUTH"); v != "" {
+	if v := cliutil.EnvOverride("WORDPRESS_BASIC_AUTH"); v != "" {
 		cfg.WordpressBasicAuth = v
 		cfg.markEnvOverride("WordpressBasicAuth")
 		cfg.AuthSource = "env:WORDPRESS_BASIC_AUTH"
@@ -154,7 +228,7 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	// Base URL override (used by printing-press verify to point at mock/test servers)
-	if v := os.Getenv("WORDPRESS_BASE_URL"); v != "" {
+	if v := cliutil.EnvOverride("WORDPRESS_BASE_URL"); v != "" {
 		cfg.BaseURL = v
 	}
 	return cfg, nil
@@ -205,6 +279,37 @@ func FileHasCredentialFields(path string) (bool, error) {
 	return cfg.hasCredentialFields(), nil
 }
 
+func (c *Config) addCredentialRefusal(refusal cliutil.CredentialRefusal) {
+	if c == nil || !refusal.CredentialsPresent {
+		return
+	}
+	c.CredentialRefusals = append(c.CredentialRefusals, refusal)
+	cliutil.ReportCredentialRefusal(refusal)
+}
+
+func (c *Config) HasCredentialRefusals() bool {
+	return c != nil && len(c.CredentialRefusals) > 0
+}
+
+func (c *Config) CredentialRefusalSummaries() []string {
+	if c == nil || len(c.CredentialRefusals) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.CredentialRefusals))
+	for _, refusal := range c.CredentialRefusals {
+		out = append(out, refusal.Error())
+	}
+	return out
+}
+
+func (c *Config) CredentialRefusalError() error {
+	summaries := c.CredentialRefusalSummaries()
+	if len(summaries) == 0 {
+		return nil
+	}
+	return fmt.Errorf("stored credentials refused: %s", strings.Join(summaries, "; "))
+}
+
 func (c *Config) AuthHeader() string {
 	if c.AuthHeaderVal != "" {
 		return c.AuthHeaderVal
@@ -224,17 +329,67 @@ func (c *Config) AuthHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(credentials))
 }
 
+func (c *Config) StoreScopeCredential() string {
+	if c == nil {
+		return ""
+	}
+	if header := c.AuthHeader(); header != "" {
+		return header
+	}
+
+	var parts []string
+	if c.AuthHeaderVal != "" {
+		parts = append(parts, "auth_header="+c.AuthHeaderVal)
+	}
+	if c.RefreshToken != "" {
+		parts = append(parts, "refresh_token="+c.RefreshToken)
+	}
+	if c.AccessToken != "" {
+		parts = append(parts, "access_token="+c.AccessToken)
+	}
+	if c.ClientID != "" {
+		parts = append(parts, "client_id="+c.ClientID)
+	}
+	if c.ClientSecret != "" {
+		parts = append(parts, "client_secret="+c.ClientSecret)
+	}
+	if c.WordpressBasicAuth != "" {
+		parts = append(parts, "basic_auth="+c.WordpressBasicAuth)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n")
+}
+
+// Raw browser-session values count as credentials even when no header
+// representation exists; hand-coded flows may also preserve a working header.
+func (c *Config) CredentialConfigured() bool {
+	if c == nil {
+		return false
+	}
+	return c.AuthHeader() != ""
+}
+
+var authFormatPlaceholderRe = regexp.MustCompile(`\{[A-Za-z0-9_]+\}`)
+
 func applyAuthFormat(format string, replacements map[string]string) string {
 	if format == "" {
 		return ""
 	}
-	for key, value := range replacements {
-		format = strings.ReplaceAll(format, "{"+key+"}", value)
-	}
-	if strings.Contains(format, "{") {
+	unresolved := false
+	out := authFormatPlaceholderRe.ReplaceAllStringFunc(format, func(match string) string {
+		value, ok := replacements[match[1:len(match)-1]]
+		if !ok {
+			unresolved = true
+			return match
+		}
+		return value
+	})
+	if unresolved {
 		return ""
 	}
-	return format
+	return out
 }
 
 func basicAuthPayload(format string, replacements map[string]string, appendColonForSingleToken bool) string {
@@ -285,6 +440,16 @@ func (c *Config) hasCredentialFields() bool {
 	return false
 }
 
+func (c *Config) hasCompleteCredentialFields() bool {
+	if c.AuthHeaderVal != "" {
+		return true
+	}
+	if c.WordpressBasicAuth == "" {
+		return false
+	}
+	return true
+}
+
 func (c *Config) clearCredentialFields() {
 	c.AuthHeaderVal = ""
 	c.AccessToken = ""
@@ -311,13 +476,27 @@ func (c *Config) applyCredentials(creds *cliutil.Credentials) {
 	if creds == nil {
 		return
 	}
-	c.AuthHeaderVal = creds.AuthHeaderVal
-	c.AccessToken = creds.AccessToken
-	c.RefreshToken = creds.RefreshToken
-	c.TokenExpiry = creds.TokenExpiry
-	c.ClientID = creds.ClientID
-	c.ClientSecret = creds.ClientSecret
-	c.WordpressBasicAuth = creds.WordpressBasicAuth
+	if c.AuthHeaderVal == "" {
+		c.AuthHeaderVal = creds.AuthHeaderVal
+	}
+	if c.AccessToken == "" {
+		c.AccessToken = creds.AccessToken
+	}
+	if c.RefreshToken == "" {
+		c.RefreshToken = creds.RefreshToken
+	}
+	if c.TokenExpiry.IsZero() {
+		c.TokenExpiry = creds.TokenExpiry
+	}
+	if c.ClientID == "" {
+		c.ClientID = creds.ClientID
+	}
+	if c.ClientSecret == "" {
+		c.ClientSecret = creds.ClientSecret
+	}
+	if c.WordpressBasicAuth == "" {
+		c.WordpressBasicAuth = creds.WordpressBasicAuth
+	}
 }
 
 func (c *Config) saveCredentialsFirst() error {
@@ -326,11 +505,133 @@ func (c *Config) saveCredentialsFirst() error {
 		return nil
 	}
 	persisted := c.configForSave()
-	if err := cliutil.SaveCredentials(persisted.credentials()); err != nil {
+	credsPath, err := c.CredentialsFilePath()
+	if err != nil {
+		return err
+	}
+	if err := cliutil.SaveCredentialsTo(credsPath, persisted.credentials()); err != nil {
 		return err
 	}
 	c.CredentialSource = "credentials file"
 	return nil
+}
+
+type credentialsSnapshot struct {
+	path          string
+	data          []byte
+	perm          os.FileMode
+	symlinkTarget string
+	missing       bool
+}
+
+// Credentials and config are separate files. Publishing tokens first would
+// otherwise leave a new credentials.toml if the config write fails.
+func (c *Config) saveCredentialsThenConfig() error {
+	credsPath, err := c.CredentialsFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(credsPath), 0o700); err != nil {
+		return err
+	}
+	return cliutil.WithFileLock(credsPath, func() error {
+		return c.saveCredentialsThenConfigLocked(credsPath)
+	})
+}
+
+func (c *Config) saveCredentialsThenConfigLocked(credsPath string) error {
+	snap, err := snapshotCredentialsFile(credsPath)
+	if err != nil {
+		return err
+	}
+	if err := c.saveCredentialsFirst(); err != nil {
+		return err
+	}
+	if err := c.save(); err != nil {
+		if restoreErr := restoreCredentialsFile(snap); restoreErr != nil {
+			return fmt.Errorf("%w (credentials file %s was replaced; restore failed: %v)", err, credsPath, restoreErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func snapshotCredentialsFile(path string) (credentialsSnapshot, error) {
+	snap := credentialsSnapshot{path: path}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			snap.missing = true
+			return snap, nil
+		}
+		return credentialsSnapshot{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return credentialsSnapshot{}, err
+		}
+		snap.symlinkTarget = target
+	}
+	targetInfo, err := os.Stat(path)
+	if err != nil {
+		return credentialsSnapshot{}, err
+	}
+	snap.perm = targetInfo.Mode().Perm()
+	data, err := os.ReadFile(filepath.Clean(path)) // #nosec G304 -- app-owned credentials path from cliutil.DataDir.
+	if err != nil {
+		return credentialsSnapshot{}, err
+	}
+	snap.data = data
+	return snap, nil
+}
+
+func restoreCredentialsFile(snap credentialsSnapshot) error {
+	if snap.path == "" {
+		return fmt.Errorf("credentials path unknown")
+	}
+	if snap.missing {
+		if err := os.Remove(snap.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if snap.symlinkTarget != "" {
+		if err := os.Remove(snap.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Symlink(snap.symlinkTarget, snap.path); err != nil {
+			return err
+		}
+		if err := os.WriteFile(snap.path, snap.data, 0o600); err != nil {
+			return err
+		}
+		if resolved, err := filepath.EvalSymlinks(snap.path); err == nil && snap.perm != 0 {
+			if err := os.Chmod(resolved, snap.perm); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	mode := snap.perm
+	if mode == 0 {
+		mode = 0o600
+	}
+	if err := cliutil.AtomicWritePrivateFile(snap.path, snap.data, mode, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(snap.path, mode)
+}
+
+// Explicit login flags intentionally opt these fields out of environment-value
+// filtering; capture their provenance before applying any fallback.
+func (c *Config) MarkCredentialsExplicit(clientID, clientSecret bool) {
+	if clientID {
+		delete(c.envOverrides, "ClientID")
+	}
+	if clientSecret {
+		delete(c.envOverrides, "ClientSecret")
+	}
 }
 
 func (c *Config) SaveTokens(clientID, clientSecret, accessToken, refreshToken string, expiry time.Time) error {
@@ -339,8 +640,6 @@ func (c *Config) SaveTokens(clientID, clientSecret, accessToken, refreshToken st
 	c.AccessToken = accessToken
 	c.RefreshToken = refreshToken
 	c.TokenExpiry = expiry
-	delete(c.envOverrides, "ClientID")
-	delete(c.envOverrides, "ClientSecret")
 	delete(c.envOverrides, "AccessToken")
 	delete(c.envOverrides, "RefreshToken")
 	delete(c.envOverrides, "TokenExpiry")
@@ -349,10 +648,7 @@ func (c *Config) SaveTokens(clientID, clientSecret, accessToken, refreshToken st
 	c.updateFileConfigField("AccessToken")
 	c.updateFileConfigField("RefreshToken")
 	c.updateFileConfigField("TokenExpiry")
-	if err := c.saveCredentialsFirst(); err != nil {
-		return err
-	}
-	return c.save()
+	return c.saveCredentialsThenConfig()
 }
 
 // SaveCredential persists a single API credential to the field that
@@ -377,10 +673,7 @@ func (c *Config) SaveCredential(token string) error {
 	c.WordpressBasicAuth = token
 	delete(c.envOverrides, "WordpressBasicAuth")
 	c.updateFileConfigField("WordpressBasicAuth")
-	if err := c.saveCredentialsFirst(); err != nil {
-		return err
-	}
-	return c.save()
+	return c.saveCredentialsThenConfig()
 }
 
 func (c *Config) ClearTokens() error {
@@ -418,8 +711,16 @@ func (c *Config) ClearTokens() error {
 		// back; returning early would leave the secrets on disk.
 		return c.save()
 	}
+	// Clear the global store (the pre-4.32 behaviour) and, under an explicit
+	// config, its sibling store too: Load prefers the sibling, so leaving it
+	// behind would keep the old token active after logout.
 	if err := cliutil.RemoveCredentials(); err != nil {
 		return err
+	}
+	if c.credentialsFile != "" {
+		if err := cliutil.RemoveCredentialsAt(c.credentialsFile); err != nil {
+			return err
+		}
 	}
 	return c.save()
 }

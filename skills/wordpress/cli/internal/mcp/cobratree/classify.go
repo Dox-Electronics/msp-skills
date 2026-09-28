@@ -11,8 +11,12 @@ import (
 )
 
 const (
-	EndpointAnnotation = "pp:endpoint"
-	HiddenAnnotation   = "mcp:hidden"
+	EndpointAnnotation    = "pp:endpoint"
+	HiddenAnnotation      = "mcp:hidden"
+	APIResourceAnnotation = "pp:api-resource"
+	// Sub-resource parents set this without APIResourceAnnotation; both
+	// classify as commandGroup so help-only parents are not MCP tools.
+	ParentGroupAnnotation = "pp:parent-group"
 	// ReadOnlyAnnotation, when set on a Cobra command to "true"/"1"/"yes",
 	// causes the runtime walker to register the resulting MCP tool with
 	// readOnlyHint=true. Use for novel CLI commands that don't mutate
@@ -20,6 +24,15 @@ const (
 	// Without it, hosts like Claude Desktop default to "could write or
 	// delete" and demand permission per call.
 	ReadOnlyAnnotation = "mcp:read-only"
+	// LocalWriteAnnotation, when set on a Cobra command to "true"/"1"/"yes",
+	// marks a command whose only writes land in the CLI's own local store
+	// (teach-style learn writes, playbook notes) - never external state and
+	// never user-visible files. The walker registers the resulting MCP tool
+	// with destructiveHint=false and openWorldHint=false; readOnlyHint stays
+	// unset because the command genuinely writes locally. Commands that
+	// delete user-visible data keep honest destructive semantics and must
+	// not carry this annotation.
+	LocalWriteAnnotation = "mcp:local-write"
 	// PositionalWriteSinksAnnotation lists zero-based positional argument
 	// indexes that write to user-visible files when populated. It is enforced
 	// only on commands that also carry ReadOnlyAnnotation.
@@ -31,6 +44,7 @@ type commandKind int
 const (
 	commandNovel commandKind = iota
 	commandEndpoint
+	commandGroup
 	commandFramework
 	commandHidden
 )
@@ -65,6 +79,7 @@ var frameworkCommands = map[string]bool{
 	"api":           true,
 	"auth":          true,
 	"completion":    true,
+	"context":       true,
 	"doctor":        true,
 	"feedback":      true,
 	"help":          true,
@@ -79,6 +94,9 @@ func classify(cmd *cobra.Command) commandKind {
 	}
 	if endpointID(cmd) != "" {
 		return commandEndpoint
+	}
+	if isGroupingParent(cmd) {
+		return commandGroup
 	}
 	if isTopLevelFrameworkCommand(cmd) {
 		return commandFramework
@@ -101,12 +119,20 @@ func endpointID(cmd *cobra.Command) string {
 	return strings.TrimSpace(cmd.Annotations[EndpointAnnotation])
 }
 
+func isGroupingParent(cmd *cobra.Command) bool {
+	return annotationIsTrue(cmd, APIResourceAnnotation) || annotationIsTrue(cmd, ParentGroupAnnotation)
+}
+
 func isMCPHidden(cmd *cobra.Command) bool {
 	return annotationIsTrue(cmd, HiddenAnnotation)
 }
 
 func isMCPReadOnly(cmd *cobra.Command) bool {
 	return annotationIsTrue(cmd, ReadOnlyAnnotation)
+}
+
+func isMCPLocalWrite(cmd *cobra.Command) bool {
+	return annotationIsTrue(cmd, LocalWriteAnnotation)
 }
 
 func positionalWriteSinkIndexes(cmd *cobra.Command) map[int]bool {

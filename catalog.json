@@ -1344,7 +1344,7 @@
       "cli_binary": "wordpress-cli",
       "mcp_binary": "wordpress-mcp",
       "version": "0.1.4",
-      "printing_press_version": "4.26.1",
+      "printing_press_version": "4.32.5",
       "license": "Apache-2.0",
       "vendor": "WordPress",
       "vendor_trademark_owner": "WordPress Foundation",

@@ -1053,9 +1053,10 @@
       "source": "./skills/wordpress",
       "description": "Publish and manage WordPress pages, posts, media",
       "version": "0.1.4",
-      "category": "msp",
+      "category": "marketing",
       "tags": [
         "wordpress",
+        "marketing",
         "msp",
         "mcp",
         "claude-code",

@@ -38,7 +38,9 @@ Add (or merge with your existing `mcpServers` block):
       "command": "wordpress-mcp",
       "env": {
         "WORDPRESS_BASE_URL": "https://wordpress.org/news/wp-json/wp/v2",
-        "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>"
+        "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>",
+        "WORDPRESS_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -64,7 +66,9 @@ Configuration**) and add:
       "command": "wordpress-mcp",
       "env": {
         "WORDPRESS_BASE_URL": "https://wordpress.org/news/wp-json/wp/v2",
-        "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>"
+        "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>",
+        "WORDPRESS_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -86,7 +90,9 @@ Claude Desktop:
       "command": "wordpress-mcp",
       "env": {
         "WORDPRESS_BASE_URL": "https://wordpress.org/news/wp-json/wp/v2",
-        "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>"
+        "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>",
+        "WORDPRESS_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -104,8 +110,10 @@ All remote agents need `wordpress-mcp` reachable as a public **HTTPS** endpoint.
 in HTTP mode with your credentials in the environment:
 
 ```bash
-WORDPRESS_BASE_URL=<value> WORDPRESS_BASIC_AUTH=<value> wordpress-mcp --transport http --addr :7777
+WORDPRESS_BASE_URL=<value> WORDPRESS_BASIC_AUTH=<value> WORDPRESS_MCP_HTTP_TOKEN=<value> wordpress-mcp --transport http --addr 127.0.0.1:7777
 ```
+
+Bind to loopback (`127.0.0.1:7777`) and let the tunnel terminate TLS: the server refuses a plaintext bind on any non-loopback address unless you pass `--tls-cert` and `--tls-key`. Every caller must send `Authorization: Bearer <WORDPRESS_MCP_HTTP_TOKEN>`; the server exits at start-up if that variable is unset.
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel
 (Cloudflare Tunnel, ngrok) or your own reverse proxy. The path is part of the

@@ -40,6 +40,18 @@
           "description": "Set the WORDPRESS_BASIC_AUTH credential for the WordPress MCP server.",
           "isRequired": true,
           "isSecret": true
+        },
+        {
+          "name": "WORDPRESS_MCP_HTTP_TOKEN",
+          "description": "Required only when running the MCP server with --transport http. Not needed for the default local stdio transport.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PRINTING_PRESS_CLIENT_PROFILE",
+          "description": "Binds this MCP server to one tenant-gated client profile. Leave blank to use the default client profile.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

@@ -16,7 +16,9 @@
       "args": [],
       "env": {
         "WORDPRESS_BASE_URL": "${user_config.wordpress_base_url}",
-        "WORDPRESS_BASIC_AUTH": "${user_config.wordpress_basic_auth}"
+        "WORDPRESS_BASIC_AUTH": "${user_config.wordpress_basic_auth}",
+        "WORDPRESS_MCP_HTTP_TOKEN": "${user_config.wordpress_mcp_http_token}",
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
       }
     }
   },
@@ -34,6 +36,19 @@
       "description": "Base URL for the Wordpress API. Leave the prefilled default unless your account uses a different regional or self-hosted host.",
       "required": false,
       "default": "https://wordpress.org/news/wp-json/wp/v2"
+    },
+    "wordpress_mcp_http_token": {
+      "type": "string",
+      "title": "MCP HTTP transport bearer token",
+      "description": "Required only when running the MCP server with --transport http (a remote/hosted deployment). Callers must send a matching Authorization: Bearer header. Not needed for the default local stdio transport that Claude Desktop uses.",
+      "required": false,
+      "sensitive": true
+    },
+    "printing_press_client_profile": {
+      "type": "string",
+      "title": "Client profile",
+      "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
+      "required": false
     }
   },
   "compatibility": {
@@ -44,10 +59,10 @@
       "win32"
     ]
   },
-  "printing_press_version": "4.26.1",
+  "printing_press_version": "4.32.5",
   "press_provenance": {
-    "printing_press_version": "4.26.1",
-    "generated_at": "2026-06-27T01:18:44.282349Z",
+    "printing_press_version": "4.32.5",
+    "generated_at": "2026-09-28T17:34:46.554404Z",
     "spec_checksum": "sha256:7efd069bd40698a46f760bcbd9d33637634feb6b533843978967547fefab213d",
     "spec_format": "internal"
   }
