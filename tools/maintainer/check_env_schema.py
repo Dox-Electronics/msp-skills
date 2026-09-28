@@ -1152,15 +1152,19 @@ def call_sites(src: str, name: str) -> list[tuple[int, list[str]]]:
     out = []
     needle = name
     start = 0
+    # Search string-blanked text (same offsets) so a call spelled inside a
+    # string or raw-string literal is never mistaken for a real one; the
+    # argument text is still sliced from the real source.
+    code = blank_strings(src)
     while True:
-        idx = src.find(needle, start)
+        idx = code.find(needle, start)
         if idx < 0:
             return out
         start = idx + len(needle)
-        before = src[idx - 1] if idx else " "
+        before = code[idx - 1] if idx else " "
         if RE_WORD_BOUNDARY.match(before):
             continue
-        rest = src[idx + len(needle):]
+        rest = code[idx + len(needle):]
         stripped = rest.lstrip()
         if not stripped.startswith("("):
             continue
@@ -1779,6 +1783,13 @@ _fixture(
                'func a() string { return cu.EnvOverride("COVE_BASE_URL") }\n',
     },
     {"COVE_BASE_URL"}, set(),
+)
+_fixture(
+    "a call spelled inside a raw-string literal is not a read",
+    'package cli\nimport "os"\n'
+    'var example = `os.Getenv("COVE_PASSWORD")`\n'
+    'func a() string { return os.Getenv("COVE_USERNAME") }\n',
+    {"COVE_USERNAME"}, set(),
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
