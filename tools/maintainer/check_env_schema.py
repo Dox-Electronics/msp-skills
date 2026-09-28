@@ -460,7 +460,11 @@ RE_ASSIGN = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)
 # the var (`for _, name := range JournalHarnessSessionEnvVars { os.Getenv(name) }`,
 # printing-press 4.32.5+ internal/learn/journal.go) resolves to its element
 # names instead of being reported as an unresolvable read.
-RE_ASSIGN_SLICE = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(\[\]string\s*\{[^}]*\})")
+# The body excludes '{' as well as '}': a nested literal (`pick([]string{"x"}),`)
+# would otherwise end the match at ITS closing brace and bind a truncated
+# literal that looks complete. A literal with nested braces is left unbound, so
+# its opener keeps RE_ASSIGN's unresolvable binding and the read stays reported.
+RE_ASSIGN_SLICE = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(\[\]string\s*\{[^{}]*\})")
 RE_RANGE_LIT = re.compile(r"for\s+[\w,\s_]*?([A-Za-z_]\w*)\s*:=\s*range\s+(\[\]string\{[^}]*\}|[A-Za-z_]\w*)")
 RE_FUNC = re.compile(r"(?m)^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(")
 # A function LITERAL. Go's `name := func(args) { ... }` is a callable helper with
@@ -1490,6 +1494,15 @@ _fixture(
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
     {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "multi-line []string with a NESTED literal is not truncated into a falsely complete binding",
+    'package cli\nimport "os"\n'
+    'func pick(v []string) string {\n\treturn "CODEX_THREAD_ID"\n}\n'
+    'var names = []string{\n\tpick([]string{"x"}),\n\t"COVE_PASSWORD",\n}\n'
+    'func a() string {\n\tfor _, name := range names {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    set(), {"name"},
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
