@@ -303,7 +303,7 @@
   "ninjaone": {
     "state": "up-to-date",
     "version": "0.1.14",
-    "latest_tag": "ninjaone-v0.1.14",
+    "latest_tag": "ninjaone-v0.1.15",
     "current_hash": "sha256:3c98f36d935348f52e07a429044a8b53a308c27ff7dbf97d3c7982e21d0c513c",
     "released_hash": "sha256:3c98f36d935348f52e07a429044a8b53a308c27ff7dbf97d3c7982e21d0c513c"
   },
