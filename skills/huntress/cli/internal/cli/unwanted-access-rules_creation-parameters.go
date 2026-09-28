@@ -16,10 +16,10 @@ func newUnwantedAccessRulesCreationParametersCmd(flags *rootFlags) *cobra.Comman
 	var bodyCategory string
 	var bodyCountryCode string
 	var bodyExpiresAt string
-	var bodyIdentityId string
+	var bodyIdentityId int
 	var bodyLogic string
 	var bodyNotes string
-	var bodyOrganizationId string
+	var bodyOrganizationId int
 	var bodyStartsAt string
 	var bodyType string
 	var bodyVpn string
@@ -30,27 +30,38 @@ func newUnwantedAccessRulesCreationParametersCmd(flags *rootFlags) *cobra.Comman
 		Aliases:     []string{"create"},
 		Short:       "Creates a new Unwanted Access Rule associated with your account, an organization, or a specific identity. **Rule logic.",
 		Example:     "  huntress-cli unwanted-access-rules creation-parameters --type expected",
-		Annotations: map[string]string{"pp:endpoint": "unwanted-access-rules.creation-parameters", "pp:method": "POST", "pp:path": "/v1/unwanted_access_rules"},
+		Annotations: map[string]string{"pp:endpoint": "unwanted-access-rules.creation-parameters", "pp:method": "POST", "pp:path": "/v1/unwanted_access_rules", "pp:requires-input": "true", "pp:happy-args": "--type=expected"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("type") && !flags.dryRun {
+				if !cmd.Flags().Changed("type") && bodyType == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "type")
 				}
 			}
+			path := "/v1/unwanted_access_rules"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/v1/unwanted_access_rules"
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -62,41 +73,42 @@ func newUnwantedAccessRulesCreationParametersCmd(flags *rootFlags) *cobra.Comman
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
-				if bodyCategory != "" {
-					body["category"] = bodyCategory
+				bodyMap := map[string]any{}
+				body = bodyMap
+				if cmd.Flags().Changed("category") || bodyCategory != "" {
+					bodyMap["category"] = bodyCategory
 				}
-				if bodyCountryCode != "" {
-					body["country_code"] = bodyCountryCode
+				if cmd.Flags().Changed("country-code") || bodyCountryCode != "" {
+					bodyMap["country_code"] = bodyCountryCode
 				}
-				if bodyExpiresAt != "" {
-					body["expires_at"] = bodyExpiresAt
+				if cmd.Flags().Changed("expires-at") || bodyExpiresAt != "" {
+					bodyMap["expires_at"] = bodyExpiresAt
 				}
-				if bodyIdentityId != "" {
-					body["identity_id"] = bodyIdentityId
+				if cmd.Flags().Changed("identity-id") || bodyIdentityId != 0 {
+					bodyMap["identity_id"] = bodyIdentityId
 				}
-				if bodyLogic != "" {
-					body["logic"] = bodyLogic
+				if cmd.Flags().Changed("logic") || bodyLogic != "" {
+					bodyMap["logic"] = bodyLogic
 				}
-				if bodyNotes != "" {
-					body["notes"] = bodyNotes
+				if cmd.Flags().Changed("notes") || bodyNotes != "" {
+					bodyMap["notes"] = bodyNotes
 				}
-				if bodyOrganizationId != "" {
-					body["organization_id"] = bodyOrganizationId
+				if cmd.Flags().Changed("organization-id") || bodyOrganizationId != 0 {
+					bodyMap["organization_id"] = bodyOrganizationId
 				}
-				if bodyStartsAt != "" {
-					body["starts_at"] = bodyStartsAt
+				if cmd.Flags().Changed("starts-at") || bodyStartsAt != "" {
+					bodyMap["starts_at"] = bodyStartsAt
 				}
-				if bodyType != "" {
-					body["type"] = bodyType
+				if cmd.Flags().Changed("type") || bodyType != "" {
+					bodyMap["type"] = bodyType
 				}
-				if bodyVpn != "" {
-					body["vpn"] = bodyVpn
+				if cmd.Flags().Changed("vpn") || bodyVpn != "" {
+					bodyMap["vpn"] = bodyVpn
 				}
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -161,6 +173,9 @@ func newUnwantedAccessRulesCreationParametersCmd(flags *rootFlags) *cobra.Comman
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -186,57 +201,75 @@ func newUnwantedAccessRulesCreationParametersCmd(flags *rootFlags) *cobra.Comman
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"country_code": true, "created_at": true, "expires_at": true, "id": true, "starts_at": true, "status": true, "type": true, "updated_at": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "unwanted-access-rules", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"country_code": true, "created_at": true, "expires_at": true, "id": true, "starts_at": true, "status": true, "type": true, "updated_at": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "unwanted-access-rules", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyCategory, "category", "", "Category that the catchall or exception applies to. Required when `logic` is provided.")
 	cmd.Flags().StringVar(&bodyCountryCode, "country-code", "", "ISO 3166-1 alpha-2 country code this rule should match. Provide for `standard` rules.")
 	cmd.Flags().StringVar(&bodyExpiresAt, "expires-at", "", "UTC date (YYYY-MM-DD) when the rule expires. Omit for `expected` rules that should never expire.")
-	cmd.Flags().StringVar(&bodyIdentityId, "identity-id", "", "Scope the rule to a specific identity. Mutually exclusive with `organization_id`.")
+	cmd.Flags().IntVar(&bodyIdentityId, "identity-id", 0, "Scope the rule to a specific identity. Mutually exclusive with `organization_id`.")
 	cmd.Flags().StringVar(&bodyLogic, "logic", "", "Rule logic.")
 	cmd.Flags().StringVar(&bodyNotes, "notes", "", "Optional free-text note to attach to the rule.")
-	cmd.Flags().StringVar(&bodyOrganizationId, "organization-id", "", "Scope the rule to an organization. Mutually exclusive with `identity_id`.")
+	cmd.Flags().IntVar(&bodyOrganizationId, "organization-id", 0, "Scope the rule to an organization. Mutually exclusive with `identity_id`.")
 	cmd.Flags().StringVar(&bodyStartsAt, "starts-at", "", "UTC date (YYYY-MM-DD) when the rule becomes active. Omit for `expected` rules that should start immediately.")
 	cmd.Flags().StringVar(&bodyType, "type", "", "Whether matching access is `expected` or `unauthorized`.")
 	cmd.Flags().StringVar(&bodyVpn, "vpn", "", "Tunnel operator name this rule should match. Provide for `standard` rules.")
