@@ -93,7 +93,7 @@
   "cipp": {
     "state": "up-to-date",
     "version": "0.1.6",
-    "latest_tag": "cipp-v0.1.6",
+    "latest_tag": "cipp-v0.1.7",
     "current_hash": "sha256:d12c14f79f65b58a7d5102230e03e9042232302d1ca1c69719bac2cc0734a81a",
     "released_hash": "sha256:d12c14f79f65b58a7d5102230e03e9042232302d1ca1c69719bac2cc0734a81a"
   },
