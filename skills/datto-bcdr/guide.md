@@ -4,6 +4,9 @@
 
 The Datto BCDR API is strictly per-device  -  to check backup health you query one appliance at a time. This CLI syncs every device, agent, share, and alert into a local store, then runs fleet-wide local joins: screenshots --failed surfaces every silently-unbootable backup, client-risk ranks your clients by composite risk, and storage-runway tells you which appliance fills up first. All read-only, all agent-native with --json and --select.
 
+Created by [@dstevens](https://github.com/dstevens) (Damien Stevens).
+Contributors: [@DamienStevens](https://github.com/DamienStevens) (Damien Stevens).
+
 ## Install
 
 This CLI ships as a Claude Code Skill and MCP server in [Servosity/msp-skills](https://github.com/Servosity/msp-skills). The installer downloads the `datto-bcdr-cli` and `datto-bcdr-mcp` binaries into `~/.local/bin` (macOS / Linux) or `%LOCALAPPDATA%\Programs\msp-skills` (Windows). It does not register the skill with your agent and writes no MCP client config - see [mcp-install.md](./mcp-install.md) for that wire-up.
@@ -60,9 +63,7 @@ To install:
 2. Double-click the `.mcpb` file. Claude Desktop opens and walks you through the install.
 3. Fill in `DATTO_BCDR_PUBLIC_KEY` when Claude Desktop prompts you.
 
-Requires Claude Desktop 1.0.0 or later. A bundle carries the five platform binaries the builder downloads - macOS (`darwin-arm64`, `darwin-amd64`), Linux (`linux-arm64`, `linux-amd64`) and Windows (`windows-amd64`). Windows on ARM is released as a standalone binary but is not bundled, so use the manual config below there.
-
-> **Claude Desktop bundle:** the `.mcpb` launches on macOS (Intel and Apple Silicon), Windows x64 and Linux x64. Every tool shells out to the companion `datto-bcdr-cli`. Releases cut from 2026-09-18 on ship that CLI inside the bundle; older bundles contain only the MCP server, so if yours lacks the companion, run the installer above first (or set `DATTO_BCDR_CLI_PATH` to an existing binary). Details: [#331](https://github.com/Servosity/msp-skills/issues/331).
+Requires Claude Desktop 1.0.0 or later. Pre-built bundles ship for macOS Apple Silicon (`darwin-arm64`) and Windows (`amd64`, `arm64`); for other platforms, use the manual config below.
 
 <details>
 <summary>Manual JSON config (advanced)</summary>
@@ -104,11 +105,14 @@ Datto BCDR uses HTTP Basic auth with a partner-generated key pair. Generate a pu
 # confirm your key pair is set and the API is reachable
 datto-bcdr-cli doctor
 
+
 # hydrate the local store with your entire fleet
 datto-bcdr-cli sync
 
+
 # the daily question: which backups are not provably bootable
 datto-bcdr-cli screenshots --failed
+
 
 # which clients are most at risk right now
 datto-bcdr-cli client-risk --top 10
@@ -120,6 +124,7 @@ datto-bcdr-cli client-risk --top 10
 These capabilities aren't available in any other tool for this API.
 
 ### Recovery Assurance
+
 - **`screenshots`**  -  See every protected machine whose last backup-bootability screenshot failed, across your entire fleet, ranked by how long it's been failing and grouped by client.
 
   _Reach for this first every morning  -  it surfaces silently-unbootable backups before a client ever needs to restore._
@@ -143,6 +148,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Fleet Health
+
 - **`client-risk`**  -  Per-client risk scorecard that rolls up screenshot failures, stale backups, open alerts, storage pressure, and warranty status into one ranked list of which clients are most at risk.
 
   _Reach for this when someone asks which clients are at risk  -  it answers the exact business question the per-device portal cannot._
@@ -166,6 +172,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Coverage Gaps
+
 - **`forgotten-assets`**  -  List agents that are paused or archived and devices that haven't checked in recently, across the whole fleet, so silently-unprotected machines and dead appliances get caught.
 
   _Reach for this to catch protection someone paused temporarily months ago, or an appliance that quietly went dark  -  gaps that never generate an alert._
@@ -182,6 +189,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Client Reporting
+
 - **`client-report`**  -  One QBR-ready health report for a single client: devices, agents, screenshot pass rate, stale backups, and open alerts in one bundled view.
 
   _Use when preparing a QBR or answering one client's are-we-protected question  -  the full single-client story in one command._
@@ -245,6 +253,55 @@ All open alerts across every appliance grouped by client, replacing a per-serial
 
 Run `datto-bcdr-cli --help` for the full command reference and flag list.
 
+## Paths & environment variables
+
+This CLI separates local files into four path kinds:
+
+| Kind | Contents |
+|------|----------|
+| `config` | User-editable settings such as `config.toml` and saved profiles |
+| `data` | Durable local data: `credentials.toml`, `data.db`, cookies, browser-session proof files, and other auth sidecars |
+| `state` | Runtime state such as persisted queries, jobs, and `teach.log` |
+| `cache` | Regenerable HTTP/cache files |
+
+Each kind resolves independently. The ladder is:
+
+1. Per-kind env var: `DATTO_BCDR_CONFIG_DIR`, `DATTO_BCDR_DATA_DIR`, `DATTO_BCDR_STATE_DIR`, or `DATTO_BCDR_CACHE_DIR`
+2. `--home <dir>` for this invocation
+3. `DATTO_BCDR_HOME` for a flat relocated root
+4. XDG env vars: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+5. Platform defaults matching existing installs
+
+For containers and agent sandboxes, prefer a single relocated root:
+
+```bash
+export DATTO_BCDR_HOME=/srv/datto-bcdr
+datto-bcdr-cli doctor
+```
+
+Under `DATTO_BCDR_HOME=/srv/datto-bcdr`, the four dirs resolve to `/srv/datto-bcdr/config`, `/srv/datto-bcdr/data`, `/srv/datto-bcdr/state`, and `/srv/datto-bcdr/cache`.
+
+MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
+
+```json
+{
+  "mcpServers": {
+    "datto-bcdr": {
+      "command": "datto-bcdr-mcp",
+      "env": {
+        "DATTO_BCDR_HOME": "/srv/datto-bcdr"
+      }
+    }
+  }
+}
+```
+
+Precedence matters in fleets: an ambient per-kind variable such as `DATTO_BCDR_DATA_DIR` overrides an explicit `--home` for that kind. Use `DATTO_BCDR_HOME` or the per-kind variables for durable fleet relocation; treat `--home` as the weaker per-invocation lever.
+
+Relocation is one-way. Unsetting `DATTO_BCDR_HOME` does not move files back to platform defaults, and `doctor` cannot find credentials left under a former root. Move the files manually before unsetting relocation variables.
+
+Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `datto-bcdr-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
+
 ## Commands
 
 ### agent
@@ -287,6 +344,23 @@ Virtualization / VM restore sessions on a device
 - **`datto-bcdr-cli vm-restore <serialNumber>`** - List VM restore sessions on a device
 
 
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`datto-bcdr-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`datto-bcdr-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`datto-bcdr-cli learnings list`** - Inspect taught rows
+- **`datto-bcdr-cli learnings forget <query>`** - Undo a teach
+- **`datto-bcdr-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`datto-bcdr-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`datto-bcdr-cli teach-pattern`** - Install a query/resource template up front
+- **`datto-bcdr-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `DATTO_BCDR_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `datto-bcdr-cli` opens the database, older binaries refuse it with a version error  -  upgrade the binary rather than downgrading.
+
 ## Output Formats
 
 ```bash
@@ -295,9 +369,8 @@ datto-bcdr-cli agent list
 
 # JSON for scripting and agents
 datto-bcdr-cli agent list --json
-
 # Filter to specific fields
-datto-bcdr-cli agent list --json --select id,name,status
+datto-bcdr-cli agent list --json --select agentName,localIp,os
 
 # Dry run  -  show the request without sending
 datto-bcdr-cli agent list --dry-run
@@ -312,7 +385,7 @@ This CLI is designed for AI agent consumption:
 
 - **Non-interactive** - never prompts, every input is a flag
 - **Pipeable** - `--json` output to stdout, errors to stderr
-- **Filterable** - `--select id,name` returns only fields you need
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
 - **Previewable** - `--dry-run` shows the request without sending
 - **Read-only by default** - this CLI does not create, update, delete, publish, send, or mutate remote resources
 - **Offline-friendly** - sync/search commands can use the local SQLite store when available
@@ -328,11 +401,21 @@ Set `DATTO_BCDR_NO_AUTO_REFRESH=1` to disable the pre-read freshness hook while 
 
 Covered command paths:
 - `datto-bcdr-cli agent`
-- `datto-bcdr-cli agent by-device`
 - `datto-bcdr-cli agent list`
+- `datto-bcdr-cli alert`
+- `datto-bcdr-cli alert get`
+- `datto-bcdr-cli alert list`
+- `datto-bcdr-cli alert search`
+- `datto-bcdr-cli asset`
+- `datto-bcdr-cli asset get`
+- `datto-bcdr-cli asset list`
 - `datto-bcdr-cli device`
 - `datto-bcdr-cli device get`
 - `datto-bcdr-cli device list`
+- `datto-bcdr-cli shares`
+- `datto-bcdr-cli shares get`
+- `datto-bcdr-cli shares list`
+- `datto-bcdr-cli shares search`
 
 JSON outputs that use the generated provenance envelope include freshness metadata at `meta.freshness`. This metadata describes the freshness decision for the covered command path; it does not claim full historical backfill or API-specific enrichment.
 
@@ -346,7 +429,7 @@ Verifies configuration, credentials, and connectivity to the API.
 
 ## Configuration
 
-Config file: `~/.config/datto-bcdr-cli/config.toml`
+Run `datto-bcdr-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/datto-bcdr-cli/config.toml`; `--home`, `DATTO_BCDR_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
 
@@ -359,7 +442,7 @@ Environment variables:
 
 ### agentcookie (optional)
 
-If you use agentcookie to sync secrets across machines, this CLI auto-adopts agentcookie-managed credentials with no extra setup. When the daemon writes to this CLI's config, `datto-bcdr-cli doctor` reports `agentcookie: detected` and `auth-status` labels the source as `agentcookie`. Skip this section if you don't use agentcookie - the CLI works the same as any other.
+If you use agentcookie to sync secrets across machines, this CLI auto-adopts agentcookie-managed credentials with no extra setup. When the daemon writes to this CLI's config, `datto-bcdr-cli doctor` reports `agentcookie: detected` and `datto-bcdr-cli auth status` labels the source as `agentcookie`. Skip this section if you don't use agentcookie - the CLI works the same as any other.
 
 ## Troubleshooting
 **Authentication errors (exit code 4)**
@@ -370,6 +453,11 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 - Run the `list` command to see available items
 
 ### API-specific
+
 - **401 Unauthorized on every call**  -  Confirm DATTO_BCDR_PUBLIC_KEY and DATTO_BCDR_SECRET_KEY are exported; regenerate the key pair in the Partner Portal if it was revoked.
 - **Fleet commands return nothing**  -  Run `datto-bcdr-cli sync` first  -  the transcendence commands read the local store, not the live API.
 - **A device is missing from the list**  -  Pass --show-hidden 1 (and --show-child-reseller 1) to device list, then re-sync.
+
+---
+
+Generated by [CLI Printing Press](https://github.com/mvanhorn/cli-printing-press)

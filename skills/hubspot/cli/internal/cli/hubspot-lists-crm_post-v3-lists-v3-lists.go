@@ -15,11 +15,11 @@ import (
 func newHubspotListsCrmPostV3ListsV3ListsCmd(flags *rootFlags) *cobra.Command {
 	var bodyCustomProperties string
 	var bodyFilterBranch string
-	var bodyListFolderId string
+	var bodyListFolderId int
 	var bodyListPermissionsTeamsWithEditAccess string
 	var bodyListPermissionsUsersWithEditAccess string
 	var bodyMembershipSettingsIncludeUnassigned bool
-	var bodyMembershipSettingsMembershipTeamId string
+	var bodyMembershipSettingsMembershipTeamId int
 	var bodyName string
 	var bodyObjectTypeId string
 	var bodyProcessingType string
@@ -28,40 +28,52 @@ func newHubspotListsCrmPostV3ListsV3ListsCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "post-v3-lists-v3-lists",
 		Short:       "Post v3 lists v3 lists",
-		Example:     "  hubspot-cli hubspot-lists-crm post-v3-lists-v3-lists --name example-resource",
-		Annotations: map[string]string{"pp:endpoint": "hubspot-lists-crm.post-v3-lists-v3-lists", "pp:method": "POST", "pp:path": "/crm/v3/lists"},
+		Annotations: map[string]string{"pp:endpoint": "hubspot-lists-crm.post-v3-lists-v3-lists", "pp:method": "POST", "pp:path": "/crm/v3/lists", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("list-permissions-teams-with-edit-access") && !flags.dryRun {
-					return fmt.Errorf("required flag \"%s\" not set", "list-permissions-teams-with-edit-access")
+				if (cmd.Flags().Changed("list-permissions-teams-with-edit-access") || bodyListPermissionsTeamsWithEditAccess != "") || (cmd.Flags().Changed("list-permissions-users-with-edit-access") || bodyListPermissionsUsersWithEditAccess != "") {
+					if !cmd.Flags().Changed("list-permissions-teams-with-edit-access") && bodyListPermissionsTeamsWithEditAccess == "" && !flags.dryRun {
+						return fmt.Errorf("required flag \"%s\" not set", "list-permissions-teams-with-edit-access")
+					}
+					if !cmd.Flags().Changed("list-permissions-users-with-edit-access") && bodyListPermissionsUsersWithEditAccess == "" && !flags.dryRun {
+						return fmt.Errorf("required flag \"%s\" not set", "list-permissions-users-with-edit-access")
+					}
 				}
-				if !cmd.Flags().Changed("list-permissions-users-with-edit-access") && !flags.dryRun {
-					return fmt.Errorf("required flag \"%s\" not set", "list-permissions-users-with-edit-access")
-				}
-				if !cmd.Flags().Changed("name") && !flags.dryRun {
+				if !cmd.Flags().Changed("name") && bodyName == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "name")
 				}
-				if !cmd.Flags().Changed("object-type-id") && !flags.dryRun {
+				if !cmd.Flags().Changed("object-type-id") && bodyObjectTypeId == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "object-type-id")
 				}
-				if !cmd.Flags().Changed("processing-type") && !flags.dryRun {
+				if !cmd.Flags().Changed("processing-type") && bodyProcessingType == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "processing-type")
 				}
 			}
+			path := "/crm/v3/lists"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/lists"
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -73,38 +85,51 @@ func newHubspotListsCrmPostV3ListsV3ListsCmd(flags *rootFlags) *cobra.Command {
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
-				if bodyCustomProperties != "" {
+				bodyMap := map[string]any{}
+				body = bodyMap
+				if cmd.Flags().Changed("custom-properties") || bodyCustomProperties != "" {
 					var parsedCustomProperties any
 					if err := json.Unmarshal([]byte(bodyCustomProperties), &parsedCustomProperties); err != nil {
 						return fmt.Errorf("parsing --custom-properties JSON: %w", err)
 					}
-					body["customProperties"] = parsedCustomProperties
+					asMap, ok := parsedCustomProperties.(map[string]any)
+					if !ok {
+						return fmt.Errorf("--custom-properties must be a JSON object, got JSON %T", parsedCustomProperties)
+					}
+					bodyMap["customProperties"] = asMap
 				}
-				if bodyFilterBranch != "" {
-					body["filterBranch"] = bodyFilterBranch
+				if cmd.Flags().Changed("filter-branch") || bodyFilterBranch != "" {
+					bodyMap["filterBranch"] = bodyFilterBranch
 				}
-				if bodyListFolderId != "" {
-					body["listFolderId"] = bodyListFolderId
+				if cmd.Flags().Changed("list-folder-id") || bodyListFolderId != 0 {
+					bodyMap["listFolderId"] = bodyListFolderId
 				}
 				{
 					nestedListPermissions := map[string]any{}
-					if bodyListPermissionsTeamsWithEditAccess != "" {
+					if cmd.Flags().Changed("list-permissions-teams-with-edit-access") || bodyListPermissionsTeamsWithEditAccess != "" {
 						var parsedListPermissionsTeamsWithEditAccess any
 						if err := json.Unmarshal([]byte(bodyListPermissionsTeamsWithEditAccess), &parsedListPermissionsTeamsWithEditAccess); err != nil {
 							return fmt.Errorf("parsing --list-permissions-teams-with-edit-access JSON: %w", err)
 						}
-						nestedListPermissions["teamsWithEditAccess"] = parsedListPermissionsTeamsWithEditAccess
+						asArray, ok := parsedListPermissionsTeamsWithEditAccess.([]any)
+						if !ok {
+							return fmt.Errorf("--list-permissions-teams-with-edit-access must be a JSON array, got JSON %T", parsedListPermissionsTeamsWithEditAccess)
+						}
+						nestedListPermissions["teamsWithEditAccess"] = asArray
 					}
-					if bodyListPermissionsUsersWithEditAccess != "" {
+					if cmd.Flags().Changed("list-permissions-users-with-edit-access") || bodyListPermissionsUsersWithEditAccess != "" {
 						var parsedListPermissionsUsersWithEditAccess any
 						if err := json.Unmarshal([]byte(bodyListPermissionsUsersWithEditAccess), &parsedListPermissionsUsersWithEditAccess); err != nil {
 							return fmt.Errorf("parsing --list-permissions-users-with-edit-access JSON: %w", err)
 						}
-						nestedListPermissions["usersWithEditAccess"] = parsedListPermissionsUsersWithEditAccess
+						asArray, ok := parsedListPermissionsUsersWithEditAccess.([]any)
+						if !ok {
+							return fmt.Errorf("--list-permissions-users-with-edit-access must be a JSON array, got JSON %T", parsedListPermissionsUsersWithEditAccess)
+						}
+						nestedListPermissions["usersWithEditAccess"] = asArray
 					}
 					if len(nestedListPermissions) > 0 {
-						body["listPermissions"] = nestedListPermissions
+						bodyMap["listPermissions"] = nestedListPermissions
 					}
 				}
 				{
@@ -112,26 +137,26 @@ func newHubspotListsCrmPostV3ListsV3ListsCmd(flags *rootFlags) *cobra.Command {
 					if cmd.Flags().Changed("membership-settings-include-unassigned") {
 						nestedMembershipSettings["includeUnassigned"] = bodyMembershipSettingsIncludeUnassigned
 					}
-					if bodyMembershipSettingsMembershipTeamId != "" {
+					if cmd.Flags().Changed("membership-settings-membership-team-id") || bodyMembershipSettingsMembershipTeamId != 0 {
 						nestedMembershipSettings["membershipTeamId"] = bodyMembershipSettingsMembershipTeamId
 					}
 					if len(nestedMembershipSettings) > 0 {
-						body["membershipSettings"] = nestedMembershipSettings
+						bodyMap["membershipSettings"] = nestedMembershipSettings
 					}
 				}
-				if bodyName != "" {
-					body["name"] = bodyName
+				if cmd.Flags().Changed("name") || bodyName != "" {
+					bodyMap["name"] = bodyName
 				}
-				if bodyObjectTypeId != "" {
-					body["objectTypeId"] = bodyObjectTypeId
+				if cmd.Flags().Changed("object-type-id") || bodyObjectTypeId != "" {
+					bodyMap["objectTypeId"] = bodyObjectTypeId
 				}
-				if bodyProcessingType != "" {
-					body["processingType"] = bodyProcessingType
+				if cmd.Flags().Changed("processing-type") || bodyProcessingType != "" {
+					bodyMap["processingType"] = bodyProcessingType
 				}
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -196,6 +221,9 @@ func newHubspotListsCrmPostV3ListsV3ListsCmd(flags *rootFlags) *cobra.Command {
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -221,57 +249,75 @@ func newHubspotListsCrmPostV3ListsV3ListsCmd(flags *rootFlags) *cobra.Command {
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-lists-crm", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, nil)
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-lists-crm", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyCustomProperties, "custom-properties", "", "The list of custom properties to tie to the list. Custom property name is the key, the value is the value.")
 	cmd.Flags().StringVar(&bodyFilterBranch, "filter-branch", "", "Filter branch object containing filtering criteria for the list")
-	cmd.Flags().StringVar(&bodyListFolderId, "list-folder-id", "", "The ID of the folder that the list should be created in.")
+	cmd.Flags().IntVar(&bodyListFolderId, "list-folder-id", 0, "The ID of the folder that the list should be created in.")
 	cmd.Flags().StringVar(&bodyListPermissionsTeamsWithEditAccess, "list-permissions-teams-with-edit-access", "", "Teams with edit access")
 	cmd.Flags().StringVar(&bodyListPermissionsUsersWithEditAccess, "list-permissions-users-with-edit-access", "", "Users with edit access")
 	cmd.Flags().BoolVar(&bodyMembershipSettingsIncludeUnassigned, "membership-settings-include-unassigned", false, "Indicates whether unassigned memberships should be included.")
-	cmd.Flags().StringVar(&bodyMembershipSettingsMembershipTeamId, "membership-settings-membership-team-id", "", "The ID of the team associated with the membership.")
+	cmd.Flags().IntVar(&bodyMembershipSettingsMembershipTeamId, "membership-settings-membership-team-id", 0, "The ID of the team associated with the membership.")
 	cmd.Flags().StringVar(&bodyName, "name", "", "The name of the list, which must be globally unique across all public lists in the portal.")
 	cmd.Flags().StringVar(&bodyObjectTypeId, "object-type-id", "", "The object type ID of the type of objects that the list will store.")
 	cmd.Flags().StringVar(&bodyProcessingType, "processing-type", "", "The processing type of the list. One of: `SNAPSHOT`, `MANUAL`, or `DYNAMIC`.")

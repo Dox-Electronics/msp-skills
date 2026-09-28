@@ -4,6 +4,58 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.1.6] - 2026-09-28
+
+Reprinted on cli-printing-press **4.32.5** (from 4.24.0). The list below is what changed
+for an operator or an agent; one command was removed and one renamed, both named here.
+
+### Changed
+- **Engine 4.32.5.** Runtime and MCP layers regenerated on the current press. The
+  0.1.5 fix that joins every MCP tool-call value to its flag as one word (`--flag=value`)
+  is now generated code (press #4647), and the MCP server refuses argument names carrying
+  `=` and the local-store destination flags at the tool schema as well as at run time.
+- **`auth set-token` is now `auth set-credentials <public_key> <secret_key>`.** The old
+  command took one value and saved only the public key, half of the Basic credential the
+  Datto BCDR API needs. The new one saves both, to `credentials.toml` in the data
+  directory. The `DATTO_BCDR_PUBLIC_KEY` / `DATTO_BCDR_SECRET_KEY` environment variables
+  work as before.
+- **`import` is removed.** It POSTed each record to `/<resource>`, and the Datto BCDR API
+  has no write endpoints, so it could only fail. Nothing else was removed.
+- **`--agent` no longer implies `--yes`.** `--agent` still sets `--json --compact
+  --no-input --no-color`; a command that asks for confirmation now needs an explicit
+  `--yes`.
+- **Local store schema 4 to 11, and one mirror per credential.** The SQLite mirror is
+  migrated forward on first open; a 0.1.5 binary cannot read a mirror this release has
+  migrated. On a machine with no mirror yet, `sync` with credentials writes
+  `data-<hash>.db`, keyed to the credential, so two Datto accounts no longer share one
+  mirror; an existing `data.db` keeps being used as it is.
+- **New commands and MCP tools:** `export` (reads the API with GET only and writes
+  JSONL or JSON; over MCP it prints to the tool result, and `--output` is refused), and the
+  local learning loop (`teach`, `teach-lookup`, `teach-pattern`, `teach-playbook`,
+  `recall`, `learnings ...`, `playbook list` / `playbook amend`), which reads and writes
+  a local store only and never contacts the Datto BCDR API. The no-op `workflow` parent tool, which only returned its
+  own help text, is gone; `workflow_archive` and `workflow_status` are unchanged.
+- **MCP `--transport http` is authenticated and loopback by default.** It requires
+  `DATTO_BCDR_MCP_HTTP_TOKEN` (callers send `Authorization: Bearer <token>`), binds
+  `127.0.0.1:7777` by default, and refuses a plaintext non-loopback bind such as
+  `--addr :7777` unless `--tls-cert` and `--tls-key` are given. The listener sets a
+  request-header read deadline. `mcp-install.md`'s remote recipe is updated to match.
+- **Three new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+  `mcp-install.md`): `DATTO_BCDR_MCP_HTTP_TOKEN`, `DATTO_BCDR_USER_AGENT` (User-Agent
+  override) and `PRINTING_PRESS_CLIENT_PROFILE`.
+- **Release artifacts:** the `.mcpb` bundle carries the companion `datto-bcdr-cli`, and
+  `datto-bcdr-mcp` reports its real version (`0.1.6`) instead of `0.0.0-dev`.
+
+### Fixed
+- **MCP `search` and `sql` read the mirror `sync` wrote.** On 4.32.5 the generated MCP
+  store path still pointed at `data.db` while `sync` wrote the credential-scoped file, so
+  after a fresh sync both tools answered "No local data store found". They now use the
+  same resolver as the CLI, pinned by a test and recorded in the hand-fix ledger.
+- **`doctor` probes the credential on the default API URL.** 0.1.5 treated the shipped
+  default `https://api.datto.com/v1`, which is the real Datto API, as an unset
+  placeholder and refused to verify credentials against it. Template, `YOUR_` and
+  reserved-domain placeholders are still refused.
+
 ## [0.1.5] - 2026-09-10
 
 ### Fixed

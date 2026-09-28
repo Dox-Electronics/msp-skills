@@ -4,22 +4,25 @@
 package cli
 
 import (
-	"datto-bcdr-pp-cli/internal/config"
 	"fmt"
-	"github.com/spf13/cobra"
 	"os"
+
+	"datto-bcdr-pp-cli/internal/cliutil"
+	"datto-bcdr-pp-cli/internal/config"
+	"github.com/spf13/cobra"
 )
 
 func newAuthCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "auth",
-		Short: "Manage authentication for Datto Bcdr",
-		RunE:  parentNoSubcommandRunE(flags),
+		Use:         "auth",
+		Short:       "Manage authentication for Datto Bcdr",
+		Annotations: map[string]string{"pp:parent-group": "true"},
+		RunE:        parentNoSubcommandRunE(flags),
 	}
 
 	cmd.AddCommand(newAuthSetupCmd(flags))
 	cmd.AddCommand(newAuthStatusCmd(flags))
-	cmd.AddCommand(newAuthSetTokenCmd(flags))
+	cmd.AddCommand(newAuthSetCredentialsCmd(flags))
 	cmd.AddCommand(newAuthLogoutCmd(flags))
 
 	return cmd
@@ -41,6 +44,7 @@ func newAuthSetupCmd(_ *rootFlags) *cobra.Command {
 			fmt.Fprintln(w, "Then set:")
 			fmt.Fprintln(w, "  export DATTO_BCDR_PUBLIC_KEY=\"your-token-here\"")
 			fmt.Fprintln(w, "  export DATTO_BCDR_SECRET_KEY=\"your-token-here\"")
+			fmt.Fprintln(w, "  datto-bcdr-cli auth set-credentials your-token-here your-token-here")
 			if !launch {
 				return nil
 			}
@@ -66,6 +70,8 @@ func newAuthStatusCmd(flags *rootFlags) *cobra.Command {
 			w := cmd.OutOrStdout()
 			header := cfg.AuthHeader()
 			authed := header != ""
+			refusals := cfg.CredentialRefusalSummaries()
+			credentialRefused := len(refusals) > 0
 			// JSON envelope: {authenticated, verified, source, config}. When not
 			// authenticated, write the envelope first then return authErr
 			// so exit code carries the auth-failure signal.
@@ -76,13 +82,33 @@ func newAuthStatusCmd(flags *rootFlags) *cobra.Command {
 					"source":        cfg.AuthSource,
 					"config":        cfg.Path,
 				}
+				if credentialRefused {
+					out["credential_refused"] = true
+					out["credential_refusals"] = refusals
+				}
+				if authed {
+					if expiresAt, _, expired, ok := jwtCredentialExpiry(jwtExpirySource(cfg)); ok {
+						out["token_expires"] = expiresAt
+						out["token_expired"] = expired
+					}
+				}
 				if printErr := printJSONFiltered(w, out, flags); printErr != nil {
 					return printErr
+				}
+				if !authed && credentialRefused {
+					return authErr(cfg.CredentialRefusalError())
 				}
 				if !authed {
 					return authErr(fmt.Errorf("no credentials configured"))
 				}
 				return nil
+			}
+			if !authed && credentialRefused {
+				fmt.Fprintln(w, red("Credentials present but refused"))
+				for _, refusal := range refusals {
+					fmt.Fprintf(w, "  %s\n", refusal)
+				}
+				return authErr(cfg.CredentialRefusalError())
 			}
 			if !authed {
 				fmt.Fprintln(w, red("Not authenticated"))
@@ -90,55 +116,81 @@ func newAuthStatusCmd(flags *rootFlags) *cobra.Command {
 				fmt.Fprintln(w, "Set your credentials:")
 				fmt.Fprintln(w, "  export DATTO_BCDR_PUBLIC_KEY=\"your-token-here\"")
 				fmt.Fprintln(w, "  export DATTO_BCDR_SECRET_KEY=\"your-token-here\"")
+				fmt.Fprintf(w, "  datto-bcdr-cli auth set-credentials your-token-here your-token-here\n")
 				return authErr(fmt.Errorf("no credentials configured"))
 			}
 
 			fmt.Fprintln(w, green("Credentials present (not verified)"))
 			fmt.Fprintf(w, "  Source: %s\n", cfg.AuthSource)
 			fmt.Fprintf(w, "  Config: %s\n", cfg.Path)
+			if _, line, expired, ok := jwtCredentialExpiry(jwtExpirySource(cfg)); ok {
+				fmt.Fprintf(w, "  Token expires: %s\n", line)
+				if expired {
+					fmt.Fprintf(w, "  %s\n", "Set Basic credentials with: export DATTO_BCDR_PUBLIC_KEY=\"your-token-here\" DATTO_BCDR_SECRET_KEY=\"your-token-here\"")
+				}
+			}
 			return nil
 		},
 	}
 }
 
-func newAuthSetTokenCmd(flags *rootFlags) *cobra.Command {
+func newAuthSetCredentialsCmd(flags *rootFlags) *cobra.Command {
 	return &cobra.Command{
-		Use:     "set-token <token>",
-		Short:   "Save an API token to the config file",
-		Example: "  datto-bcdr-cli auth set-token YOUR_TOKEN_HERE",
-		Args:    cobra.ExactArgs(1),
+		Use:     "set-credentials <bcdr_public_key> <bcdr_secret_key>",
+		Short:   "Save Basic auth credentials to the credentials file",
+		Example: "  datto-bcdr-cli auth set-credentials your-token-here your-token-here",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 2 {
+				return fmt.Errorf("requires exactly 2 args: <bcdr_public_key> <bcdr_secret_key>")
+			}
+			if args[0] == "" {
+				return fmt.Errorf("DATTO_BCDR_PUBLIC_KEY is required")
+			}
+			if args[1] == "" {
+				return fmt.Errorf("DATTO_BCDR_SECRET_KEY is required")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(flags.configPath)
 			if err != nil {
 				return configErr(err)
 			}
-
-			// Clear any legacy auth_header so AuthHeader() falls through to
-			// the newly-saved credential. Without this, a pre-existing
-			// auth_header value (common after regenerate) shadows the saved
-			// token and set-token silently has no effect. Silent clear (no
-			// log line): a masked-tail variant could leak token bytes through
-			// scripted dogfood that captures stderr.
-			cfg.AuthHeaderVal = ""
-			// api_key auth: AuthHeader() reads the env-var-derived field, not
-			// AccessToken. Writing the token to AccessToken via SaveTokens
-			// would persist the bytes but leave doctor reporting "not
-			// configured" — the slot the header builder consults stays empty.
-			if err := cfg.SaveCredential(args[0]); err != nil {
-				return configErr(fmt.Errorf("saving token: %w", err))
+			value1 := ""
+			if len(args) > 1 {
+				value1 = args[1]
 			}
-
-			// JSON envelope: {saved, config_path}.
+			if err := cfg.SaveCredentials(args[0], value1); err != nil {
+				return configErr(fmt.Errorf("saving credentials: %w", err))
+			}
+			savePath := credentialSavePath(cfg)
 			if flags.asJSON {
-				return printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+				out := map[string]any{
 					"saved":       true,
 					"config_path": cfg.Path,
-				}, flags)
+				}
+				if !cfg.AgentcookieManagedByExternalStore() {
+					out["credentials_path"] = savePath
+				}
+				return printJSONFiltered(cmd.OutOrStdout(), out, flags)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Token saved to %s\n", cfg.Path)
+			fmt.Fprintf(cmd.OutOrStdout(), "Credentials saved to %s\n", savePath)
 			return nil
 		},
 	}
+}
+
+func credentialSavePath(cfg *config.Config) string {
+	if cfg != nil && cfg.AgentcookieManagedByExternalStore() {
+		return cfg.Path
+	}
+	if path, err := cliutil.CredentialsFilePath(); err == nil {
+		return path
+	}
+	if cfg != nil {
+		return cfg.Path
+	}
+	return ""
 }
 
 func newAuthLogoutCmd(flags *rootFlags) *cobra.Command {

@@ -155,10 +155,10 @@
   },
   "datto-bcdr": {
     "state": "up-to-date",
-    "version": "0.1.5",
+    "version": "0.1.6",
     "latest_tag": "datto-bcdr-v0.1.6",
-    "current_hash": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630",
-    "released_hash": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630"
+    "current_hash": "sha256:78185d7d75fc4ccc769aee40f33c9a0ada09183b60755fa3d8e7e22149b2ac62",
+    "released_hash": "sha256:78185d7d75fc4ccc769aee40f33c9a0ada09183b60755fa3d8e7e22149b2ac62"
   },
   "datto-rmm": {
     "state": "up-to-date",
@@ -197,10 +197,10 @@
   },
   "hubspot": {
     "state": "up-to-date",
-    "version": "0.1.6",
+    "version": "0.2.0",
     "latest_tag": "hubspot-v0.2.0",
-    "current_hash": "sha256:9731f5877dcffc6043b0e60cd34155bc079fab63da62ad4f286ae3203188d927",
-    "released_hash": "sha256:9731f5877dcffc6043b0e60cd34155bc079fab63da62ad4f286ae3203188d927"
+    "current_hash": "sha256:383130d0a2d711776761091ea0520c6edbbc923ae82cca349df4835de3114065",
+    "released_hash": "sha256:383130d0a2d711776761091ea0520c6edbbc923ae82cca349df4835de3114065"
   },
   "hudu": {
     "state": "up-to-date",
@@ -212,7 +212,7 @@
   "huntress": {
     "state": "up-to-date",
     "version": "0.1.5",
-    "latest_tag": "huntress-v0.1.5",
+    "latest_tag": "huntress-v0.1.6",
     "current_hash": "sha256:e99e0197119b3d680835f1851183baacf102334df778d9734fcbf861444196a3",
     "released_hash": "sha256:e99e0197119b3d680835f1851183baacf102334df778d9734fcbf861444196a3"
   },
