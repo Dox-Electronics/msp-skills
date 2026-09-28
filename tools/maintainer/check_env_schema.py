@@ -482,6 +482,12 @@ def slice_literal_bindings(src: str) -> list[tuple[int, str, str]]:
         literal = src[m.start(2):close + 1]
         if "\n" not in literal:
             continue  # single-line literals are already bound whole by RE_ASSIGN
+        # The literal must END the statement. `[]string{...}[0] + "_X"` is a
+        # different value; binding just the literal would look complete while
+        # omitting the real name, so such an RHS is left unbound (unresolved).
+        rest = src[close + 1:].split("\n", 1)[0].strip()
+        if rest not in ("", ";"):
+            continue
         out.append((m.start(), m.group(1), literal))
     return out
 RE_RANGE_LIT = re.compile(r"for\s+[\w,\s_]*?([A-Za-z_]\w*)\s*:=\s*range\s+(\[\]string\{[^}]*\}|[A-Za-z_]\w*)")
@@ -1535,6 +1541,13 @@ _fixture(
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
     {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
+)
+_fixture(
+    "multi-line []string followed by an index/concat is not bound as the bare literal",
+    'package cli\nimport "os"\n'
+    'func a() string {\n\tname := []string{\n\t\t"CODEX_THREAD_ID",\n\t}[0] + "_PASSWORD"\n'
+    '\treturn os.Getenv(name)\n}\n',
+    set(), {"name"},
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
