@@ -315,6 +315,41 @@
       "file": "skills/datagate/cli/cmd/datagate-mcp/main.go",
       "rule": "G101",
       "reason": "datagate (generated). gosec G101 false-positive on the constant NAME 'httpTokenEnvVar' (the 'Token' substring). Its value is the NAME of an environment variable, \"DATAGATE_MCP_HTTP_TOKEN\", not a credential; the actual token is read at runtime via os.Getenv and never appears in the source. Same class as the tokenURL G101 FPs (#109). Repo-relative, scoped to datagate only. Surfaced by the full-tree diff scan of the new-connector PR #317."
+    },
+    {
+      "file": "skills/zammad/cli/cmd/zammad-mcp/main.go",
+      "rule": "G101",
+      "reason": "zammad (generated, printing-press 4.32.5). gosec G101 false-positive on the constant NAME 'httpTokenEnvVar' (the 'Token' substring). Its value is the NAME of an environment variable, \"ZAMMAD_MCP_HTTP_TOKEN\", not a credential; the actual token is read at runtime via os.Getenv and never appears in the source. Same class as datagate's entry and the tokenURL G101 FPs (#109). Repo-relative, scoped to zammad only; every 4.32.5 reprint emits the same constant in cmd/<slug>-mcp/main.go and needs its own entry."
+    },
+    {
+      "file": "skills/huntress/cli/cmd/huntress-mcp/main.go",
+      "rule": "G101",
+      "reason": "huntress (generated, printing-press 4.32.5 reprint). gosec G101 false-positive on the constant NAME 'httpTokenEnvVar' (the 'Token' substring), emitted by the press template main_mcp.go.tmpl for every connector. Its value is the NAME of an environment variable, \"HUNTRESS_MCP_HTTP_TOKEN\", not a credential; the actual token is read at runtime via os.Getenv and never appears in the source. Same class as the datagate and zammad entries. Repo-relative, scoped to huntress only."
+    },
+    {
+      "file": "skills/datto-bcdr/cli/cmd/datto-bcdr-mcp/main.go",
+      "rule": "G101",
+      "reason": "datto-bcdr (generated, printing-press 4.32.5 reprint). gosec G101 false-positive on the constant NAME 'httpTokenEnvVar' (the 'Token' substring), emitted by the press template main_mcp.go.tmpl for every connector. Its value is the NAME of an environment variable, \"DATTO_BCDR_MCP_HTTP_TOKEN\", not a credential; the actual token is read at runtime via os.Getenv and never appears in the source. Same class as the datagate and zammad entries. Repo-relative, scoped to datto-bcdr only."
+    },
+    {
+      "file": "skills/wordpress/cli/cmd/wordpress-mcp/main.go",
+      "rule": "G101",
+      "reason": "wordpress (generated, printing-press 4.32.5 reprint). gosec G101 false-positive on the constant NAME 'httpTokenEnvVar' (the 'Token' substring), emitted by the press template main_mcp.go.tmpl for every connector. Its value is the NAME of an environment variable, \"WORDPRESS_MCP_HTTP_TOKEN\", not a credential; the actual token is read at runtime via os.Getenv and never appears in the source. Same class as the datagate and zammad entries. Repo-relative, scoped to wordpress only."
+    },
+    {
+      "file": "skills/sentinelone/cli/cmd/sentinelone-mcp/main.go",
+      "rule": "G101",
+      "reason": "sentinelone (generated, printing-press 4.32.5 reprint). gosec G101 false-positive on the constant NAME 'httpTokenEnvVar' (the 'Token' substring), emitted by the press template main_mcp.go.tmpl for every connector. Its value is the NAME of an environment variable, \"SENTINELONE_MCP_HTTP_TOKEN\", not a credential; the actual token is read at runtime via os.Getenv and never appears in the source. Same class as the datagate and zammad entries. Repo-relative, scoped to sentinelone only."
+    },
+    {
+      "file": "cli/internal/cli/teach.go",
+      "rule": "G703",
+      "reason": "FLEET (generated, printing-press 4.32.5+). gosec taint on scrubLogFile(path, ...): os.WriteFile(path, ..., 0o600) where `path` is the learn loop's own journal log under the CLI's state directory (the same file the generated code reads one line above with a G304 marker). The path is derived from the CLI's config/state dir, never from a tool-call or API value; single-user local CLI, the operator is not their own attacker. Same class as the config.go G703 fleet entry."
+    },
+    {
+      "file": "cli/internal/cliutil/testenv/testenv.go",
+      "rule": "G302",
+      "reason": "FLEET (generated, printing-press 4.32.5+). TestMain-style sandbox helper (package testenv, only imported from _test.go files) that chmods a temp sandbox DIRECTORY to 0700 before pointing HOME/XDG at it; 0700 is the correct restrictive mode for a directory. Never compiled into a shipped binary. Mirrors the sandbox_unix.go G302 entry."
     }
   ]
 }
