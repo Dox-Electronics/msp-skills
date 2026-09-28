@@ -110,10 +110,10 @@ All remote agents need `wordpress-mcp` reachable as a public **HTTPS** endpoint.
 in HTTP mode with your credentials in the environment:
 
 ```bash
-WORDPRESS_BASE_URL=<value> WORDPRESS_BASIC_AUTH=<value> WORDPRESS_MCP_HTTP_TOKEN=<value> wordpress-mcp --transport http --addr 127.0.0.1:7777  # loopback bind address, not a URL (install-docs:ignore)
+WORDPRESS_BASE_URL=<value> WORDPRESS_BASIC_AUTH=<value> WORDPRESS_MCP_HTTP_TOKEN=<value> wordpress-mcp --transport http
 ```
 
-Bind to the loopback address `127.0.0.1` as shown and let the tunnel terminate TLS: the server refuses a plaintext bind on any non-loopback address unless you pass `--tls-cert` and `--tls-key`. Every caller must send `Authorization: Bearer <WORDPRESS_MCP_HTTP_TOKEN>`; the server exits at start-up if that variable is unset.
+With no `--addr` the server binds loopback port 7777; keep it on loopback and let the tunnel terminate TLS. It refuses a plaintext bind on any non-loopback address (a bare `--addr :PORT` binds every interface) unless you pass `--tls-cert` and `--tls-key`. Every caller must send `Authorization: Bearer <WORDPRESS_MCP_HTTP_TOKEN>`; the server exits at start-up if that variable is unset.
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel
 (Cloudflare Tunnel, ngrok) or your own reverse proxy. The path is part of the
