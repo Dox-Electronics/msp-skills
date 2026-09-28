@@ -464,7 +464,7 @@ class GoPackage(Scope):
         return best[1] if best else None
 
 
-RE_ASSIGN = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(.+?)[\t ]*$")
+RE_ASSIGN = re.compile(r"(?m)(?:^|[{;])[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(.+?)[\t ]*$")
 # A package-level (or local) `var names = []string{` whose literal spans several
 # lines. RE_ASSIGN stops at the end of the first line and binds the useless
 # opener `[]string{`; slice_literal_bindings() binds the whole literal so a
@@ -1835,6 +1835,13 @@ _fixture(
         "cli": 'package cli\nimport . "fixture/learn"\n'
                'func b() {\n\tNames[0] = "COVE_PASSWORD"\n}\n',
     },
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "a range variable reassigned mid-line keeps the read reported",
+    'package cli\nimport "os"\n'
+    'func a() {\n\tnames := []string{\n\t\t"CODEX_THREAD_ID",\n\t}\n'
+    '\tfor _, name := range names {\n\t\tif true { name = pick() }\n\t\tos.Getenv(name)\n\t}\n}\n',
     {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
