@@ -138,7 +138,7 @@ After install, authenticate once with your Datto BCDR credentials, then verify w
 | Read | screenshots, stale-backups, recoverability, client-risk, alert-triage, storage-runway, forgotten-assets, agent-versions, client-report, device/agent/asset/shares/alert/vm-restore, sync, search, analytics | Allow |
 | Write (routine) | none - the Datto BCDR API exposes no write endpoints | n/a |
 | Local state | sync, export (GET from Datto, write the SQLite mirror or a local file), teach*, learnings, playbook amend, profile, feedback (local learning store and settings; never contact Datto) | Allow |
-| Credential / config | auth set-token, auth logout (replace or clear stored credentials) | Human-in-the-loop only |
+| Credential / config | auth set-credentials, auth logout (replace or clear stored credentials) | Human-in-the-loop only |
 
 The datto-bcdr skill is read-only against Datto: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and the API it targets exposes no write endpoints, so no command can change remote state. It writes only to your own machine - the local SQLite mirror, an optional export file, and the local learning store. Scope the partner key pair to what your workflow needs; the only human-in-the-loop commands are the ones that replace or clear the stored credential. Full details in [governance.md](https://github.com/servosity/msp-skills/blob/main/skills/datto-bcdr/governance.md).
 

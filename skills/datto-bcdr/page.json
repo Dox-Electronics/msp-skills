@@ -115,7 +115,7 @@
     },
     {
       "tier": "Credential / config",
-      "examples": "auth set-token, auth logout (replace or clear stored credentials)",
+      "examples": "auth set-credentials, auth logout (replace or clear stored credentials)",
       "policy": "Human-in-the-loop only"
     }
   ]

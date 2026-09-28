@@ -226,7 +226,7 @@ Free. Apache-2.0 licensed. You pay only for whichever AI agent you use (Claude, 
 | Read | `screenshots`, `stale-backups`, `recoverability`, `client-risk`, `alert-triage`, `storage-runway`, `forgotten-assets`, `agent-versions`, `client-report`, `device`, `agent`, `asset`, `shares`, `alert`, `vm-restore`, `sync`, `search`, `analytics` | Allow |
 | Write (routine) | (none - the Datto BCDR API exposes no write endpoints) | n/a |
 | Local state | `sync`, `export` (GET from Datto, write the SQLite mirror or a local file), `teach*`, `learnings`, `playbook amend`, `profile`, `feedback` (local learning store and settings; never contact Datto) | Allow |
-| Credential / config | `auth set-token`, `auth logout` (replace or clear stored credentials) | Human-in-the-loop only |
+| Credential / config | `auth set-credentials`, `auth logout` (replace or clear stored credentials) | Human-in-the-loop only |
 
 The strongest control is the **scope you grant the Datto BCDR credentials** - the CLI can only do what the credentials are permitted to do. Full details, including how to lock it down, are in [governance.md](./governance.md).
 
