@@ -425,6 +425,9 @@ class GoPackage(Scope):
 
     def __init__(self, path: Path):
         super().__init__()
+        # (name, scope) of every multi-line []string literal bound whole; see
+        # guard_whole_slices().
+        self.whole_slices: list[tuple[str, Scope]] = []
         self.path = path
         self.funcs: dict[str, GoFunc] = {}
         self.sources: list[tuple[Path, str]] = []
@@ -582,6 +585,7 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
         for start, name, literal in slices:
             scope = pkg.func_at(path, start) or pkg
             scope.bind(name, literal)
+            pkg.whole_slices.append((name, scope))
         for regex, group in ((RE_ASSIGN, 2), (RE_RANGE_LIT, 2)):
             for m in regex.finditer(src):
                 rhs = m.group(group)
@@ -598,6 +602,34 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
             pkg.fields.setdefault(m.group(1), []).append((m.group(2), scope, pkg))
     detect_env_param_helpers(pkg)
     return pkg
+
+
+RE_SLICE_DECL_USE = r"(?:(?:const|var)\s+)?\b{n}\s*:?=\s*\[\]string\s*\{{"
+RE_SLICE_RANGE_USE = r"range\s+{n}\b"
+
+
+def guard_whole_slices(packages: list[GoPackage]) -> None:
+    """Keep a whole-bound []string literal only while nothing can change it.
+
+    A literal bound whole says "these are the names", which is only true while
+    the variable is used solely by its declaration and `range` loops. Any other
+    occurrence (`names[0] = x`, `copy(names, ...)`, `mutate(names)`, `&names`,
+    or, for an exported name, any `pkg.Name` reference from another package)
+    gets the bare opener bound as well, which resolves UNRESOLVED - the same
+    verdict origin/main gave every multi-line literal - so the read stays
+    reported instead of resolving to a list that may no longer be true.
+    """
+    all_text = "\n".join(src for pkg in packages for _, src in pkg.sources)
+    for pkg in packages:
+        pkg_text = "\n".join(src for _, src in pkg.sources)
+        for name, scope in pkg.whole_slices:
+            n = re.escape(name)
+            total = len(re.findall(rf"\b{n}\b", pkg_text))
+            benign = (len(re.findall(RE_SLICE_DECL_USE.format(n=n), pkg_text))
+                      + len(re.findall(RE_SLICE_RANGE_USE.format(n=n), pkg_text)))
+            foreign = name[:1].isupper() and re.search(rf"\.{n}\b", all_text)
+            if total != benign or foreign:
+                scope.bind(name, "[]string{")
 
 
 def link_packages(packages: list[GoPackage]) -> None:
@@ -685,15 +717,12 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
             value = as_literal(element)
             if value is not None:
                 out.add(value)
-            elif RE_IDENT.match(element.strip()):
-                # A named element (`[]string{"A", secretName}`) resolves through
-                # its binding; dropping it would hide a read.
-                out |= resolve(element, pkg, env_prefix, scope, depth + 1, seen)
             else:
-                # Any other element (a call, a slice expression, a concat) is
-                # UNRESOLVED: the call resolver accepts trailing expressions
-                # (`pick()[:13]`), so recursing here could name the wrong
-                # variable and look complete.
+                # A non-literal element (`[]string{"A", secret}`, `pick()`) is
+                # UNRESOLVED. Dropping it (the old behaviour) hid a read behind
+                # the literal siblings; resolving it recursively inherits the call
+                # resolver's leniency (`pick()[:13]`) and can name the wrong
+                # variable.
                 out.add(UNRESOLVED)
         return out or {UNRESOLVED}
 
@@ -719,11 +748,6 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
 
     call = RE_CALL.match(expr)
     if call:
-        if not is_whole_call(expr, call):
-            # `pick()[:13]`, `pick() + "_X"` (concat is split above), `pick().F`:
-            # the value is not what pick returns, so resolving it through pick's
-            # returns would name the wrong variable and look complete.
-            return {UNRESOLVED}
         fname = call.group(1)
         fn = pkg.funcs.get(fname)
         key = (id(pkg), fname)
@@ -739,12 +763,6 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
         return resolve_field(sel.group(1), pkg, env_prefix, depth, seen)
 
     return {UNRESOLVED}
-
-
-def is_whole_call(expr: str, call: "re.Match") -> bool:
-    """True when expr is exactly `f(...)`: the call's '(' closes at the end."""
-    close = match_close(expr, call.end() - 1, "(", ")")
-    return close == len(expr) - 1
 
 
 RE_SELECTOR = re.compile(r"^[A-Za-z_]\w*\.([A-Za-z_]\w*)$")
@@ -857,7 +875,7 @@ def resolve_prefixes(expr: str, pkg: GoPackage, env_prefix: str,
         return out or {""}
 
     call = RE_CALL.match(expr)
-    if call and is_whole_call(expr, call):
+    if call:
         fn = pkg.funcs.get(call.group(1))
         key = (id(pkg), call.group(1))
         if fn is None or key in seen:
@@ -967,6 +985,7 @@ def scan_slug(slug: str, rules: dict) -> tuple[dict[str, list[str]], list[Unreso
     groups = go_files(cli_dir)
     packages = [parse_package(d, files) for d, files in sorted(groups.items())]
     link_packages(packages)
+    guard_whole_slices(packages)
     prefix = env_prefix_for(slug, packages)
     found, unresolved = scan_packages(packages, prefix, rules)
     return found, unresolved, prefix
@@ -978,6 +997,22 @@ def scan_packages(packages: list[GoPackage], prefix: str,
     found: dict[str, list[str]] = {}
     unresolved: dict[tuple, Unresolved] = {}
 
+    # Cross-package helpers: an EXPORTED name-as-parameter helper
+    # (cli-printing-press 4.32+ `cliutil.EnvOverride(name)`, which is
+    # os.Getenv plus an MCPB-placeholder scrub) is called package-qualified from
+    # other packages. Without this table `cliutil.EnvOverride("X_BASE_URL")` is
+    # invisible, so X_BASE_URL reads as declared-but-never-read and a new
+    # credential read through the helper would go unnoticed. Keyed by the
+    # callee package's `package` clause name.
+    qualified: dict[str, tuple[list[int], bool]] = {}
+    for pkg in packages:
+        pkg_name = go_package_name(pkg)
+        if not pkg_name:
+            continue
+        for fn in pkg.funcs.values():
+            if fn.env_param_idx and fn.name[:1].isupper():
+                qualified[f"{pkg_name}.{fn.name}"] = (sorted(fn.env_param_idx), fn.variadic_env)
+
     for pkg in packages:
         helpers: dict[str, list[int]] = {}
         variadic: set[str] = set()
@@ -986,6 +1021,13 @@ def scan_packages(packages: list[GoPackage], prefix: str,
                 helpers[fn.name] = sorted(fn.env_param_idx)
                 if fn.variadic_env:
                     variadic.add(fn.name)
+        own = go_package_name(pkg)
+        for qname, (idxs, is_variadic) in qualified.items():
+            if qname.split(".", 1)[0] == own:
+                continue  # same package: called unqualified, already in helpers
+            helpers[qname] = idxs
+            if is_variadic:
+                variadic.add(qname)
 
         for path, src in pkg.sources:
             try:
@@ -1022,6 +1064,18 @@ def scan_packages(packages: list[GoPackage], prefix: str,
                                 if site not in found[value]:
                                     found[value].append(site)
     return found, sorted(unresolved.values(), key=lambda u: u.key)
+
+
+RE_PACKAGE_CLAUSE = re.compile(r"(?m)^package\s+([A-Za-z_]\w*)")
+
+
+def go_package_name(pkg: GoPackage) -> str:
+    """The `package` clause name of this package ('' when none is found)."""
+    for _, src in pkg.sources:
+        m = RE_PACKAGE_CLAUSE.search(src)
+        if m:
+            return m.group(1)
+    return ""
 
 
 RE_WORD_BOUNDARY = re.compile(r"[\w.]")
@@ -1525,13 +1579,13 @@ _fixture(
     set(), {"name"},
 )
 _fixture(
-    "multi-line []string with a non-literal element resolves that element too",
+    "multi-line []string with a non-literal element keeps the read reported",
     'package cli\nimport "os"\n'
     'const secret = "COVE_PASSWORD"\n'
     'var names = []string{\n\t"CODEX_THREAD_ID",\n\tsecret,\n}\n'
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
-    {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
+    {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
     "multi-line []string with an unresolvable element keeps the read reported",
@@ -1585,6 +1639,43 @@ _fixture(
     set(), {"name"},
 )
 _fixture(
+    "multi-line []string mutated by index assignment keeps the read reported",
+    'package cli\nimport "os"\n'
+    'func a() {\n\tnames := []string{\n\t\t"CODEX_THREAD_ID",\n\t}\n'
+    '\tnames[0] = "COVE_PASSWORD"\n'
+    '\tfor _, name := range names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "multi-line []string passed to a function keeps the read reported",
+    'package cli\nimport "os"\n'
+    'var names = []string{\n\t"CODEX_THREAD_ID",\n}\n'
+    'func a() {\n\tmutate(names)\n'
+    '\tfor _, name := range names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "exported helper called package-qualified from another package (4.32 cliutil.EnvOverride)",
+    {
+        "cliutil": 'package cliutil\nimport "os"\n'
+                   'func EnvOverride(name string) string { return scrub(os.Getenv(name)) }\n'
+                   'func scrub(v string) string { return v }\n',
+        "config": 'package config\nimport "x/internal/cliutil"\n'
+                  'func a() string { return cliutil.EnvOverride("COVE_BASE_URL") }\n',
+    },
+    {"COVE_BASE_URL"}, set(),
+)
+_fixture(
+    "UNEXPORTED helper of another package is not matched by a qualified call",
+    {
+        "cliutil": 'package cliutil\nimport "os"\n'
+                   'func envOverride(name string) string { return os.Getenv(name) }\n',
+        "config": 'package config\n'
+                  'func a() string { return other.envOverride("COVE_BASE_URL") }\n',
+    },
+    set(), set(),
+)
+_fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
     'package cli\nimport "os"\n'
     'func envDir(name string) string { return os.Getenv(name) }\n'
@@ -1630,10 +1721,13 @@ def scanner_self_test(rules: dict) -> int:
     REPORTS the ones it cannot resolve instead of dropping them on the floor."""
     failed = 0
     for label, (src, expect_reads, expect_unexplained) in SCAN_FIXTURES.items():
-        pkg = parse_sources(Path("/fixture"),
-                            [(Path("/fixture/x.go"), strip_comments(src))])
-        link_packages([pkg])
-        found, unresolved = scan_packages([pkg], "COVE", rules)
+        # A dict fixture is several packages ({dir: source}); a str is one.
+        srcs = src if isinstance(src, dict) else {"fixture": src}
+        pkgs = [parse_sources(Path(f"/{d}"), [(Path(f"/{d}/x.go"), strip_comments(text))])
+                for d, text in srcs.items()]
+        link_packages(pkgs)
+        guard_whole_slices(pkgs)
+        found, unresolved = scan_packages(pkgs, "COVE", rules)
         got_reads = set(found)
         got_unexplained = {u.expr for u in unresolved if u.why is None}
         ok = got_reads == expect_reads and got_unexplained == expect_unexplained
