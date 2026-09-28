@@ -4602,6 +4602,7 @@ var resourceIDFieldOverrides = map[string]string{
 	"finance-agreements-types":             "id",
 	"finance-agreements-types-info":        "id",
 	"procurement":                          "id",
+	"procurement-catalog":                  "id",
 	"procurement-purchaseorders":           "id",
 	"procurement-purchaseorders-info":      "id",
 	"project":                              "id",

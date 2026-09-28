@@ -819,6 +819,8 @@ func resourceSupportsPagination(resource string) bool {
 		return true
 	case "procurement":
 		return true
+	case "procurement-catalog":
+		return true
 	case "procurement-products-count":
 		return true
 	case "procurement-purchaseorders":
@@ -1732,6 +1734,7 @@ func knownSyncResourceNames() []string {
 		"finance-invoices-count",
 		"procurement",
 		"procurement-products-count",
+		"procurement-catalog",
 		"procurement-purchaseorders",
 		"procurement-purchaseorders-count",
 		"procurement-purchaseorders-info",
@@ -1848,6 +1851,7 @@ func syncResourcePath(resource string) (string, error) {
 		"finance-invoices-count":                "/finance/invoices/count",
 		"procurement":                           "/procurement/products",
 		"procurement-products-count":            "/procurement/products/count",
+		"procurement-catalog":                   "/procurement/catalog",
 		"procurement-purchaseorders":            "/procurement/purchaseorders",
 		"procurement-purchaseorders-count":      "/procurement/purchaseorders/count",
 		"procurement-purchaseorders-info":       "/procurement/purchaseorders/info",
@@ -1956,6 +1960,7 @@ var resourceIDFieldOverrides = map[string]string{
 	"finance-agreements-types":             "id",
 	"finance-agreements-types-info":        "id",
 	"procurement":                          "id",
+	"procurement-catalog":                  "id",
 	"procurement-purchaseorders":           "id",
 	"procurement-purchaseorders-info":      "id",
 	"project":                              "id",

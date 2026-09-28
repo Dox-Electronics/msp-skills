@@ -4,6 +4,21 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.2.0] - unreleased
+
+### Added
+- **Product catalog.** The connector could not read the ConnectWise PSA product catalog: none
+  of the `/procurement/catalog` endpoints were exposed, so an agent searching for "catalog"
+  only found `/procurement/products`, and `procurement.get-catalog` was an unknown endpoint.
+  Three read-only commands, also reachable through the MCP search and execute tools, now
+  cover it: `procurement get-catalog`, `procurement get-catalog-by-id <id>` and
+  `procurement get-catalog-count`. `sync --resources procurement-catalog` stores the
+  catalog locally, including items never added to an opportunity, agreement, ticket or
+  project, with fields like the inactive flag, category, cost and price. It is opt-in, so a
+  default `sync` makes no new calls. The API Member's security role needs Product Catalog
+  inquire rights. Existing `procurement` commands, their `list`/`get` aliases and the
+  `procurement` sync resource (products) are unchanged. Reported by @Xenith-B (#335).
+
 ## [0.1.8] - 2026-09-10
 
 ### Fixed
