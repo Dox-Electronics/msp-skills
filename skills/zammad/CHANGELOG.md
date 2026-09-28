@@ -28,10 +28,17 @@ an operator or an agent.
   is registered. The three no-op parent tools (`learnings`, `playbook`, `workflow`),
   which only returned their own help text, are gone. `stale`, `orphans` and `load` are
   unchanged.
-- **Two new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+- **Three new optional install prompts** on every channel (`.mcpb`, MCP Registry,
   `mcp-install.md`): `ZAMMAD_MCP_HTTP_TOKEN` (bearer token, only for
-  `--transport http`) and `PRINTING_PRESS_CLIENT_PROFILE` (client-profile binding).
-  `ZAMMAD_URL`, `ZAMMAD_BASE_URL` and `ZAMMAD_API_TOKEN` are unchanged.
+  `--transport http`), `PRINTING_PRESS_CLIENT_PROFILE` (client-profile binding) and
+  `ZAMMAD_USER_AGENT` (overrides the User-Agent sent to Zammad; blank keeps the
+  built-in one). `ZAMMAD_URL`, `ZAMMAD_BASE_URL` and `ZAMMAD_API_TOKEN` are unchanged.
+- **Remote (HTTP) launch recipe.** `mcp-install.md` and the ChatGPT answer now say
+  `ZAMMAD_MCP_HTTP_TOKEN=<value> ... zammad-mcp --transport http` with no `--addr`:
+  the server listens on `127.0.0.1:7777` by default and refuses a non-loopback
+  `--addr` (such as the old `--addr :7777`) unless `--tls-cert` and `--tls-key` are
+  given, and refuses to start `--transport http` without the bearer token. Put the
+  loopback listener behind your HTTPS tunnel or reverse proxy as before.
 - **Release artifacts:** first zammad release cut after the 2026-09-18 pipeline change,
   so the `.mcpb` bundle carries the companion `zammad-cli` and `zammad-mcp` reports its
   real version (`0.1.6`) instead of `0.0.0-dev`.

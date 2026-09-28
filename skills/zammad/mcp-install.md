@@ -41,6 +41,7 @@ Add (or merge with your existing `mcpServers` block):
         "ZAMMAD_BASE_URL": "",
         "ZAMMAD_URL": "<your-zammad_url>",
         "ZAMMAD_MCP_HTTP_TOKEN": "",
+        "ZAMMAD_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -70,6 +71,7 @@ Configuration**) and add:
         "ZAMMAD_BASE_URL": "",
         "ZAMMAD_URL": "<your-zammad_url>",
         "ZAMMAD_MCP_HTTP_TOKEN": "",
+        "ZAMMAD_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -95,6 +97,7 @@ Claude Desktop:
         "ZAMMAD_BASE_URL": "",
         "ZAMMAD_URL": "<your-zammad_url>",
         "ZAMMAD_MCP_HTTP_TOKEN": "",
+        "ZAMMAD_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -113,7 +116,7 @@ All remote agents need `zammad-mcp` reachable as a public **HTTPS** endpoint. Ru
 in HTTP mode with your credentials in the environment:
 
 ```bash
-ZAMMAD_API_TOKEN=<value> ZAMMAD_BASE_URL=<value> ZAMMAD_URL=<value> zammad-mcp --transport http --addr :7777
+ZAMMAD_API_TOKEN=<value> ZAMMAD_BASE_URL=<value> ZAMMAD_URL=<value> ZAMMAD_MCP_HTTP_TOKEN=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> ZAMMAD_USER_AGENT=<value> zammad-mcp --transport http
 ```
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel
