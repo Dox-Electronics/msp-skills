@@ -3,14 +3,15 @@
 
 // Package mcp — code-orchestration thin surface.
 //
-// Two tools cover the entire API: <api>_search to discover endpoints, and
-// <api>_execute to invoke one. This collapses a large API (50+ endpoints)
+// Three tools cover the entire API: <api>_search to discover endpoints,
+// <api>_get to inspect one GET endpoint, and <api>_execute to invoke one.
+// This collapses a large API (50+ endpoints)
 // to ~1K tokens of tool definitions while preserving full coverage — the
 // agent writes the composition logic in its own sandbox.
 //
 // Pattern source: Anthropic 2026-04-22 "Building agents that reach
 // production systems with MCP" — Cloudflare's MCP server covers ~2,500
-// endpoints in roughly 1K tokens via the same search+execute shape.
+// endpoints in roughly 1K tokens via the same search, get, and execute shape.
 
 package mcp
 
@@ -24,19 +25,35 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"huntress-pp-cli/internal/cli"
+	"huntress-pp-cli/internal/mcp/bound"
 )
 
-// RegisterCodeOrchestrationTools registers the two agent-facing tools that
-// cover the whole API surface. Called from RegisterTools in place of the
-// per-endpoint registrations when MCP.Orchestration is "code".
+// RegisterCodeOrchestrationTools registers the agent-facing tools that cover
+// the whole API surface. Called from RegisterTools in place of the per-endpoint
+// registrations when MCP.Orchestration is "code".
 func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("huntress_search",
 			mcplib.WithDescription("Search the huntress API for endpoints matching a natural-language query. Returns a ranked list of {endpoint_id, method, path, summary} entries. Call this first to find the endpoint to execute."),
 			mcplib.WithString("query", mcplib.Required(), mcplib.Description("Natural-language description of what you want to do.")),
-			mcplib.WithNumber("limit", mcplib.Description("Max endpoints to return (default 10).")),
+			mcplib.WithNumber("limit", mcplib.Description("Max endpoints to return (default 10, max 100).")),
+			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithDestructiveHintAnnotation(false),
+			mcplib.WithOpenWorldHintAnnotation(false),
 		),
 		handleCodeOrchSearch,
+	)
+
+	s.AddTool(
+		mcplib.NewTool("huntress_get",
+			mcplib.WithDescription("Get metadata for one GET endpoint by its endpoint_id (from huntress_search). This registry-only lookup never calls the API."),
+			mcplib.WithString("endpoint_id", mcplib.Required(), mcplib.Description("GET endpoint identifier returned by huntress_search (e.g., \"users.list\").")),
+			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithDestructiveHintAnnotation(false),
+			mcplib.WithOpenWorldHintAnnotation(false),
+		),
+		handleCodeOrchGet,
 	)
 
 	s.AddTool(
@@ -50,7 +67,7 @@ func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 }
 
 // codeOrchEndpoint captures the small slice of endpoint metadata the
-// search+execute pair needs at runtime. `keywords` is a precomputed
+// registry tools need at runtime. `keywords` is a precomputed
 // lowercase stream of description + path tokens used for naive ranking;
 // anything more sophisticated belongs on the agent side.
 type codeOrchEndpoint struct {
@@ -69,6 +86,9 @@ type codeOrchEndpoint struct {
 	// string instead of dumping them into the JSON body. Derived from the
 	// same mcpParamBindings location data the per-endpoint tools use.
 	QueryParams []codeOrchParamBinding
+	// Keep declared headers out of query/body routing so execution sends them
+	// through the request-header map.
+	HeaderParams []codeOrchParamBinding
 	// HeaderOverrides carries per-endpoint request headers (e.g. an
 	// Accept override for binary-only response endpoints). Without
 	// threading these through, the code-orchestration execute path
@@ -80,12 +100,17 @@ type codeOrchEndpoint struct {
 	// params object; a strict-mapping API rejects an object at the body
 	// root with HTTP 422 "Invalid json".
 	BodyIsArray bool
+	Mutating    bool
 	keywords    []string
 }
 
 type codeOrchParamBinding struct {
-	PublicName string
-	WireName   string
+	PublicName   string
+	WireName     string
+	Default      string
+	QueryArray   bool
+	QueryStyle   string
+	QueryExplode bool
 }
 
 // codeOrchEndpoints is the generator-populated registry covering every
@@ -100,6 +125,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("account", "get-v1", "Shows details of the top-level Huntress Account associated with your API credentials.", "/v1/account"),
 	},
 	{
@@ -110,6 +137,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "creation-parameters", "Create a new account under the reseller associated with the supplied API credential.", "/v1/accounts"),
 	},
 	{
@@ -120,6 +149,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "delete-v1-id", "Marks the account as disabled and will be deleted after 10 days from initial request.", "/v1/accounts/{account_id}"),
 	},
 	{
@@ -129,7 +160,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows all accounts associated with your API credentials.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1", "Shows all accounts associated with your API credentials.", "/v1/accounts"),
 	},
 	{
@@ -140,6 +173,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-id", "Shows the details of a specific account which your API credentials grant access to.", "/v1/accounts/{account_id}"),
 	},
 	{
@@ -150,6 +185,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "update-parameters", "Updates the details of a specific account.", "/v1/accounts/{account_id}"),
 	},
 	{
@@ -159,7 +196,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Agents associated with your account.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "platform", WireName: "platform"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "platform", WireName: "platform"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows Agents associated with your account.", "/v1/accounts/{account_id}/agents"),
 	},
 	{
@@ -170,6 +209,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single Agent associated with your account.", "/v1/accounts/{account_id}/agents/{id}"),
 	},
 	{
@@ -179,7 +220,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows external port records from External Recon scans associated with your account.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "organization_id", WireName: "organization_id"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "organization_id", WireName: "organization_id"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows external port records from External Recon scans associated with your account.", "/v1/accounts/{account_id}/external_ports"),
 	},
 	{
@@ -190,6 +233,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single external port record associated with your account.", "/v1/accounts/{account_id}/external_ports/{id}"),
 	},
 	{
@@ -199,7 +244,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Incident Reports associated with your account.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "indicator_type", WireName: "indicator_type"}, {PublicName: "status", WireName: "status"}, {PublicName: "severity", WireName: "severity"}, {PublicName: "platform", WireName: "platform"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "agent_id", WireName: "agent_id"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "indicator_type", WireName: "indicator_type"}, {PublicName: "status", WireName: "status"}, {PublicName: "severity", WireName: "severity"}, {PublicName: "platform", WireName: "platform"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "agent_id", WireName: "agent_id"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows Incident Reports associated with your account.", "/v1/accounts/{account_id}/incident_reports"),
 	},
 	{
@@ -210,6 +257,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single Incident Report associated with your account.", "/v1/accounts/{account_id}/incident_reports/{id}"),
 	},
 	{
@@ -219,7 +268,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows details of Remediations belonging to a single Incident Report.",
 		Positional:     []string{"account_id", "incident_report_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "types[]", WireName: "types[]"}, {PublicName: "statuses[]", WireName: "statuses[]"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "types", WireName: "types[]", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "statuses", WireName: "statuses[]", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id-remediations", "Shows details of Remediations belonging to a single Incident Report.", "/v1/accounts/{account_id}/incident_reports/{incident_report_id}/remediations"),
 	},
 	{
@@ -230,6 +281,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "incident_report_id", "remediation_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id-remediations-remediation-id", "Shows details for a single Remediation belonging to a single Incident Report", "/v1/accounts/{account_id}/incident_reports/{incident_report_id}/remediations/{remediation_id}"),
 	},
 	{
@@ -240,6 +293,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "incident_report_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "post-v1-accounts-account-id-id-remediations-bulk-approval", "Approve all unapproved remediations for an Incident Report.", "/v1/accounts/{account_id}/incident_reports/{incident_report_id}/remediations/bulk_approval"),
 	},
 	{
@@ -250,6 +305,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "post-v1-accounts-account-id-id-resolution", "Use this endpoint to resolve a single Incident Report.", "/v1/accounts/{account_id}/incident_reports/{id}/resolution"),
 	},
 	{
@@ -260,6 +317,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "incident_report_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "remediation-bulk-rejection-parameters", "Reject all unapproved remediations for an Incident Report.", "/v1/accounts/{account_id}/incident_reports/{incident_report_id}/remediations/bulk_rejection"),
 	},
 	{
@@ -269,7 +328,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Invoices associated with your account.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "status", WireName: "status"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "status", WireName: "status"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows Invoices associated with your account.", "/v1/accounts/{account_id}/invoices"),
 	},
 	{
@@ -280,6 +341,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single Invoice associated with your account.", "/v1/accounts/{account_id}/invoices/{id}"),
 	},
 	{
@@ -290,6 +353,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "creation-parameters", "This endpoint allows you to invite a user to join your organization or account.", "/v1/accounts/{account_id}/memberships"),
 	},
 	{
@@ -300,6 +365,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "delete-v1-accounts-account-id-id", "Deletes a single Membership associated with your account or organization.", "/v1/accounts/{account_id}/memberships/{id}"),
 	},
 	{
@@ -309,7 +376,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows a list of memberships.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "user_id", WireName: "user_id"}, {PublicName: "permissions", WireName: "permissions"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "user_id", WireName: "user_id"}, {PublicName: "permissions", WireName: "permissions"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows a list of memberships.", "/v1/accounts/{account_id}/memberships"),
 	},
 	{
@@ -320,6 +389,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single Membership associated with your account or organization.", "/v1/accounts/{account_id}/memberships/{id}"),
 	},
 	{
@@ -330,6 +401,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "update-parameters", "Update a User's membership", "/v1/accounts/{account_id}/memberships/{id}"),
 	},
 	{
@@ -340,6 +413,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "creation-parameters", "Create an Organization", "/v1/accounts/{account_id}/organizations"),
 	},
 	{
@@ -350,6 +425,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "delete-v1-accounts-account-id-id", "Deletes the specified Organization.", "/v1/accounts/{account_id}/organizations/{id}"),
 	},
 	{
@@ -359,7 +436,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows details of Organizations belonging to the account associated with your API credentials.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "name", WireName: "name"}, {PublicName: "key", WireName: "key"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "name", WireName: "name"}, {PublicName: "key", WireName: "key"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows details of Organizations belonging to the account associated with your API credentials.", "/v1/accounts/{account_id}/organizations"),
 	},
 	{
@@ -370,6 +449,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single Organization associated with your account.", "/v1/accounts/{account_id}/organizations/{id}"),
 	},
 	{
@@ -380,6 +461,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "update-parameters", "Update an Organization", "/v1/accounts/{account_id}/organizations/{id}"),
 	},
 	{
@@ -389,7 +472,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Summary Reports associated with your account.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "period_min", WireName: "period_min"}, {PublicName: "period_max", WireName: "period_max"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "type", WireName: "type"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "period_min", WireName: "period_min"}, {PublicName: "period_max", WireName: "period_max"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "type", WireName: "type"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows Summary Reports associated with your account.", "/v1/accounts/{account_id}/reports"),
 	},
 	{
@@ -400,6 +485,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details on a single Summary Report associated with your account.", "/v1/accounts/{account_id}/reports/{id}"),
 	},
 	{
@@ -409,7 +496,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows details of Signals belonging to the account associated with your API credentials.",
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "investigated_at_min", WireName: "investigated_at_min"}, {PublicName: "investigated_at_max", WireName: "investigated_at_max"}, {PublicName: "entity_type", WireName: "entity_type"}, {PublicName: "entity_id", WireName: "entity_id"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "types", WireName: "types"}, {PublicName: "statuses", WireName: "statuses"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "investigated_at_min", WireName: "investigated_at_min"}, {PublicName: "investigated_at_max", WireName: "investigated_at_max"}, {PublicName: "entity_type", WireName: "entity_type"}, {PublicName: "entity_id", WireName: "entity_id"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "types", WireName: "types"}, {PublicName: "statuses", WireName: "statuses"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id", "Shows details of Signals belonging to the account associated with your API credentials.", "/v1/accounts/{account_id}/signals"),
 	},
 	{
@@ -420,6 +509,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id", "id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-v1-accounts-account-id-id", "Shows details of a single Signal belonging to the account associated with your API credentials.", "/v1/accounts/{account_id}/signals/{id}"),
 	},
 	{
@@ -430,6 +521,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("actor", "get-v1", "Shows details of the entities associated with the supplied API credentials.", "/v1/actor"),
 	},
 	{
@@ -439,7 +532,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Agents associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "platform", WireName: "platform"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "platform", WireName: "platform"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "get-v1", "Shows Agents associated with your account.", "/v1/agents"),
 	},
 	{
@@ -450,6 +545,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "get-v1-id", "Shows details on a single Agent associated with your account.", "/v1/agents/{id}"),
 	},
 	{
@@ -459,7 +556,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Escalations associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "status", WireName: "status"}, {PublicName: "severity", WireName: "severity"}, {PublicName: "subtype", WireName: "subtype"}, {PublicName: "organization_id", WireName: "organization_id"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "status", WireName: "status"}, {PublicName: "severity", WireName: "severity"}, {PublicName: "subtype", WireName: "subtype"}, {PublicName: "organization_id", WireName: "organization_id"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("escalations", "get-v1", "Shows Escalations associated with your account.", "/v1/escalations"),
 	},
 	{
@@ -470,6 +569,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("escalations", "get-v1-id", "Shows details on a single Escalation associated with your account.", "/v1/escalations/{id}"),
 	},
 	{
@@ -480,6 +581,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("escalations", "escalation-parameters", "Allows you to resolve an Escalation. Creating a resolution updates the Escalation's status to resolved.", "/v1/escalations/{id}/resolution"),
 	},
 	{
@@ -489,7 +592,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows external port records from External Recon scans associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "organization_id", WireName: "organization_id"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "organization_id", WireName: "organization_id"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("external-ports", "get-v1", "Shows external port records from External Recon scans associated with your account.", "/v1/external_ports"),
 	},
 	{
@@ -500,6 +605,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("external-ports", "get-v1-id", "Shows details on a single external port record associated with your account.", "/v1/external_ports/{id}"),
 	},
 	{
@@ -509,7 +616,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Identities associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "tenant_type", WireName: "tenant_type"}, {PublicName: "billable", WireName: "billable"}, {PublicName: "enabled", WireName: "enabled"}, {PublicName: "external", WireName: "external"}, {PublicName: "risk_level", WireName: "risk_level"}, {PublicName: "mfa_enabled", WireName: "mfa_enabled"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "tenant_type", WireName: "tenant_type"}, {PublicName: "billable", WireName: "billable"}, {PublicName: "enabled", WireName: "enabled"}, {PublicName: "external", WireName: "external"}, {PublicName: "risk_level", WireName: "risk_level"}, {PublicName: "mfa_enabled", WireName: "mfa_enabled"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("identities", "get-v1", "Shows Identities associated with your account.", "/v1/identities"),
 	},
 	{
@@ -520,6 +629,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("identities", "get-v1-id", "Shows details on a single Identity associated with your account.", "/v1/identities/{id}"),
 	},
 	{
@@ -529,7 +640,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Incident Reports associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "indicator_type", WireName: "indicator_type"}, {PublicName: "status", WireName: "status"}, {PublicName: "severity", WireName: "severity"}, {PublicName: "platform", WireName: "platform"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "agent_id", WireName: "agent_id"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "indicator_type", WireName: "indicator_type"}, {PublicName: "status", WireName: "status"}, {PublicName: "severity", WireName: "severity"}, {PublicName: "platform", WireName: "platform"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "agent_id", WireName: "agent_id"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "get-v1", "Shows Incident Reports associated with your account.", "/v1/incident_reports"),
 	},
 	{
@@ -540,6 +653,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "get-v1-id", "Shows details on a single Incident Report associated with your account.", "/v1/incident_reports/{id}"),
 	},
 	{
@@ -550,6 +665,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"incident_report_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "bulk-rejection-parameters", "Reject all unapproved remediations for an Incident Report.", "/v1/incident_reports/{incident_report_id}/remediations/bulk_rejection"),
 	},
 	{
@@ -559,7 +676,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows details of Remediations belonging to a single Incident Report.",
 		Positional:     []string{"incident_report_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "types[]", WireName: "types[]"}, {PublicName: "statuses[]", WireName: "statuses[]"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "types", WireName: "types[]", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "statuses", WireName: "statuses[]", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "get-v1-incident-reports-incident-report-id", "Shows details of Remediations belonging to a single Incident Report.", "/v1/incident_reports/{incident_report_id}/remediations"),
 	},
 	{
@@ -570,6 +689,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"incident_report_id", "remediation_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "get-v1-incident-reports-incident-report-id-id", "Shows details for a single Remediation belonging to a single Incident Report", "/v1/incident_reports/{incident_report_id}/remediations/{remediation_id}"),
 	},
 	{
@@ -580,6 +701,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"incident_report_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "post-v1-incident-reports-incident-report-id-bulk-approval", "Approve all unapproved remediations for an Incident Report.", "/v1/incident_reports/{incident_report_id}/remediations/bulk_approval"),
 	},
 	{
@@ -590,6 +713,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("incident-reports", "post-v1-incident-reports-id", "Use this endpoint to resolve a single Incident Report.", "/v1/incident_reports/{id}/resolution"),
 	},
 	{
@@ -599,7 +724,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Invoices associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "status", WireName: "status"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "status", WireName: "status"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("invoices", "get-v1", "Shows Invoices associated with your account.", "/v1/invoices"),
 	},
 	{
@@ -610,6 +737,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("invoices", "get-v1-id", "Shows details on a single Invoice associated with your account.", "/v1/invoices/{id}"),
 	},
 	{
@@ -620,6 +749,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("known-vpns", "get-v1", "Returns the list of VPN and proxy operators recognized by Huntress.", "/v1/known_vpns"),
 	},
 	{
@@ -630,6 +761,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("memberships", "creation-parameters", "This endpoint allows you to invite a user to join your organization or account.", "/v1/memberships"),
 	},
 	{
@@ -640,6 +773,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("memberships", "delete-v1-id", "Deletes a single Membership associated with your account or organization.", "/v1/memberships/{id}"),
 	},
 	{
@@ -649,7 +784,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows a list of memberships.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "user_id", WireName: "user_id"}, {PublicName: "permissions", WireName: "permissions"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "user_id", WireName: "user_id"}, {PublicName: "permissions", WireName: "permissions"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("memberships", "get-v1", "Shows a list of memberships.", "/v1/memberships"),
 	},
 	{
@@ -660,6 +797,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("memberships", "get-v1-id", "Shows details on a single Membership associated with your account or organization.", "/v1/memberships/{id}"),
 	},
 	{
@@ -670,6 +809,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("memberships", "update-parameters", "Update a User's membership", "/v1/memberships/{id}"),
 	},
 	{
@@ -680,6 +821,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("organizations", "creation-parameters", "Create an Organization", "/v1/organizations"),
 	},
 	{
@@ -690,6 +833,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("organizations", "delete-v1-id", "Deletes the specified Organization.", "/v1/organizations/{id}"),
 	},
 	{
@@ -699,7 +844,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows details of Organizations belonging to the account associated with your API credentials.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "name", WireName: "name"}, {PublicName: "key", WireName: "key"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "sort_field", WireName: "sort_field"}, {PublicName: "sort_direction", WireName: "sort_direction"}, {PublicName: "name", WireName: "name"}, {PublicName: "key", WireName: "key"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("organizations", "get-v1", "Shows details of Organizations belonging to the account associated with your API credentials.", "/v1/organizations"),
 	},
 	{
@@ -710,6 +857,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("organizations", "get-v1-id", "Shows details on a single Organization associated with your account.", "/v1/organizations/{id}"),
 	},
 	{
@@ -720,6 +869,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("organizations", "update-parameters", "Update an Organization", "/v1/organizations/{id}"),
 	},
 	{
@@ -729,7 +880,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Summary Reports associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "period_min", WireName: "period_min"}, {PublicName: "period_max", WireName: "period_max"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "type", WireName: "type"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "period_min", WireName: "period_min"}, {PublicName: "period_max", WireName: "period_max"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "type", WireName: "type"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "get-v1", "Shows Summary Reports associated with your account.", "/v1/reports"),
 	},
 	{
@@ -740,6 +893,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "get-v1-id", "Shows details on a single Summary Report associated with your account.", "/v1/reports/{id}"),
 	},
 	{
@@ -749,7 +904,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Invoices associated with the current reseller.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "status", WireName: "status"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "status", WireName: "status"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "get-v1-invoices", "Shows Invoices associated with the current reseller.", "/v1/reseller/invoices"),
 	},
 	{
@@ -760,6 +917,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "get-v1-invoices-id", "Shows a specific Reseller Invoice associated with the current reseller.", "/v1/reseller/invoices/{id}"),
 	},
 	{
@@ -769,7 +928,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows a list of Account Usage Line Items.",
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "get-v1-invoices-id-account-usage-line-items", "Shows a list of Account Usage Line Items.", "/v1/reseller/invoices/{id}/account_usage_line_items"),
 	},
 	{
@@ -779,7 +940,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows a list of Organization Usage Line Items.",
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "get-v1-invoices-id-organization-usage-line-items", "Shows a list of Organization Usage Line Items.", "/v1/reseller/invoices/{id}/organization_usage_line_items"),
 	},
 	{
@@ -789,7 +952,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows subscriptions associated with the current reseller's managed accounts.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "product", WireName: "product"}, {PublicName: "status", WireName: "status"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "product", WireName: "product"}, {PublicName: "status", WireName: "status"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "get-v1-subscriptions", "Shows subscriptions associated with the current reseller's managed accounts.", "/v1/reseller/subscriptions"),
 	},
 	{
@@ -800,6 +965,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "get-v1-subscriptions-id", "Shows details on a single subscription associated with the current reseller's managed accounts.", "/v1/reseller/subscriptions/{id}"),
 	},
 	{
@@ -810,6 +977,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "subscription-creation-parameters", "Creates a subscription for a product on a reseller-managed account.", "/v1/reseller/subscriptions"),
 	},
 	{
@@ -820,6 +989,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "subscription-update-parameters", "Updates a subscription associated with the current reseller's managed accounts.", "/v1/reseller/subscriptions/{id}"),
 	},
 	{
@@ -830,6 +1001,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reseller", "subscription-upgrade-parameters", "Upgrades an active subscription by creating a new subscription with a higher minimum and/or price tier", "/v1/reseller/subscriptions/{id}/upgrade"),
 	},
 	{
@@ -840,6 +1013,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("siem", "post-v1-query", "Execute an ESQL query against your SIEM logs and receive paginated JSON results.", "/v1/siem/query"),
 	},
 	{
@@ -849,7 +1024,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows details of Signals belonging to the account associated with your API credentials.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "investigated_at_min", WireName: "investigated_at_min"}, {PublicName: "investigated_at_max", WireName: "investigated_at_max"}, {PublicName: "entity_type", WireName: "entity_type"}, {PublicName: "entity_id", WireName: "entity_id"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "types", WireName: "types"}, {PublicName: "statuses", WireName: "statuses"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "investigated_at_min", WireName: "investigated_at_min"}, {PublicName: "investigated_at_max", WireName: "investigated_at_max"}, {PublicName: "entity_type", WireName: "entity_type"}, {PublicName: "entity_id", WireName: "entity_id"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "types", WireName: "types"}, {PublicName: "statuses", WireName: "statuses"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("signals", "get-v1", "Shows details of Signals belonging to the account associated with your API credentials.", "/v1/signals"),
 	},
 	{
@@ -860,6 +1037,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("signals", "get-v1-id", "Shows details of a single Signal belonging to the account associated with your API credentials.", "/v1/signals/{id}"),
 	},
 	{
@@ -870,6 +1049,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("unwanted-access-rules", "creation-parameters", "Creates a new Unwanted Access Rule associated with your account, an organization, or a specific identity. **Rule logic.", "/v1/unwanted_access_rules"),
 	},
 	{
@@ -880,6 +1061,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("unwanted-access-rules", "delete-v1-id", "Deletes a single Unwanted Access Rule associated with your account.", "/v1/unwanted_access_rules/{id}"),
 	},
 	{
@@ -889,7 +1072,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Shows Unwanted Access Rules associated with your account.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "page_token", WireName: "page_token"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "identity_id", WireName: "identity_id"}, {PublicName: "type", WireName: "type"}, {PublicName: "status", WireName: "status"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "category", WireName: "category"}, {PublicName: "country_code", WireName: "country_code"}, {PublicName: "vpn", WireName: "vpn"}, {PublicName: "logic", WireName: "logic"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "organization_id", WireName: "organization_id"}, {PublicName: "identity_id", WireName: "identity_id"}, {PublicName: "type", WireName: "type"}, {PublicName: "status", WireName: "status"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "category", WireName: "category"}, {PublicName: "country_code", WireName: "country_code"}, {PublicName: "vpn", WireName: "vpn"}, {PublicName: "logic", WireName: "logic"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("unwanted-access-rules", "get-v1", "Shows Unwanted Access Rules associated with your account.", "/v1/unwanted_access_rules"),
 	},
 	{
@@ -900,6 +1085,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("unwanted-access-rules", "get-v1-id", "Shows details on a single Unwanted Access Rule associated with your account.", "/v1/unwanted_access_rules/{id}"),
 	},
 	{
@@ -910,6 +1097,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("unwanted-access-rules", "update-parameters", "Updates the schedule and notes on an existing Unwanted Access Rule.", "/v1/unwanted_access_rules/{id}"),
 	},
 }
@@ -952,16 +1141,47 @@ func codeOrchKeywords(resource, endpoint, summary, path string) []string {
 	return out
 }
 
+func codeOrchEndpointMetadata(ep *codeOrchEndpoint) map[string]any {
+	out := map[string]any{
+		"endpoint_id": ep.ID,
+		"method":      ep.Method,
+		"path":        ep.Path,
+		"summary":     ep.Summary,
+	}
+	return out
+}
+
+func findCodeOrchEndpoint(id string) *codeOrchEndpoint {
+	for i := range codeOrchEndpoints {
+		if codeOrchEndpoints[i].ID == id {
+			return &codeOrchEndpoints[i]
+		}
+	}
+	return nil
+}
+
+const (
+	codeOrchSearchDefaultLimit = 10
+	codeOrchSearchMaxLimit     = 100
+)
+
+func codeOrchSearchLimit(args map[string]any) int {
+	if v, ok := args["limit"].(float64); ok && v > 0 {
+		if v > float64(codeOrchSearchMaxLimit) {
+			return codeOrchSearchMaxLimit
+		}
+		return int(v)
+	}
+	return codeOrchSearchDefaultLimit
+}
+
 func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
 	query, ok := args["query"].(string)
 	if !ok || strings.TrimSpace(query) == "" {
 		return mcplib.NewToolResultError("query is required"), nil
 	}
-	limit := 10
-	if v, ok := args["limit"].(float64); ok && v > 0 {
-		limit = int(v)
-	}
+	limit := codeOrchSearchLimit(args)
 
 	terms := codeOrchKeywords("", "", query, "")
 	type scored struct {
@@ -992,16 +1212,35 @@ func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcp
 
 	out := make([]map[string]any, 0, len(results))
 	for _, r := range results {
-		out = append(out, map[string]any{
-			"endpoint_id": r.ep.ID,
-			"method":      r.ep.Method,
-			"path":        r.ep.Path,
-			"summary":     r.ep.Summary,
-			"score":       r.score,
-		})
+		item := codeOrchEndpointMetadata(r.ep)
+		item["score"] = r.score
+		out = append(out, item)
 	}
-	data, _ := json.Marshal(map[string]any{"count": len(out), "results": out})
-	return mcplib.NewToolResultText(string(data)), nil
+	text, err := bound.JSON(map[string]any{"count": len(out), "results": out})
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("encoding search results: %v", err)), nil
+	}
+	return mcplib.NewToolResultText(text), nil
+}
+
+func handleCodeOrchGet(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	args := req.GetArguments()
+	id, ok := args["endpoint_id"].(string)
+	if !ok || id == "" {
+		return mcplib.NewToolResultError("endpoint_id is required (call huntress_search first)"), nil
+	}
+	ep := findCodeOrchEndpoint(id)
+	if ep == nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("unknown endpoint_id %q — call huntress_search to discover valid ids", id)), nil
+	}
+	if ep.Method != "GET" {
+		return mcplib.NewToolResultError(fmt.Sprintf("endpoint_id %q is %s, but huntress_get only permits GET endpoints", id, ep.Method)), nil
+	}
+	text, err := bound.JSON(codeOrchEndpointMetadata(ep))
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("encoding endpoint metadata: %v", err)), nil
+	}
+	return mcplib.NewToolResultText(text), nil
 }
 
 func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -1011,13 +1250,7 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		return mcplib.NewToolResultError("endpoint_id is required (call huntress_search first)"), nil
 	}
 
-	var ep *codeOrchEndpoint
-	for i := range codeOrchEndpoints {
-		if codeOrchEndpoints[i].ID == id {
-			ep = &codeOrchEndpoints[i]
-			break
-		}
-	}
+	ep := findCodeOrchEndpoint(id)
 	if ep == nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("unknown endpoint_id %q — call huntress_search to discover valid ids", id)), nil
 	}
@@ -1027,17 +1260,44 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		params = map[string]any{}
 	}
 
-	c, err := newMCPClient()
+	c, platformSession, err := newMCPClient(ctx)
 	if err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
+
+	if platformSession != nil {
+		defer platformSession.ZeroCredentials()
+	}
+	if err := cli.AdoptMCPOutputSemantics(platformSession, params); err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
 
 	path := ep.Path
 	for _, p := range ep.Positional {
-		if v, ok := params[p]; ok {
-			path = strings.ReplaceAll(path, "{"+p+"}", formatMCPParamValue(v))
+		if v, ok := params[p]; ok && strings.Contains(path, "{"+p+"}") {
+			path = strings.ReplaceAll(path, "{"+p+"}", mcpPathValue(v))
 			delete(params, p)
 		}
+	}
+
+	hdrs := make(map[string]string, len(ep.HeaderOverrides)+len(ep.HeaderParams))
+	for k, v := range ep.HeaderOverrides {
+		hdrs[k] = v
+	}
+	for _, binding := range ep.HeaderParams {
+		if binding.Default != "" {
+			hdrs[binding.WireName] = binding.Default
+		}
+		for _, key := range []string{binding.PublicName, binding.WireName} {
+			if v, ok := params[key]; ok {
+				hdrs[binding.WireName] = formatMCPParamValue(v)
+				delete(params, key)
+				break
+			}
+		}
+	}
+	if len(hdrs) == 0 {
+		hdrs = nil
 	}
 
 	// Route params to their runtime slots. GET/DELETE params are query
@@ -1045,6 +1305,7 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	// remaining params used as the request body below.
 	query := map[string]string{}
 	if ep.Method == "GET" || ep.Method == "DELETE" {
+		path = codeOrchSplitQuery(path, ep.QueryParams, params)
 		for k, v := range params {
 			query[codeOrchWireQueryName(ep.QueryParams, k)] = formatMCPParamValue(v)
 		}
@@ -1054,16 +1315,9 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		// PUT /ledger/voucher/{id}) wrongly lands in the JSON body and the
 		// API silently ignores it or rejects the request. The remaining
 		// params stay in the map for codeOrchWriteBody (the JSON body).
-		if enc := codeOrchSplitQuery(ep.QueryParams, params); enc != "" {
-			sep := "?"
-			if strings.Contains(path, "?") {
-				sep = "&"
-			}
-			path += sep + enc
-		}
+		path = codeOrchSplitQuery(path, ep.QueryParams, params)
 	}
 
-	hdrs := ep.HeaderOverrides
 	writeBody := func() any {
 		if ep.BodyIsArray {
 			return codeOrchArrayBody(params)
@@ -1074,9 +1328,17 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	switch ep.Method {
 	case "GET":
 		if len(hdrs) > 0 {
-			data, err = c.GetWithHeaders(ctx, path, query, hdrs)
+			if ep.Mutating {
+				data, err = c.GetMutatingWithHeaders(ctx, path, query, hdrs)
+			} else {
+				data, err = c.GetWithHeaders(ctx, path, query, hdrs)
+			}
 		} else {
-			data, err = c.Get(ctx, path, query)
+			if ep.Mutating {
+				data, err = c.GetMutating(ctx, path, query)
+			} else {
+				data, err = c.Get(ctx, path, query)
+			}
 		}
 	case "DELETE":
 		if len(hdrs) > 0 {
@@ -1111,7 +1373,11 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	if err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
-	return mcplib.NewToolResultText(string(data)), nil
+	text := bound.EndpointResponse(ep.Method, data)
+	if platformSession != nil {
+		text = bound.WithMetadata(text, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(text), nil
 }
 
 // codeOrchWriteBody returns the value handed to the client layer as the
@@ -1146,11 +1412,11 @@ func codeOrchArrayBody(params map[string]any) any {
 }
 
 // codeOrchSplitQuery removes spec-declared in:query params from params and
-// returns them URL-encoded for appending to the request path. The remaining
+// appends them URL-encoded to the request path. The remaining
 // entries stay in the map for codeOrchWriteBody (the JSON body), so a write
 // method's query parameters never get buried in the body. Mutates params by
 // design (deletes the consumed query keys).
-func codeOrchSplitQuery(queryParams []codeOrchParamBinding, params map[string]any) string {
+func codeOrchSplitQuery(path string, queryParams []codeOrchParamBinding, params map[string]any) string {
 	uv := neturl.Values{}
 	for _, q := range queryParams {
 		for _, key := range []string{q.PublicName, q.WireName} {
@@ -1158,13 +1424,24 @@ func codeOrchSplitQuery(queryParams []codeOrchParamBinding, params map[string]an
 				continue
 			}
 			if v, ok := params[key]; ok {
-				uv.Set(q.WireName, formatMCPParamValue(v))
+				if q.QueryArray {
+					path = appendMCPArrayQueryParam(path, q.WireName, v, q.QueryStyle, q.QueryExplode)
+				} else {
+					uv.Set(q.WireName, formatMCPParamValue(v))
+				}
 				delete(params, key)
 				break
 			}
 		}
 	}
-	return uv.Encode()
+	if enc := uv.Encode(); enc != "" {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		path += sep + enc
+	}
+	return path
 }
 
 func codeOrchWireQueryName(queryParams []codeOrchParamBinding, name string) string {

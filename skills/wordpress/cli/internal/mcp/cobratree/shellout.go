@@ -4,7 +4,6 @@
 package cobratree
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -19,34 +18,96 @@ import (
 	"wordpress-pp-cli/internal/mcp/bound"
 )
 
-func shellOutToCLI(cliPath func() (string, error), commandPath []string, blockedStructuredArgs map[string]bool, positionals []positionalArg, readOnly bool, positionalWriteSinks map[int]bool) server.ToolHandlerFunc {
+func boundedToolResultError(message string) *mcplib.CallToolResult {
+	return mcplib.NewToolResultError(bound.Text(message))
+}
+
+const shelloutCaptureLimit = bound.MaxBytes + 1
+
+// cappedCapture drains a child-process stream while retaining enough bytes for
+// bound.Text to render an oversized result as a truncated preview.
+type cappedCapture struct {
+	data []byte
+}
+
+func newCappedCapture() *cappedCapture {
+	return &cappedCapture{data: make([]byte, 0, shelloutCaptureLimit)}
+}
+
+func (c *cappedCapture) Write(p []byte) (int, error) {
+	remaining := shelloutCaptureLimit - len(c.data)
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		c.data = append(c.data, p[:remaining]...)
+	}
+	return len(p), nil
+}
+
+func (c *cappedCapture) String() string {
+	return string(c.data)
+}
+
+func shellOutToCLI(cliPath func() (string, error), commandPath []string, blockedStructuredArgs map[string]bool, allowedStructuredArgs map[string]bool, positionals []positionalArg, readOnly bool, positionalWriteSinks map[int]bool) server.ToolHandlerFunc {
 	lookupPath, lookupErr := cliPath()
 	prefixArgs := append([]string{}, commandPath...)
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		if lookupErr != nil {
-			return mcplib.NewToolResultError(fmt.Sprintf("companion CLI binary not found: %v\nTried sibling lookup, WORDPRESS_CLI_PATH env var, and PATH.", lookupErr)), nil
+			return boundedToolResultError(fmt.Sprintf("companion CLI binary not found: %v\nTried sibling lookup, WORDPRESS_CLI_PATH env var, and PATH.", lookupErr)), nil
 		}
 		args := req.GetArguments()
+		if err := validateMCPArgumentNames(args, allowedStructuredArgs); err != nil {
+			return boundedToolResultError(err.Error()), nil
+		}
 		finalArgs := append([]string{}, prefixArgs...)
 		finalArgs = append(finalArgs, cliArgsFromMCP(args, blockedStructuredArgs)...)
 		positionalArgs, err := positionalArgsFromMCP(args, positionals, readOnly, positionalWriteSinks)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return boundedToolResultError(err.Error()), nil
 		}
 		finalArgs = append(finalArgs, positionalArgs...)
 		if raw, _ := args["args"].(string); strings.TrimSpace(raw) != "" {
-			tokens := SplitShellArgs(raw)
-			if err := validatePositionalArgsForMCPAtOffset(tokens, readOnly, positionalWriteSinks, len(positionalArgs)); err != nil {
-				return mcplib.NewToolResultError(err.Error()), nil
+			rawPositionals := positionalArgsFromRawArgsField(raw, positionals, len(positionalArgs))
+			if err := validatePositionalArgsForMCPAtOffset(rawPositionals, readOnly, positionalWriteSinks, len(positionalArgs)); err != nil {
+				return boundedToolResultError(err.Error()), nil
 			}
-			finalArgs = append(finalArgs, tokens...)
+			finalArgs = append(finalArgs, rawPositionals...)
 		}
 		out, err := RunCLICommand(ctx, lookupPath, finalArgs)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return boundedToolResultError(err.Error()), nil
 		}
-		return mcplib.NewToolResultText(bound.Text(out)), nil
+		return ToolResultFromCLICommand(out), nil
 	}
+}
+
+func validateMCPArgumentNames(args map[string]any, allowed map[string]bool) error {
+	if len(args) == 0 {
+		return nil
+	}
+	var unknown []string
+	for k := range args {
+		if !allowed[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	if len(unknown) == 1 {
+		return fmt.Errorf("unknown MCP parameter %q; use the tool schema's named parameters", unknown[0])
+	}
+	return fmt.Errorf("unknown MCP parameters %s; use the tool schema's named parameters", quoteMCPParameterNames(unknown))
+}
+
+func quoteMCPParameterNames(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = strconv.Quote(name)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func positionalArgsFromMCP(args map[string]any, positionals []positionalArg, readOnly bool, positionalWriteSinks map[int]bool) ([]string, error) {
@@ -85,6 +146,19 @@ func positionalArgsFromMCP(args map[string]any, positionals []positionalArg, rea
 		return nil, err
 	}
 	return out, nil
+}
+
+func positionalArgsFromRawArgsField(raw string, positionals []positionalArg, structuredCount int) []string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return nil
+	}
+	// One descriptor is not necessarily scalar: [id...] is a single
+	// positional but still needs shell-word splitting.
+	if len(positionals) == 1 && structuredCount == 0 && !positionals[0].Variadic {
+		return []string{text}
+	}
+	return SplitShellArgs(raw)
 }
 
 func validatePositionalArgsForMCP(tokens []string, readOnly bool, positionalWriteSinks map[int]bool) error {
@@ -247,16 +321,20 @@ func UnblockedFilesystemPathFlags(root *cobra.Command) []string {
 // able to override via structured tool parameters. Allowing them lets a
 // caller swap auth credentials, redirect the API base URL, select a different
 // per-client filesystem, relocate the config/data/state/cache roots, load a
-// malicious config file, or change the delivery target, all of which sit
-// outside the per-command surface the agent is supposed to be calling.
+// malicious config file, change receipt destinations, or change the delivery
+// target, all of which sit outside the per-command surface the agent is
+// supposed to be calling.
 var blockedRootFlags = map[string]bool{
-	"base-url": true,
-	"client":   true,
-	"config":   true,
-	"deliver":  true,
-	"home":     true,
-	"profile":  true,
-	"token":    true,
+	"audit-dir":    true,
+	"base-url":     true,
+	"client":       true,
+	"config":       true,
+	"deliver":      true,
+	"home":         true,
+	"insecure":     true,
+	"profile":      true,
+	"receipt-file": true,
+	"token":        true,
 }
 
 func cliArgsFromMCP(args map[string]any, blocked map[string]bool) []string {
@@ -272,16 +350,11 @@ func cliArgsFromMCP(args map[string]any, blocked map[string]bool) []string {
 	}
 	sort.Strings(keys)
 
-	// Hand-wired (handfixes.json: mcp-argv-value-joined): every value is
-	// joined to its flag as ONE argv element. Emitted as a separate element,
-	// a value beginning with "--" is parsed by pflag as its own flag whenever
-	// the preceding flag is a bool (NoOptDefVal does not consume the next
-	// token), which let a tool-call VALUE smuggle a denylisted root flag past
-	// the key-only filter above. Joined, pflag rejects it on a bool flag and
-	// contains it as the literal value on a string flag.
 	var out []string
 	for _, k := range keys {
 		v := args[k]
+		// Join values onto the flag so a value starting with -- cannot be
+		// re-parsed as its own flag (bool flags do not consume the next token).
 		switch tv := v.(type) {
 		case bool:
 			if tv {
@@ -346,27 +419,67 @@ func SplitShellArgs(s string) []string {
 	return tokens
 }
 
+// CLICommandResult carries the machine-readable stdout separately from
+// operator-facing stderr hints.
+type CLICommandResult struct {
+	Stdout      string
+	StderrHints []string
+}
+
+// ToolResultFromCLICommand keeps stdout in the first content block and places
+// filtered CLI hints in a separate block for clients that display auxiliary
+// content.
+func ToolResultFromCLICommand(result CLICommandResult) *mcplib.CallToolResult {
+	toolResult := mcplib.NewToolResultText(bound.Text(result.Stdout))
+	if len(result.StderrHints) > 0 {
+		toolResult.Content = append(toolResult.Content, mcplib.NewTextContent(bound.Text(strings.Join(result.StderrHints, "\n"))))
+	}
+	return toolResult
+}
+
 // RunCLICommand executes the companion CLI while preserving stdout as the
-// machine-readable channel. Stderr is included only in error text so post-run
-// telemetry or quota output cannot corrupt JSON results.
-func RunCLICommand(ctx context.Context, binPath string, args []string) (string, error) {
-	cmd := exec.CommandContext(ctx, binPath, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+// machine-readable channel. Hint and warning stderr lines are returned
+// separately on success so they cannot corrupt JSON results.
+func RunCLICommand(ctx context.Context, binPath string, args []string) (CLICommandResult, error) {
+	cmd := exec.CommandContext(ctx, binPath, args...) // #nosec G204 -- trusted companion CLI path, args pre-tokenized.
+	stdout := newCappedCapture()
+	stderr := newCappedCapture()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	stdoutText := stdout.String()
+	result := CLICommandResult{
+		Stdout:      stdoutText,
+		StderrHints: stderrHintLines(stderr.String()),
+	}
+	if err != nil {
+		stderrText := strings.TrimSpace(stderr.String())
+		msg := stderrText
 		if msg == "" {
-			msg = strings.TrimSpace(stdout.String())
+			msg = strings.TrimSpace(stdoutText)
 		}
 		if msg != "" {
 			label := "stderr"
-			if strings.TrimSpace(stderr.String()) == "" {
+			if stderrText == "" {
 				label = "output"
 			}
-			return stdout.String(), fmt.Errorf("cli %s: %w (%s: %s)", binPath, err, label, msg)
+			return result, fmt.Errorf("cli %s: %w (%s: %s)", binPath, err, label, bound.Text(msg))
 		}
-		return stdout.String(), fmt.Errorf("cli %s: %w", binPath, err)
+		return result, fmt.Errorf("cli %s: %w", binPath, err)
 	}
-	return stdout.String(), nil
+	return result, nil
+}
+
+func stderrHintLines(stderr string) []string {
+	var hints []string
+	for _, rawLine := range strings.Split(stderr, "\n") {
+		for _, segment := range strings.Split(rawLine, "\r") {
+			line := strings.TrimSpace(segment)
+			lower := strings.ToLower(line)
+			if strings.HasPrefix(lower, "hint:") || strings.HasPrefix(lower, "warning:") {
+				hints = append(hints, line)
+			}
+		}
+	}
+	return hints
 }

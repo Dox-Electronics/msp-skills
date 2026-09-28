@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "huntress-mcp",
   "display_name": "Huntress",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Every Huntress endpoint, plus fleet-wide incident, coverage, and billing rollups the API can't.",
   "author": {
     "name": "Servosity Inc."
@@ -16,12 +16,22 @@
       "args": [],
       "env": {
         "HUNTRESS_API_KEY": "${user_config.huntress_api_key}",
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}",
         "HUNTRESS_API_SECRET": "${user_config.huntress_api_secret}",
-        "HUNTRESS_BASE_URL": "${user_config.huntress_base_url}"
+        "HUNTRESS_BASE_URL": "${user_config.huntress_base_url}",
+        "HUNTRESS_MCP_HTTP_TOKEN": "${user_config.huntress_mcp_http_token}",
+        "HUNTRESS_USER_AGENT": "${user_config.huntress_user_agent}"
       }
     }
   },
   "user_config": {
+    "printing_press_client_profile": {
+      "type": "string",
+      "title": "Client profile (optional)",
+      "description": "Only for tenant-gated multi-client deployments: binds the MCP server to an existing Printing Press client profile. Leave blank for a single-tenant install.",
+      "required": false,
+      "sensitive": true
+    },
     "huntress_api_key": {
       "type": "string",
       "title": "HUNTRESS_API_KEY",
@@ -42,6 +52,19 @@
       "description": "Base URL for the Huntress API. Leave the prefilled default unless your account uses a different regional or self-hosted host.",
       "required": false,
       "default": "https://api.huntress.io"
+    },
+    "huntress_user_agent": {
+      "type": "string",
+      "title": "User-Agent header",
+      "description": "Overrides the User-Agent the CLI sends on Huntress requests. Leave blank to use the CLI's own built-in User-Agent.",
+      "required": false
+    },
+    "huntress_mcp_http_token": {
+      "type": "string",
+      "title": "MCP HTTP transport bearer token",
+      "description": "Required only when running the MCP server with --transport http (a remote/hosted deployment). Callers must send a matching Authorization: Bearer header. Not needed for the default local stdio transport that Claude Desktop uses.",
+      "required": false,
+      "sensitive": true
     }
   },
   "compatibility": {
@@ -52,10 +75,10 @@
       "win32"
     ]
   },
-  "printing_press_version": "4.24.0",
+  "printing_press_version": "4.32.5",
   "press_provenance": {
-    "printing_press_version": "4.24.0",
-    "generated_at": "2026-06-13T03:45:09.770139Z",
+    "printing_press_version": "4.32.5",
+    "generated_at": "2026-09-28T17:13:00.780151Z",
     "spec_checksum": "sha256:cab57b837bbb529e6f9b1357ab6c27b78a1b5e7f800883bd9f7faea17dbc2c31",
     "spec_format": "openapi3"
   }

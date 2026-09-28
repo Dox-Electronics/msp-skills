@@ -3,7 +3,7 @@
   "name": "io.github.Servosity/huntress-mcp",
   "title": "Huntress MCP",
   "description": "Every Huntress endpoint, plus a local SQLite mirror that delivers fleet-wide incident, coverage",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "icons": [
     {
       "src": "https://raw.githubusercontent.com/servosity/msp-skills/main/docs/assets/social/huntress/huntress-512x512.png",
@@ -21,13 +21,19 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/servosity/msp-skills/releases/download/huntress-v0.1.5/huntress-mcp.mcpb",
-      "version": "0.1.5",
+      "identifier": "https://github.com/servosity/msp-skills/releases/download/huntress-v0.1.6/huntress-mcp.mcpb",
+      "version": "0.1.6",
       "fileSha256": "PLACEHOLDER_SHA256_FILLED_BY_CI",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
+        {
+          "name": "PRINTING_PRESS_CLIENT_PROFILE",
+          "description": "Optional: binds the MCP server to an existing tenant-gated Printing Press client profile. Leave unset for a single-tenant install.",
+          "isRequired": false,
+          "isSecret": true
+        },
         {
           "name": "HUNTRESS_API_KEY",
           "description": "Set the HUNTRESS_API_KEY credential for the Huntress MCP server.",
@@ -46,6 +52,18 @@
           "isRequired": false,
           "isSecret": false,
           "default": "https://api.huntress.io"
+        },
+        {
+          "name": "HUNTRESS_USER_AGENT",
+          "description": "Overrides the User-Agent the CLI sends on Huntress requests.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "HUNTRESS_MCP_HTTP_TOKEN",
+          "description": "Required only when running the MCP server with --transport http. Not needed for the default local stdio transport.",
+          "isRequired": false,
+          "isSecret": true
         }
       ]
     }

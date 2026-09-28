@@ -46,31 +46,20 @@ const doctorBaseURLEnv = "HUNTRESS_BASE_URL"
 // placeholder and doctor would never dial it. Refusing to check a healthy
 // install is the same class of defect as blessing a broken one, pointed the
 // other way.
-const doctorShippedBaseURL = "https://api.huntress.io"
+// Huntress ships its REAL API root as the default (https://api.huntress.io is
+// the only host; there is no per-tenant or self-hosted variant), so an operator
+// who never set HUNTRESS_BASE_URL is correctly configured, not on a stand-in.
+// The value is therefore empty here: the exact-match refusal below must stay
+// inert for this connector. With the literal filled in (v0.1.5 and earlier)
+// every default install was told "base_url is still the shipped placeholder"
+// and doctor never probed the credential at all - the mirror defect the file
+// header describes, pointed the other way. Found by the 4.32.5 reprint review.
+const doctorShippedBaseURL = ""
 
-// doctorInfoKeys are report entries rendered without a status indicator:
-// paths, versions, and the free-text hints that tell an operator how to get a
-// credential. They are NOT health checks.
-//
-// doctorExitForFailOn used to scan every value in the report for the substrings
-// "error", "missing", "invalid" and "unreachable". That made --fail-on=error
-// trip on a perfectly healthy connector whose auth hint happened to contain the
-// word "missing", or whose suggested read command was named something like
-// `errors list`. Excluding the informational keys keeps --fail-on keyed to the
-// checks and nothing else.
-var doctorInfoKeys = map[string]bool{
-	"config_path":       true,
-	"base_url":          true,
-	"auth_source":       true,
-	"version":           true,
-	"auth_hint":         true,
-	"auth_key_url":      true,
-	"auth_instructions": true,
-	"agentcookie":       true,
-	"db_path":           true,
-}
-
-func doctorIsInfoKey(key string) bool { return doctorInfoKeys[key] }
+// doctorInfoKeys / doctorIsInfoKey used to live here. cli-printing-press
+// 4.32 emits both natively in doctor.go (with a wider key set), so the
+// --fail-on scan that skips informational rows is now generated code and this
+// file no longer defines them.
 
 // doctorBaseURLIsPlaceholder reports whether base is still the value this
 // connector shipped with rather than the operator's own instance.
