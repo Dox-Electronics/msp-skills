@@ -4,6 +4,60 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.1.6] - 2026-09-28
+
+Reprinted on cli-printing-press **4.32.5** (from 4.28.0). Every command, flag and
+MCP tool that shipped in 0.1.5 is still here; the list below is what changed for
+an operator or an agent.
+
+### Changed
+- **Engine 4.32.5.** Runtime and MCP layers regenerated on the current press. The two
+  security fixes this connector carried by hand since September are now generated code
+  and no longer depend on a hand-fix surviving a reprint: every MCP tool-call value is
+  joined to its flag as one word (`--flag=value`, the 0.1.5 fix, press #4647) and the
+  MCP server refuses argument names carrying `=` and the local-store destination flags
+  (`--db`, `--output`, `--audit-dir`, ...) at the schema as well as at run time.
+- **`--agent` no longer implies `--yes`.** `--agent` still sets `--json --compact
+  --no-input --no-color`; a command that asks for confirmation now needs an explicit
+  `--yes`. Scripts that relied on `--agent` to auto-confirm a write must add `--yes`.
+- **New global flags:** `--receipt` / `--receipt-file` / `--audit-dir` write a private
+  run receipt; `--client-profile` selects a tenant-gated client profile;
+  `--rate-limit` now defaults to `auto` (paces to the server's rate-limit headers).
+- **MCP tool surface:** `kb_browse`, `kb_get`, `kb_search`, `articles_sync` and
+  `zammad_get` are now exposed as tools, and the `read_the_kb_before_answering` recipe
+  is registered. The three no-op parent tools (`learnings`, `playbook`, `workflow`),
+  which only returned their own help text, are gone. `stale`, `orphans` and `load` are
+  unchanged.
+- **Three new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+  `mcp-install.md`): `ZAMMAD_MCP_HTTP_TOKEN` (bearer token, only for
+  `--transport http`), `PRINTING_PRESS_CLIENT_PROFILE` (client-profile binding) and
+  `ZAMMAD_USER_AGENT` (overrides the User-Agent sent to Zammad; blank keeps the
+  built-in one). `ZAMMAD_URL`, `ZAMMAD_BASE_URL` and `ZAMMAD_API_TOKEN` are unchanged.
+- **Remote (HTTP) launch recipe.** `mcp-install.md` and the ChatGPT answer now say
+  `ZAMMAD_MCP_HTTP_TOKEN=<value> ... zammad-mcp --transport http` with no `--addr`:
+  the server listens on `127.0.0.1:7777` by default and refuses a non-loopback
+  `--addr` (such as the old `--addr :7777`) unless `--tls-cert` and `--tls-key` are
+  given, and refuses to start `--transport http` without the bearer token. Put the
+  loopback listener behind your HTTPS tunnel or reverse proxy as before.
+- **Release artifacts:** first zammad release cut after the 2026-09-18 pipeline change,
+  so the `.mcpb` bundle carries the companion `zammad-cli` and `zammad-mcp` reports its
+  real version (`0.1.6`) instead of `0.0.0-dev`.
+
+### Fixed
+- **`ZAMMAD_URL` kept working.** The 4.32.5 generation dropped the hand-wired read of
+  `ZAMMAD_URL` (instance root, `/api/v1` appended), which every install doc names as the
+  way to point the CLI at your instance; the read is restored, pinned by a test and now
+  recorded in the hand-fix ledger.
+- **`stale`, `orphans` and `load` kept working.** The 4.32.5 profiler no longer emits
+  the three project-management workflow commands for this API; they are carried as
+  hand-authored files so the CLI and MCP surfaces stay the same.
+- **MCP `--transport http` listener** now sets a request-header read deadline, so one
+  client cannot hold the listener open by dribbling headers.
+- **`doctor`, `recall` / `playbook list` honesty fixes preserved** (0.1.3 / 0.1.4):
+  the placeholder-`base_url` refusal, the explicit no-credential row and the
+  `mcp:local-write` annotations were re-applied on the fresh tree; the doctor
+  information-key handling is now generated.
+
 ## [0.1.5] - 2026-09-10
 
 ### Fixed

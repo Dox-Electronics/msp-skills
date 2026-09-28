@@ -74,3 +74,39 @@ func runLearnInitOnce(ctx context.Context) {
 		}
 	})
 }
+
+// learnCommonIdentityFields is the ordered, domain-neutral list
+// ResourceEntitiesFromJSON walks when a resource has no more specific
+// identity key. Missing JSON keys are skipped, so one list can serve
+// every collection.
+var learnCommonIdentityFields = []string{
+	"name", "title", "display_name", "full_name", "short_name", "label",
+	"slug", "key", "code", "id", "address",
+}
+
+// learnResourceTypeFields returns the per-resource identity-field map
+// passed to Recall so entity_match can be exact when the stored JSON
+// actually carries the identity.
+func learnResourceTypeFields() map[string][]string {
+	return map[string][]string{
+		"articles":      {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"groups":        {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"kb":            {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"organizations": {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"overviews":     {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"priorities":    {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"states":        {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"tags":          {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"tickets":       {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+		"users":         {"name", "title", "display_name", "full_name", "short_name", "label", "slug", "key", "code", "id", "address"},
+	}
+}
+
+// learnIdentityFieldsFor returns the identity fields for one resource
+// type, falling back to the common list when the type is unknown.
+func learnIdentityFieldsFor(resourceType string) []string {
+	if fields, ok := learnResourceTypeFields()[resourceType]; ok && len(fields) > 0 {
+		return fields
+	}
+	return append([]string(nil), learnCommonIdentityFields...)
+}

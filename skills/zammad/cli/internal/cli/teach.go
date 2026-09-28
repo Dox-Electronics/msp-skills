@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,34 +94,188 @@ func teachErrLogPath() (string, error) {
 	return filepath.Join(dir, teachErrLogFileName), nil
 }
 
-// writeTeachErrLog appends a single line to teach.log. Best-effort.
+// Overridable in tests so rotation can be forced below the 1 MiB production cap.
+var learningsAuditMaxBytes int64 = 1 << 20
+
+func queryHashRef(query string) string {
+	return "query_hash=" + learn.QueryHash(query)
+}
+
+// Caller must hold WithFileLock on path. Rename is exclusive with append/scrub
+// so a concurrent writer cannot delete a just-rotated file or append into the
+// wrong generation.
+func rotateLogIfNeeded(path string, maxBytes int64) {
+	if maxBytes <= 0 {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < maxBytes {
+		return
+	}
+	rotated := path + ".1"
+	_ = os.Remove(rotated)
+	_ = os.Rename(path, rotated)
+}
+
 func writeTeachErrLog(line string) {
 	p, err := teachErrLogPath()
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	ts := time.Now().UTC().Format(time.RFC3339)
-	fmt.Fprintf(f, "%s %s\n", ts, line)
+	_ = cliutil.WithFileLock(p, func() error {
+		rotateLogIfNeeded(p, learningsAuditMaxBytes)
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		ts := time.Now().UTC().Format(time.RFC3339)
+		_, err = fmt.Fprintf(f, "%s %s\n", ts, line)
+		return err
+	})
 }
 
-// appendLearningsAudit records one event in the JSONL audit log.
+// The raw query is never persisted: callers pass query_hash and a
+// redacted normalized form. A leftover "query" key is stripped.
 func appendLearningsAudit(entry map[string]any) error {
+	if entry != nil {
+		delete(entry, "query")
+	}
 	p, err := learningsAuditPath()
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	return cliutil.WithFileLock(p, func() error {
+		rotateLogIfNeeded(p, learningsAuditMaxBytes)
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		entry["ts"] = time.Now().UTC().Format(time.RFC3339)
+		return json.NewEncoder(f).Encode(entry)
+	})
+}
+
+func scrubLearningsLogs(query string) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return
+	}
+	hash := learn.QueryHash(query)
+	if p, err := learningsAuditPath(); err == nil {
+		_ = cliutil.WithFileLock(p, func() error {
+			_ = scrubLogFile(p, query, hash)
+			_ = scrubLogFile(p+".1", query, hash)
+			return nil
+		})
+	}
+	if p, err := teachErrLogPath(); err == nil {
+		_ = cliutil.WithFileLock(p, func() error {
+			_ = scrubLogFile(p, query, hash)
+			_ = scrubLogFile(p+".1", query, hash)
+			return nil
+		})
+	}
+}
+
+func scrubLogFile(path, rawQuery, queryHash string) error {
+	data, err := os.ReadFile(path) // #nosec G304 -- CLI state-dir log path
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	defer f.Close()
-	entry["ts"] = time.Now().UTC().Format(time.RFC3339)
-	return json.NewEncoder(f).Encode(entry)
+	trimmed := strings.TrimRight(string(data), "\n")
+	if trimmed == "" {
+		return nil
+	}
+	lines := strings.Split(trimmed, "\n")
+	kept := make([]string, 0, len(lines))
+	changed := false
+	for _, line := range lines {
+		if logLineMatchesQuery(line, rawQuery, queryHash) {
+			changed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !changed {
+		return nil
+	}
+	if len(kept) == 0 {
+		return os.WriteFile(path, nil, 0o600)
+	}
+	return os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
+}
+
+func logLineMatchesQuery(line, rawQuery, queryHash string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "{") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return false
+		}
+		if queryHash != "" {
+			if h, _ := entry["query_hash"].(string); h == queryHash {
+				return true
+			}
+		}
+		if rawQuery != "" {
+			if q, _ := entry["query"].(string); q == rawQuery {
+				return true
+			}
+		}
+		return false
+	}
+	if queryHash != "" && textLogHasQueryHash(line, queryHash) {
+		return true
+	}
+	return rawQuery != "" && textLogHasLegacyQuery(line, rawQuery)
+}
+
+func textLogHasQueryHash(line, queryHash string) bool {
+	const prefix = "query_hash="
+	for {
+		i := strings.Index(line, prefix)
+		if i < 0 {
+			return false
+		}
+		rest := line[i+len(prefix):]
+		end := len(rest)
+		if j := strings.IndexAny(rest, " \t,;)\""); j >= 0 {
+			end = j
+		}
+		if rest[:end] == queryHash {
+			return true
+		}
+		line = rest
+	}
+}
+
+func textLogHasLegacyQuery(line, rawQuery string) bool {
+	const key = "query="
+	idx := strings.Index(line, key)
+	if idx < 0 {
+		return false
+	}
+	rest := strings.TrimSpace(line[idx+len(key):])
+	if rest == "" || rest[0] != '"' {
+		return false
+	}
+	quoted, err := strconv.QuotedPrefix(rest)
+	if err != nil {
+		return false
+	}
+	got, err := strconv.Unquote(quoted)
+	if err != nil {
+		return false
+	}
+	return got == rawQuery
 }
 
 // silentCodeErr returns an error that ExitCode honors but that carries
@@ -129,6 +284,21 @@ func appendLearningsAudit(entry map[string]any) error {
 // lives in teach.log instead.
 func silentCodeErr(code int) error {
 	return &cliError{code: code, err: silentSentinel{}}
+}
+
+// teachEmitsJSON honors --json/--agent over the silent-on-success default.
+// Only an explicit --quiet keeps stdout empty; the local default must not.
+func teachEmitsJSON(flags *rootFlags, localQuiet bool, cmd *cobra.Command) bool {
+	if flags == nil || !(flags.asJSON || flags.agent) {
+		return false
+	}
+	if localQuiet && cmd.Flags().Changed("quiet") {
+		return false
+	}
+	if quietFlag := cmd.Root().PersistentFlags().Lookup("quiet"); quietFlag != nil && quietFlag.Changed && flags.quiet {
+		return false
+	}
+	return true
 }
 
 type silentSentinel struct{}
@@ -176,7 +346,11 @@ func newTeachCmd(flags *rootFlags, learnCfg *entities.Config) *cobra.Command {
 		// Execute cell honestly instead of masking a FAIL. Writes land only
 		// in the CLI's own local store, so MCP hosts get non-destructive
 		// local-write hints instead of a "could mutate anything" prompt.
-		Annotations: map[string]string{"pp:typed-exit-codes": "0,2", "mcp:local-write": "true"},
+		Annotations: map[string]string{
+			"pp:typed-exit-codes": "0,2",
+			"mcp:local-write":     "true",
+			"pp:happy-args":       "--query=find items in category;--resource-type=items;--resource=GROUP-category",
+		},
 		Long: `Record one or more "this query -> this resource" mappings so the next
 query that matches surfaces the right resources without re-running discovery.
 
@@ -185,8 +359,7 @@ emits the user-facing response: silent on success, errors only to
 the CLI state directory's teach.log, safe to fire-and-forget.
 
 Disabling: pass --no-learn or set ` + noLearnEnvVar + `=true.`,
-		Example: `  zammad-cli teach --query "<question>" --resource-type <type> \
-    --resource <id> --resource <id> &`,
+		Example: `  zammad-cli teach --query "find items in category" --resource-type items --resource GROUP-category`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cmd.SilenceUsage = true
 			cmd.SilenceErrors = true
@@ -194,22 +367,22 @@ Disabling: pass --no-learn or set ` + noLearnEnvVar + `=true.`,
 				return nil
 			}
 			if dryRunOK(flags) {
-				return nil
+				return writeDryRun(cmd.OutOrStdout(), flags, "teach")
 			}
 			if strings.TrimSpace(query) == "" {
 				writeTeachErrLog(fmt.Sprintf("teach: missing --query (args=%v resources=%v)", args, resources))
 				return silentCodeErr(2)
 			}
 			if len(resources) == 0 {
-				writeTeachErrLog(fmt.Sprintf("teach: missing --resource for query=%q", query))
+				writeTeachErrLog(fmt.Sprintf("teach: missing --resource (%s)", queryHashRef(query)))
 				return silentCodeErr(2)
 			}
 			if strings.TrimSpace(resourceType) == "" {
-				writeTeachErrLog(fmt.Sprintf("teach: missing --resource-type for query=%q", query))
+				writeTeachErrLog(fmt.Sprintf("teach: missing --resource-type (%s)", queryHashRef(query)))
 				return silentCodeErr(2)
 			}
 			if strings.TrimSpace(playbookFile) != "" && strings.TrimSpace(playbookJSONInline) != "" {
-				writeTeachErrLog(fmt.Sprintf("teach: --playbook-file and --playbook-json are mutually exclusive (query=%q)", query))
+				writeTeachErrLog(fmt.Sprintf("teach: --playbook-file and --playbook-json are mutually exclusive (%s)", queryHashRef(query)))
 				return silentCodeErr(2)
 			}
 			// PII guard (R18): scan the freeform query for obvious
@@ -247,7 +420,7 @@ Disabling: pass --no-learn or set ` + noLearnEnvVar + `=true.`,
 				}
 				learningID, _, uerr := s.UpsertLearning(cmd.Context(), store.UpsertLearningInput{
 					Query:         query,
-					QueryEntities: normalized.Entities,
+					QueryEntities: learn.QueryIdentityEntities(normalized),
 					ResourceID:    rid,
 					ResourceType:  resourceType,
 					Venue:         venueArg,
@@ -255,13 +428,13 @@ Disabling: pass --no-learn or set ` + noLearnEnvVar + `=true.`,
 					Notes:         notes,
 				})
 				if uerr != nil {
-					writeTeachErrLog(fmt.Sprintf("teach: upsert %q for query=%q: %v", rid, query, uerr))
+					writeTeachErrLog(fmt.Sprintf("teach: upsert %q (%s): %v", rid, queryHashRef(query), uerr))
 					return silentCodeErr(1)
 				}
 				taughtRowIDs = append(taughtRowIDs, learningID)
 
 				if !noValidate {
-					for _, w := range learn.ValidateResourceShape(cmd.Context(), s.DB(), learnCfg, query, rid, resourceType, nil) {
+					for _, w := range learn.ValidateResourceShape(cmd.Context(), s.DB(), learnCfg, query, rid, resourceType, learnIdentityFieldsFor(resourceType)) {
 						if logErr := learn.AppendTeachLogWarning("teach", query, w); logErr != nil {
 							writeTeachErrLog(fmt.Sprintf("teach: warn append: %v", logErr))
 						}
@@ -325,8 +498,8 @@ Disabling: pass --no-learn or set ` + noLearnEnvVar + `=true.`,
 
 			if auditErr := appendLearningsAudit(map[string]any{
 				"action":     "teach",
-				"query":      query,
-				"normalized": normalized.NonEntityNormalized,
+				"query_hash": learn.QueryHash(query),
+				"normalized": learn.RedactPII(normalized.NonEntityNormalized),
 				"resources":  resources,
 				"venue":      venueArg,
 				"notes":      notes,
@@ -334,13 +507,15 @@ Disabling: pass --no-learn or set ` + noLearnEnvVar + `=true.`,
 				writeTeachErrLog(fmt.Sprintf("teach: audit append: %v", auditErr))
 			}
 
-			if !quiet && flags.asJSON {
+			if teachEmitsJSON(flags, quiet, cmd) {
+				outFlags := *flags
+				outFlags.quiet = false
 				return printJSONFiltered(cmd.OutOrStdout(), map[string]any{
 					"recorded":   true,
 					"query":      query,
 					"normalized": normalized.NonEntityNormalized,
 					"resources":  resources,
-				}, flags)
+				}, &outFlags)
 			}
 			return nil
 		},
@@ -467,8 +642,8 @@ is an information query, not a not-found error.
 
 Disabling: ` + noLearnEnvVar + `=true returns the empty shape even
 when learnings exist.`,
-		Example: `  zammad-cli recall "<question>" --agent
-  zammad-cli recall "<question>" --agent --min-confidence 2`,
+		Example: `  QUERY="$(cat /path/to/question.txt)" zammad-cli recall "$QUERY" --agent
+  QUERY="$(cat /path/to/question.txt)" zammad-cli recall "$QUERY" --agent --min-confidence 2`,
 		// mcp:local-write, NOT mcp:read-only (issue #275 finding 4):
 		// recall opens the WRITABLE learn store and records a hit/miss
 		// event for every call. The annotation is what an MCP host reads
@@ -482,7 +657,7 @@ when learnings exist.`,
 				return cmd.Help()
 			}
 			if dryRunOK(flags) {
-				return nil
+				return writeDryRun(cmd.OutOrStdout(), flags, "recall")
 			}
 			query := strings.Join(args, " ")
 			envelope := recallEnvelope{
@@ -493,7 +668,7 @@ when learnings exist.`,
 			if noLearnActive(flags) {
 				normalized := learn.Normalize(query, learnCfg)
 				envelope.Normalized = normalized.NonEntityNormalized
-				envelope.QueryEntities = append([]string{}, normalized.Entities...)
+				envelope.QueryEntities = append([]string{}, learn.QueryIdentityEntities(normalized)...)
 				if envelope.QueryEntities == nil {
 					envelope.QueryEntities = []string{}
 				}
@@ -507,10 +682,11 @@ when learnings exist.`,
 			defer s.Close()
 
 			result, err := learn.Recall(cmd.Context(), s.DB(), query, learn.Opts{
-				EntityConfig:    learnCfg,
-				MinConfidence:   minConf,
-				Limit:           limit,
-				DebugMismatches: debugMismatches,
+				EntityConfig:       learnCfg,
+				MinConfidence:      minConf,
+				Limit:              limit,
+				DebugMismatches:    debugMismatches,
+				ResourceTypeFields: learnResourceTypeFields(),
 			})
 			if err != nil {
 				return fmt.Errorf("recall: %w", err)
@@ -626,7 +802,7 @@ func newLearningsCmd(flags *rootFlags, learnCfg *entities.Config) *cobra.Command
 		Short: "Inspect or forget the local search_learnings table",
 		Long: `Surface for browsing, filtering, and deleting rows in the
 search_learnings table that the LLM populates via the 'teach' command.`,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 	cmd.AddCommand(newLearningsListCmd(flags))
@@ -700,12 +876,12 @@ func newLearningsListCmd(flags *rootFlags) *cobra.Command {
 		Use:   "list",
 		Short: "List recorded learnings",
 		Example: `  zammad-cli learnings list --agent
-  zammad-cli learnings list --query "<substring>"
+  zammad-cli learnings list --query "$QUERY"
   zammad-cli learnings list --warnings --agent`,
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if dryRunOK(flags) {
-				return nil
+				return writeDryRun(cmd.OutOrStdout(), flags, "learnings list")
 			}
 			if warningsOnly {
 				var filterIDs []string
@@ -807,14 +983,14 @@ func newLearningsForgetCmd(flags *rootFlags, learnCfg *entities.Config) *cobra.C
 undone without dropping the whole DB.
 
 Requires at least one of --resource, --action, or --all.`,
-		Example: `  zammad-cli learnings forget "<question>" --resource <id>
-  zammad-cli learnings forget "<question>" --all`,
+		Example: `  QUERY="$(cat /path/to/question.txt)" zammad-cli learnings forget "$QUERY" --resource <id>
+  QUERY="$(cat /path/to/question.txt)" zammad-cli learnings forget "$QUERY" --all`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return cmd.Help()
 			}
 			if dryRunOK(flags) {
-				return nil
+				return writeDryRun(cmd.OutOrStdout(), flags, "learnings forget")
 			}
 			query := strings.Join(args, " ")
 			dbPath = learnDBPath(dbPath)
@@ -840,10 +1016,10 @@ Requires at least one of --resource, --action, or --all.`,
 			// entity promotion, so the same query text keys the same
 			// family on both paths. Telemetry-class: failures log to
 			// teach.log and never fail the forget.
+			normalized := learn.PromoteEntities(
+				learn.Normalize(query, learnCfg),
+				learn.NewCanonicalResolver(cmd.Context(), s.DB()))
 			if n > 0 {
-				normalized := learn.PromoteEntities(
-					learn.Normalize(query, learnCfg),
-					learn.NewCanonicalResolver(cmd.Context(), s.DB()))
 				famHash := learn.FamilyHash(learn.QueryFamily(normalized))
 				if _, cascErr := s.DeleteLearnEventsByFamilyHash(famHash); cascErr != nil {
 					writeTeachErrLog(fmt.Sprintf("learnings forget: event cascade: %v", cascErr))
@@ -853,9 +1029,11 @@ Requires at least one of --resource, --action, or --all.`,
 					writeTeachErrLog(fmt.Sprintf("learnings forget: event insert: %v", evErr))
 				}
 			}
+			scrubLearningsLogs(query)
 			_ = appendLearningsAudit(map[string]any{
 				"action":       "forget",
-				"query":        query,
+				"query_hash":   learn.QueryHash(query),
+				"normalized":   learn.RedactPII(normalized.NonEntityNormalized),
 				"filter":       map[string]any{"resource": resourceArg, "action": actionArg, "all": all},
 				"rows_deleted": n,
 			})
@@ -892,20 +1070,24 @@ func newTeachPatternCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "teach-pattern",
 		Short: "Install a manual generalization pattern (query_template, resource_template, entity_kind)",
+		// Missing required flags intentionally exit 2 via usageErr, matching the
+		// sibling teach/teach-playbook commands; declare it so both `verify` and
+		// the live-dogfood matrix score the Execute cell honestly instead of
+		// masking a FAIL. Writes land only in the CLI's own local store.
+		Annotations: map[string]string{
+			"pp:typed-exit-codes": "0,2",
+			"mcp:local-write":     "true",
+			"pp:happy-args":       "--query-template=items in {entity};--resource-template=GROUP-{entity:category};--resource-type=items;--entity-kind=category;--strategy=substitute",
+		},
 		Long: `Adds one row to search_patterns. The recall path uses patterns to
 substitute live query entities into a resource template, so a pattern
 with query_template="items in {entity}" and
 resource_template="GROUP-{entity:category}" generalizes one teach into
 a whole family.`,
-		Example: `  zammad-cli teach-pattern \
-    --query-template "items in {entity}" \
-    --resource-template "GROUP-{entity:category}" \
-    --resource-type "items" \
-    --entity-kind "category" \
-    --strategy substitute`,
+		Example: `  zammad-cli teach-pattern --query-template "items in {entity}" --resource-template "GROUP-{entity:category}" --resource-type items --entity-kind category --strategy substitute`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if dryRunOK(flags) {
-				return nil
+				return writeDryRun(cmd.OutOrStdout(), flags, "teach-pattern")
 			}
 			if noLearnActive(flags) {
 				return nil
@@ -977,6 +1159,15 @@ func newTeachLookupCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "teach-lookup",
 		Short: "Install a manual entity-lookup row (kind, canonical, value)",
+		// Missing required flags intentionally exit 2 via usageErr, matching the
+		// sibling teach/teach-playbook commands; declare it so both `verify` and
+		// the live-dogfood matrix score the Execute cell honestly instead of
+		// masking a FAIL. Writes land only in the CLI's own local store.
+		Annotations: map[string]string{
+			"pp:typed-exit-codes": "0,2",
+			"mcp:local-write":     "true",
+			"pp:happy-args":       "--kind=country;--canonical=United States;--value=USA",
+		},
 		Long: `Adds one row to entity_lookups. Used by the recall path's pattern
 engine to substitute values for canonical names at substitution time.
 Computed kinds (lowercase, uppercase, kebab-case, capitalize-first, slug)
@@ -984,7 +1175,7 @@ cannot be taught — they are derived from the canonical input.`,
 		Example: `  zammad-cli teach-lookup --kind country --canonical "United States" --value USA`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if dryRunOK(flags) {
-				return nil
+				return writeDryRun(cmd.OutOrStdout(), flags, "teach-lookup")
 			}
 			if noLearnActive(flags) {
 				return nil

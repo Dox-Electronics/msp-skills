@@ -484,9 +484,9 @@
   },
   "zammad": {
     "state": "up-to-date",
-    "version": "0.1.5",
-    "latest_tag": "zammad-v0.1.5",
-    "current_hash": "sha256:88e9605e93b7202061b23eacf0ac6eb49e8effc29306bf06f9eae504e0e3e90b",
-    "released_hash": "sha256:88e9605e93b7202061b23eacf0ac6eb49e8effc29306bf06f9eae504e0e3e90b"
+    "version": "0.1.6",
+    "latest_tag": "zammad-v0.1.6",
+    "current_hash": "sha256:61e3f33d949822769924d136542674383685dab2f434aa1795db19b46e6ba7d0",
+    "released_hash": "sha256:61e3f33d949822769924d136542674383685dab2f434aa1795db19b46e6ba7d0"
   }
 }

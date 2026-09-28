@@ -12,16 +12,12 @@ import (
 	"testing"
 
 	"zammad-pp-cli/internal/cliutil"
+	"zammad-pp-cli/internal/cliutil/testenv"
 )
 
 func withTempHomeForLog(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("ZAMMAD_STATE_DIR", "")
-	t.Setenv("ZAMMAD_HOME", "")
-	t.Setenv("XDG_STATE_HOME", "")
-	return dir
+	return testenv.Isolate(t, cliutil.StateDir)
 }
 
 func teachLogPathForTest(t *testing.T) string {
@@ -91,8 +87,14 @@ func TestAppendTeachLogWarning_JSONShape(t *testing.T) {
 	if entry.Action != "teach" {
 		t.Errorf("action = %q", entry.Action)
 	}
-	if entry.Query != "alpha widget" {
-		t.Errorf("query = %q", entry.Query)
+	if entry.Query != "" {
+		t.Errorf("raw query must not persist; got %q", entry.Query)
+	}
+	if want := QueryHash("alpha widget"); entry.QueryHash != want {
+		t.Errorf("query_hash = %q, want %q", entry.QueryHash, want)
+	}
+	if strings.Contains(raw, "alpha widget") {
+		t.Errorf("raw query must not appear in teach.log; got %q", raw)
 	}
 	if entry.Suggested != "PREFIX-Y" {
 		t.Errorf("suggested = %q", entry.Suggested)

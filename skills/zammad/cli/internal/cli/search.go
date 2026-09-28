@@ -125,7 +125,7 @@ In local mode: searches locally synced data only.`,
 				}
 				// Check if it's a network error for auto-mode fallback
 				if flags.dataSource == "live" || !isNetworkError(getErr) {
-					return classifyAPIError(getErr, flags)
+					return classifyAPIError(cmd.OutOrStdout(), getErr, flags)
 				}
 				// auto mode + network error: fall through to local FTS
 				fmt.Fprintf(cmd.ErrOrStderr(), "API unreachable, falling back to local search.\n")
@@ -141,7 +141,6 @@ In local mode: searches locally synced data only.`,
 				return fmt.Errorf("opening local database: %w\nRun 'zammad-cli sync' first to populate the local database.", err)
 			}
 			defer db.Close()
-
 			maybeEmitSyncHints(cmd, db, resourceType, flags.maxAge)
 
 			var results []json.RawMessage
@@ -266,9 +265,13 @@ func outputSearchResults(cmd *cobra.Command, flags *rootFlags, results []json.Ra
 		if flags.csv || flags.plain || flags.quiet {
 			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
 		}
+		var selectErr error
 		outputFlags := *flags
 		if flags.selectFields != "" {
-			data = filterFields(data, flags.selectFields)
+			// Search returns determinate SQLite or live-search rows even when
+			// the persistent --dry-run flag is set; it is not a dry-run plan
+			// path, so an all-miss --select must still exit 2.
+			data, selectErr = filterFieldsChecked(data, flags.selectFields)
 			outputFlags.selectFields = ""
 			outputFlags.compact = false
 		} else if flags.compact {
@@ -279,7 +282,10 @@ func outputSearchResults(cmd *cobra.Command, flags *rootFlags, results []json.Ra
 		if err != nil {
 			return err
 		}
-		return printOutputWithFlags(cmd.OutOrStdout(), wrapped, &outputFlags)
+		if err := printOutputWithFlags(cmd.OutOrStdout(), wrapped, &outputFlags); err != nil {
+			return err
+		}
+		return selectErr
 	}
 
 	if len(results) == 0 {
