@@ -108,13 +108,12 @@ func newThreatsGetCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli threats get",
 		Annotations: map[string]string{"pp:endpoint": "threats.get", "pp:method": "GET", "pp:path": "/threats", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/threats"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/threats"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "threats", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "threats", path, retainCLIQueryParams(cmd, map[string]string{
 				"k8sNodeName__contains":           formatCLIParamValue(flagK8sNodeNameContains),
 				"sortOrder":                       formatCLIParamValue(flagSortOrder),
 				"filePath__contains":              formatCLIParamValue(flagFilePathContains),
@@ -203,10 +202,11 @@ func newThreatsGetCmd(flags *rootFlags) *cobra.Command {
 				"classificationSources":           formatCLIParamValue(flagClassificationSources),
 				"agentMachineTypes":               formatCLIParamValue(flagAgentMachineTypes),
 				"countOnly":                       formatCLIParamValue(flagCountOnly),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"k8sNodeName__contains": {"k8s-node-name-contains"}, "sortOrder": {"sort-order"}, "filePath__contains": {"file-path-contains"}, "analystVerdictsNin": {"analyst-verdicts-nin"}, "confidenceLevelsNin": {"confidence-levels-nin"}, "agentIds": {"agent-ids"}, "createdAt__gte": {"created-at-gte"}, "incidentStatusesNin": {"incident-statuses-nin"}, "initiatedByUsername__contains": {"initiated-by-username-contains"}, "sortBy": {"sort-by"}, "classificationsNin": {"classifications-nin"}, "k8sPodName__contains": {"k8s-pod-name-contains"}, "k8sNamespaceLabels__contains": {"k8s-namespace-labels-contains"}, "agentIsActive": {"agent-is-active"}, "updatedAt__gte": {"updated-at-gte"}, "detectionEnginesNin": {"detection-engines-nin"}, "k8sNamespaceName__contains": {"k8s-namespace-name-contains"}, "osTypesNin": {"os-types-nin"}, "noteExists": {"note-exists"}, "tenant": {"tenant"}, "resolved": {"resolved"}, "rebootRequired": {"reboot-required"}, "detectionAgentDomain__contains": {"detection-agent-domain-contains"}, "engines": {"engines"}, "externalTicketExists": {"external-ticket-exists"}, "updatedAt__gt": {"updated-at-gt"}, "agentVersions": {"agent-versions"}, "contentHash__contains": {"content-hash-contains"}, "k8sControllerName__contains": {"k8s-controller-name-contains"}, "collectionIds": {"collection-ids"}, "updatedAt__lte": {"updated-at-lte"}, "k8sPodLabels__contains": {"k8s-pod-labels-contains"}, "siteIds": {"site-ids"}, "groupIds": {"group-ids"}, "limit": {"limit"}, "threatDetails__contains": {"threat-details-contains"}, "detectionAgentVersion__contains": {"detection-agent-version-contains"}, "accountIds": {"account-ids"}, "mitigationStatuses": {"mitigation-statuses"}, "containerImageName__contains": {"container-image-name-contains"}, "agentMachineTypesNin": {"agent-machine-types-nin"}, "contentHashes": {"content-hashes"}, "originatedProcess__contains": {"originated-process-contains"}, "publisherName__contains": {"publisher-name-contains"}, "skipCount": {"skip-count"}, "containerLabels__contains": {"container-labels-contains"}, "skip": {"skip"}, "createdAt__lte": {"created-at-lte"}, "classifications": {"classifications"}, "confidenceLevels": {"confidence-levels"}, "ids": {"ids"}, "initiatedBy": {"initiated-by"}, "externalTicketId__contains": {"external-ticket-id-contains"}, "agentVersionsNin": {"agent-versions-nin"}, "externalTicketIds": {"external-ticket-ids"}, "osTypes": {"os-types"}, "displayName": {"display-name"}, "storylines": {"storylines"}, "storyline__contains": {"storyline-contains"}, "query": {"query"}, "cursor": {"cursor"}, "pendingActions": {"pending-actions"}, "k8sClusterName__contains": {"k8s-cluster-name-contains"}, "initiatedByNin": {"initiated-by-nin"}, "detectionEngines": {"detection-engines"}, "enginesNin": {"engines-nin"}, "osNamesNin": {"os-names-nin"}, "incidentStatuses": {"incident-statuses"}, "createdAt__gt": {"created-at-gt"}, "updatedAt__lt": {"updated-at-lt"}, "createdAt__lt": {"created-at-lt"}, "mitigatedPreemptively": {"mitigated-preemptively"}, "failedActions": {"failed-actions"}, "realtimeAgentVersion__contains": {"realtime-agent-version-contains"}, "k8sControllerLabels__contains": {"k8s-controller-labels-contains"}, "uuid__contains": {"uuid-contains"}, "analystVerdicts": {"analyst-verdicts"}, "countsFor": {"counts-for"}, "containerName__contains": {"container-name-contains"}, "classificationSourcesNin": {"classification-sources-nin"}, "commandLineArguments__contains": {"command-line-arguments-contains"}, "osArchs": {"os-archs"}, "computerName__contains": {"computer-name-contains"}, "mitigationStatusesNin": {"mitigation-statuses-nin"}, "osNames": {"os-names"}, "classificationSources": {"classification-sources"}, "agentMachineTypes": {"agent-machine-types"}, "countOnly": {"count-only"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -214,7 +214,7 @@ func newThreatsGetCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -223,22 +223,31 @@ func newThreatsGetCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -248,7 +257,11 @@ func newThreatsGetCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagK8sNodeNameContains, "k8s-node-name-contains", "", "Free-text filter by the endpoint Kubernetes node name (supports multiple values)")

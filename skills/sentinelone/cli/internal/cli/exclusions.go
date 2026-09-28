@@ -11,8 +11,7 @@ func newExclusionsCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "exclusions",
 		Short:       "Get, create, update, and delete exclusions",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -21,6 +20,6 @@ func newExclusionsCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newExclusionsGetCmd(flags))
 	cmd.AddCommand(newExclusionsUpdateCmd(flags))
 	cmd.AddCommand(newExclusionsValidateItemCmd(flags))
-	cmd.AddCommand(newNovelExclusionsAuditCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelExclusionsAuditCmd(flags))
 	return cmd
 }

@@ -44,13 +44,12 @@ func newReportsGetCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli reports get",
 		Annotations: map[string]string{"pp:endpoint": "reports.get", "pp:method": "GET", "pp:path": "/reports", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/reports"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/reports"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "reports", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "reports", path, retainCLIQueryParams(cmd, map[string]string{
 				"name":           formatCLIParamValue(flagName),
 				"skip":           formatCLIParamValue(flagSkip),
 				"sortOrder":      formatCLIParamValue(flagSortOrder),
@@ -74,10 +73,11 @@ func newReportsGetCmd(flags *rootFlags) *cobra.Command {
 				"frequency":      formatCLIParamValue(flagFrequency),
 				"scheduleType":   formatCLIParamValue(flagScheduleType),
 				"countOnly":      formatCLIParamValue(flagCountOnly),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"name": {"name"}, "skip": {"skip"}, "sortOrder": {"sort-order"}, "createdAt__lte": {"created-at-lte"}, "ids": {"ids"}, "toDate": {"to-date"}, "interval": {"interval"}, "createdAt__gte": {"created-at-gte"}, "scope": {"scope"}, "siteIds": {"site-ids"}, "sortBy": {"sort-by"}, "groupIds": {"group-ids"}, "fromDate": {"from-date"}, "limit": {"limit"}, "query": {"query"}, "taskId": {"task-id"}, "accountIds": {"account-ids"}, "id": {"id"}, "cursor": {"cursor"}, "skipCount": {"skip-count"}, "frequency": {"frequency"}, "scheduleType": {"schedule-type"}, "countOnly": {"count-only"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -85,7 +85,7 @@ func newReportsGetCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -94,22 +94,31 @@ func newReportsGetCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -119,7 +128,11 @@ func newReportsGetCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagName, "name", "", "Name")

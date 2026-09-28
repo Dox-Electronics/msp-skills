@@ -11,8 +11,7 @@ func newSitesCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "sites",
 		Short:       "Get, create, update, and delete sites",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -27,6 +26,6 @@ func newSitesCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newSitesReactivateCmd(flags))
 	cmd.AddCommand(newSitesRegenerateKeyCmd(flags))
 	cmd.AddCommand(newSitesRevertPolicyCmd(flags))
-	cmd.AddCommand(newNovelSitesRiskCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelSitesRiskCmd(flags))
 	return cmd
 }

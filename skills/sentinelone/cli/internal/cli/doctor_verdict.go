@@ -48,29 +48,17 @@ const doctorBaseURLEnv = "SENTINELONE_BASE_URL"
 // other way.
 const doctorShippedBaseURL = "https://your-console.sentinelone.net/web/api/v2.1"
 
-// doctorInfoKeys are report entries rendered without a status indicator:
-// paths, versions, and the free-text hints that tell an operator how to get a
-// credential. They are NOT health checks.
-//
-// doctorExitForFailOn used to scan every value in the report for the substrings
-// "error", "missing", "invalid" and "unreachable". That made --fail-on=error
-// trip on a perfectly healthy connector whose auth hint happened to contain the
-// word "missing", or whose suggested read command was named something like
-// `errors list`. Excluding the informational keys keeps --fail-on keyed to the
-// checks and nothing else.
-var doctorInfoKeys = map[string]bool{
-	"config_path":       true,
-	"base_url":          true,
-	"auth_source":       true,
-	"version":           true,
-	"auth_hint":         true,
-	"auth_key_url":      true,
-	"auth_instructions": true,
-	"agentcookie":       true,
-	"db_path":           true,
+// doctorInfoKeys / doctorIsInfoKey: emitted natively by cli-printing-press >= 4.32
+// (doctor.go); the hand copy this file used to carry was retired on the 4.32.5 reprint.
+// The native map does not list every informational row this connector's doctor
+// emits (db_path is a path, auth_key_url / auth_instructions are free text), so
+// the extra keys are merged in here; scanning them for "error"/"missing" is how
+// --fail-on used to trip on a healthy connector.
+func init() {
+	for _, k := range []string{"auth_key_url", "auth_instructions", "db_path"} {
+		doctorInfoKeys[k] = true
+	}
 }
-
-func doctorIsInfoKey(key string) bool { return doctorInfoKeys[key] }
 
 // doctorBaseURLIsPlaceholder reports whether base is still the value this
 // connector shipped with rather than the operator's own instance.

@@ -11,8 +11,7 @@ func newAgentsCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "agents",
 		Short:       "Get, count, fetch, enable, disable, create, and update agents",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -56,6 +55,6 @@ func newAgentsCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newAgentsUpdateSoftwareCmd(flags))
 	cmd.AddCommand(newAgentsActionsCmd(flags))
 	cmd.AddCommand(newAgentsUploadsCmd(flags))
-	cmd.AddCommand(newNovelAgentsDossierCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelAgentsDossierCmd(flags))
 	return cmd
 }

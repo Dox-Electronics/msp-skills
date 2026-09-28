@@ -45,13 +45,12 @@ func newConfigOverrideGetCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli config-override get",
 		Annotations: map[string]string{"pp:endpoint": "config-override.get", "pp:method": "GET", "pp:path": "/config-override", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/config-override"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/config-override"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "config-override", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "config-override", path, retainCLIQueryParams(cmd, map[string]string{
 				"createdAt__lt":      formatCLIParamValue(flagCreatedAtLt),
 				"agentVersions":      formatCLIParamValue(flagAgentVersions),
 				"skip":               formatCLIParamValue(flagSkip),
@@ -76,10 +75,11 @@ func newConfigOverrideGetCmd(flags *rootFlags) *cobra.Command {
 				"name__like":         formatCLIParamValue(flagNameLike),
 				"countOnly":          formatCLIParamValue(flagCountOnly),
 				"createdAt__gt":      formatCLIParamValue(flagCreatedAtGt),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"createdAt__lt": {"created-at-lt"}, "agentVersions": {"agent-versions"}, "skip": {"skip"}, "sortOrder": {"sort-order"}, "createdAt__lte": {"created-at-lte"}, "description__like": {"description-like"}, "agentIds": {"agent-ids"}, "ids": {"ids"}, "createdAt__gte": {"created-at-gte"}, "osTypes": {"os-types"}, "siteIds": {"site-ids"}, "sortBy": {"sort-by"}, "groupIds": {"group-ids"}, "limit": {"limit"}, "query": {"query"}, "accountIds": {"account-ids"}, "cursor": {"cursor"}, "createdAt__between": {"created-at-between"}, "tenant": {"tenant"}, "skipCount": {"skip-count"}, "versionOption": {"version-option"}, "name__like": {"name-like"}, "countOnly": {"count-only"}, "createdAt__gt": {"created-at-gt"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -87,7 +87,7 @@ func newConfigOverrideGetCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -96,22 +96,31 @@ func newConfigOverrideGetCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -121,7 +130,11 @@ func newConfigOverrideGetCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagCreatedAtLt, "created-at-lt", "", "Config Overrides created before this timestamp. Example: '2018-02-27T04:49:26.257525Z'.")

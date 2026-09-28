@@ -4,11 +4,522 @@
 package cli
 
 import (
+	"bytes"
+
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
+
+	"sentinelone-pp-cli/internal/cliutil"
+
+	"github.com/spf13/cobra"
+	"sentinelone-pp-cli/internal/cliutil/testenv"
 )
+
+func TestMain(m *testing.M) {
+	os.Exit(testenv.RunSandboxed(m))
+}
+
+func TestDeclaredAPISurfaceReachable(t *testing.T) {
+	expected := []string{
+		"accounts",
+		"accounts create",
+		"accounts expire-now",
+		"accounts expire-now expire-an-account",
+		"accounts get",
+		"accounts get-by-id",
+		"accounts policy",
+		"accounts policy account",
+		"accounts policy update-account",
+		"accounts reactivate",
+		"accounts reactivate account",
+		"accounts revert-policy",
+		"accounts revert-policy revert-policy",
+		"accounts uninstall-password",
+		"accounts uninstall-password generate-regenerate",
+		"accounts uninstall-password get",
+		"accounts uninstall-password get-metadata",
+		"accounts uninstall-password revoke",
+		"accounts update",
+		"activities",
+		"activities get",
+		"activities get-activity-types",
+		"agents",
+		"agents abort-scan",
+		"agents actions",
+		"agents actions fetch-files",
+		"agents approve-uninstall",
+		"agents broadcast-message",
+		"agents can-run-remote-shell",
+		"agents clear-remote-shell",
+		"agents connect-to-network",
+		"agents count",
+		"agents decommission",
+		"agents disable",
+		"agents disable-ranger",
+		"agents disconnect-from-network",
+		"agents enable",
+		"agents enable-ranger",
+		"agents fetch-firewall-logs",
+		"agents fetch-firewall-rules",
+		"agents fetch-logs",
+		"agents get",
+		"agents get-application",
+		"agents get-installed-apps-for",
+		"agents get-passphrase",
+		"agents initiate-scan",
+		"agents mark-as-uptodate",
+		"agents move-between-sites",
+		"agents move-to-console",
+		"agents processes",
+		"agents randomize-uuid",
+		"agents reject-uninstall",
+		"agents reset-local-config",
+		"agents restart",
+		"agents set-external-id",
+		"agents set-persistent-configuration-overrides",
+		"agents shutdown",
+		"agents start-remote-profiling",
+		"agents start-remote-shell",
+		"agents stop-remote-profiling",
+		"agents terminate-remote-shell",
+		"agents uninstall",
+		"agents update-software",
+		"agents uploads",
+		"agents uploads export-agent-logs",
+		"application-inventory",
+		"application-inventory-counts",
+		"applications",
+		"applications forensics",
+		"applications forensics application",
+		"applications forensics application-connections",
+		"applications forensics application-detailed",
+		"applications forensics export-application",
+		"cloud-detection",
+		"cloud-detection activate-rules",
+		"cloud-detection create-rule",
+		"cloud-detection delete-rules",
+		"cloud-detection disable-rules",
+		"cloud-detection get-alerts",
+		"cloud-detection get-rules",
+		"cloud-detection update-alert-analyst-verdict",
+		"cloud-detection update-rule",
+		"cloud-detection updated-threat-incident",
+		"config-override",
+		"config-override create",
+		"config-override delete",
+		"config-override delete-configoverride",
+		"config-override get",
+		"config-override update",
+		"device-control",
+		"device-control copy-rules",
+		"device-control create-rule",
+		"device-control delete-rules",
+		"device-control enable-disable-rules",
+		"device-control export-rules",
+		"device-control get-configuration",
+		"device-control get-device-rules",
+		"device-control get-events",
+		"device-control import-rules",
+		"device-control move-rules",
+		"device-control reorder-rules",
+		"device-control update-configuration",
+		"device-control update-device-rule",
+		"dv",
+		"dv cancel-running-query",
+		"dv create-query-and-get-query-id",
+		"dv download-source-process-file",
+		"dv get-events",
+		"dv get-events-by-type",
+		"dv get-process-state",
+		"dv get-query-status",
+		"exclusions",
+		"exclusions create",
+		"exclusions delete",
+		"exclusions get",
+		"exclusions update",
+		"exclusions validate-item",
+		"filters",
+		"filters delete",
+		"filters delete-deep-visibility",
+		"filters get",
+		"filters get-deep-visibility",
+		"filters save",
+		"filters save-deep-visibility",
+		"filters update",
+		"filters update-deep-visibility",
+		"firewall-control",
+		"firewall-control add-rule-tags",
+		"firewall-control add-tags",
+		"firewall-control add-tags add-rule-tags-by-category",
+		"firewall-control configuration",
+		"firewall-control configuration get-by-category",
+		"firewall-control configuration update-by-category",
+		"firewall-control copy-rules",
+		"firewall-control create-firewall-rule",
+		"firewall-control create-firewall-rule-by-category",
+		"firewall-control delete-rules",
+		"firewall-control delete-rules-by-category",
+		"firewall-control enable",
+		"firewall-control enable disable-rules-by-category",
+		"firewall-control enable-disable-rules",
+		"firewall-control export",
+		"firewall-control export rules-by-category",
+		"firewall-control export-rules",
+		"firewall-control get-configuration",
+		"firewall-control get-firewall-rules",
+		"firewall-control get-firewall-rules-by-category",
+		"firewall-control get-protocols",
+		"firewall-control get-tag-firewall-rules",
+		"firewall-control import",
+		"firewall-control import rules-by-category",
+		"firewall-control import-rules",
+		"firewall-control item-copy-rules",
+		"firewall-control item-copy-rules by-category",
+		"firewall-control item-move-rules",
+		"firewall-control item-move-rules by-category",
+		"firewall-control item-set-location",
+		"firewall-control item-set-location by-category",
+		"firewall-control move-rules",
+		"firewall-control protocols",
+		"firewall-control protocols get-by-category",
+		"firewall-control remove-rule-tags",
+		"firewall-control remove-tags",
+		"firewall-control remove-tags remove-rule-tags-by-category",
+		"firewall-control reorder",
+		"firewall-control reorder rules-by-category",
+		"firewall-control reorder-rules",
+		"firewall-control set-location",
+		"firewall-control update-configuration",
+		"firewall-control update-firewall-rule-by-category",
+		"groups",
+		"groups create",
+		"groups delete",
+		"groups get",
+		"groups get-by-id",
+		"groups move-agents",
+		"groups move-agents move-agents",
+		"groups policy",
+		"groups policy group",
+		"groups policy update-group",
+		"groups regenerate-key",
+		"groups regenerate-key regenerate-group-token",
+		"groups revert-policy",
+		"groups revert-policy revert-policy",
+		"groups update",
+		"groups update-ranks",
+		"hashes",
+		"hashes classification",
+		"hashes classification hash",
+		"hashes reputation",
+		"hashes reputation hash",
+		"installed-applications",
+		"installed-applications get",
+		"installed-applications get-cves",
+		"last-activity-as-syslog",
+		"locations",
+		"locations create",
+		"locations delete",
+		"locations get",
+		"locations update",
+		"ranger",
+		"ranger add-cred-details",
+		"ranger add-new-deploy-command-for-device-from-agent-from-task-infra",
+		"ranger change-device-review",
+		"ranger change-device-review-in-bulk",
+		"ranger change-device-tags",
+		"ranger create-cred-group",
+		"ranger delete-cred-group",
+		"ranger delete-cred-group-detail",
+		"ranger export-data",
+		"ranger get-cred-group-details",
+		"ranger get-cred-groups",
+		"ranger get-gateways",
+		"ranger get-settings",
+		"ranger get-table",
+		"ranger json",
+		"ranger json export-raw-data",
+		"ranger json raw-data",
+		"ranger update-cred-group",
+		"ranger update-cred-group-details",
+		"ranger update-gateway",
+		"ranger update-gateways",
+		"ranger update-settings",
+		"rbac",
+		"rbac create-new-role",
+		"rbac delete-role",
+		"rbac get-all-roles",
+		"rbac get-specific-role-definition",
+		"rbac get-template-for-new-role",
+		"rbac update-role",
+		"remote-scripts",
+		"remote-scripts get-scripts",
+		"remote-scripts run",
+		"remote-scripts upload-a-new-script",
+		"report-tasks",
+		"report-tasks create",
+		"report-tasks get",
+		"report-tasks update",
+		"reports",
+		"reports delete",
+		"reports delete-tasks",
+		"reports download",
+		"reports get",
+		"reports get-insight",
+		"restrictions",
+		"restrictions create-blacklist-item",
+		"restrictions delete-blacklist-item",
+		"restrictions get-blacklist",
+		"restrictions update-blacklist-item",
+		"restrictions validate-blacklist-item",
+		"rogues",
+		"rogues export-data",
+		"rogues get-settings",
+		"rogues get-table",
+		"rogues update-settings",
+		"sentinelone-export",
+		"sentinelone-export activities",
+		"sentinelone-export agents",
+		"sentinelone-export events",
+		"sentinelone-export list-installed-applications",
+		"sentinelone-export threat-timeline",
+		"sentinelonerss",
+		"settings",
+		"settings clear-pending-emails",
+		"settings delete-notification-recipient",
+		"settings get-ad",
+		"settings get-ad-fqdns",
+		"settings get-microsoft",
+		"settings get-notification",
+		"settings get-notification-recipients",
+		"settings get-sms",
+		"settings get-smtp",
+		"settings get-sso",
+		"settings get-syslog",
+		"settings set-ad",
+		"settings set-ad-fqdns",
+		"settings set-microsoft",
+		"settings set-notification",
+		"settings set-notification-recipients",
+		"settings set-sms",
+		"settings set-smtp",
+		"settings set-sso",
+		"settings set-syslog",
+		"settings test-ad",
+		"settings test-microsoft",
+		"settings test-smtp",
+		"settings test-sso",
+		"settings test-syslog",
+		"singularity-marketplace",
+		"singularity-marketplace delete-marketplace-application",
+		"singularity-marketplace enable-or-disable-application",
+		"singularity-marketplace get-applications-catalog",
+		"singularity-marketplace get-configuration-fields",
+		"singularity-marketplace get-configuration-fields-for-catalog-application",
+		"singularity-marketplace get-marketplace-applications",
+		"singularity-marketplace install-applications",
+		"singularity-marketplace update-application-configuration",
+		"site-with-admin",
+		"sites",
+		"sites create",
+		"sites create-duplicate",
+		"sites delete",
+		"sites expire-now",
+		"sites expire-now expire-site",
+		"sites get",
+		"sites get-by-id",
+		"sites policy",
+		"sites policy site",
+		"sites policy update-site",
+		"sites reactivate",
+		"sites reactivate site",
+		"sites regenerate-key",
+		"sites regenerate-key regenerate-site-key",
+		"sites revert-policy",
+		"sites revert-policy revert-policy",
+		"sites update",
+		"system",
+		"system cache-status",
+		"system database-status",
+		"system get-config",
+		"system info",
+		"system set-config",
+		"system status",
+		"tags",
+		"tags create",
+		"tags delete",
+		"tags delete-by-id",
+		"tags edit",
+		"tags get",
+		"tasks-configuration",
+		"tasks-configuration create-task",
+		"tasks-configuration get-child-scope-task-configuration",
+		"tasks-configuration get-task-configuration",
+		"tasks-configuration has-child-scopes",
+		"tenant",
+		"tenant global-policy",
+		"tenant update-global-policy",
+		"tests",
+		"threat-intelligence",
+		"threat-intelligence create-io-cs",
+		"threat-intelligence delete-io-cs",
+		"threats",
+		"threats add-note-to-multiple",
+		"threats add-to-blacklist",
+		"threats add-to-exclusions",
+		"threats disable-engines",
+		"threats download-from-cloud",
+		"threats download-from-cloud download-from-cloud",
+		"threats explore",
+		"threats explore get-events",
+		"threats export",
+		"threats export-mitigation-report",
+		"threats fetch-file",
+		"threats get",
+		"threats mitigate",
+		"threats notes",
+		"threats notes delete-threat",
+		"threats notes get-threat",
+		"threats notes update-threat",
+		"threats timeline",
+		"threats timeline get-threat",
+		"threats update-analyst-verdict",
+		"threats update-external-ticket-id",
+		"threats updated-incident",
+		"threats whitening-options",
+		"threats whitening-options exclusion-options",
+		"update",
+		"update delete-packages",
+		"update download-agent-package",
+		"update download-package",
+		"update get-latest-packages",
+		"update latest-packages-by-os",
+		"update package",
+		"upload",
+		"upload agent-package",
+		"upload deploy-system-package",
+		"upload system-package",
+		"user",
+		"users",
+		"users api-token-details",
+		"users api-token-details token-by-user-id",
+		"users auth-app",
+		"users auth-by-sso",
+		"users auth-recovery-code",
+		"users bulk-delete",
+		"users change-password",
+		"users check-global",
+		"users check-remote-shell-permissions",
+		"users check-viewer",
+		"users create",
+		"users delete",
+		"users disable-2-fa",
+		"users email-verification",
+		"users enable-2-fa",
+		"users enable-2-fa-app",
+		"users generate-api-token",
+		"users generate-i-frame-token",
+		"users generate-recovery-code",
+		"users get",
+		"users list",
+		"users login",
+		"users login-by-api-token",
+		"users login-by-token",
+		"users logout",
+		"users redirect-to-sso",
+		"users request-2-fa-app",
+		"users revoke-api-token",
+		"users send-verification-email",
+		"users sign-eula",
+		"users token-details",
+		"users update",
+		"users validate-verification-token",
+	}
+	actual := make(map[string]struct{}, len(expected))
+	type pendingCommand struct {
+		command *cobra.Command
+		path    string
+	}
+	queue := make([]pendingCommand, 0, len(expected))
+	for _, child := range RootCmd().Commands() {
+		queue = append(queue, pendingCommand{command: child, path: child.Name()})
+	}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		actual[current.path] = struct{}{}
+		for _, child := range current.command.Commands() {
+			queue = append(queue, pendingCommand{
+				command: child,
+				path:    strings.TrimSpace(current.path + " " + child.Name()),
+			})
+		}
+	}
+
+	var missing []string
+	for _, commandPath := range expected {
+		if _, ok := actual[commandPath]; !ok {
+			missing = append(missing, commandPath)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("declared API command paths missing from generated Cobra tree: %s", strings.Join(missing, ", "))
+	}
+}
+
+func TestNoDuplicateCommandNames(t *testing.T) {
+	type pendingCommand struct {
+		command *cobra.Command
+		path    string
+	}
+	queue := []pendingCommand{}
+	queue = append(queue, pendingCommand{command: RootCmd(), path: ""})
+	var duplicates []string
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		seen := map[string]struct{}{}
+		for _, child := range current.command.Commands() {
+			childPath := strings.TrimSpace(current.path + " " + child.Name())
+			if _, exists := seen[child.Name()]; exists {
+				duplicates = append(duplicates, childPath)
+			} else {
+				seen[child.Name()] = struct{}{}
+			}
+			queue = append(queue, pendingCommand{command: child, path: childPath})
+		}
+	}
+	if len(duplicates) > 0 {
+		t.Fatalf("generated Cobra tree contains duplicate sibling command names: %s", strings.Join(duplicates, ", "))
+	}
+}
+func TestWriteCredentialSaveErrorEnvelope(t *testing.T) {
+	var out bytes.Buffer
+	cause := &cliutil.CredentialsPermissionError{
+		Path: "/tmp/credentials.toml",
+		Err:  errors.New("unsafe permissions"),
+	}
+	if !writeCredentialSaveErrorEnvelope(&out, &rootFlags{asJSON: true}, fmt.Errorf("saving token: %w", cause)) {
+		t.Fatal("permission failure envelope was not written")
+	}
+
+	var payload struct {
+		Saved               bool   `json:"saved"`
+		CredentialsPath     string `json:"credentials_path"`
+		PermissionsVerified bool   `json:"permissions_verified"`
+		Error               string `json:"error"`
+		Code                int    `json:"code"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("permission failure envelope must be valid JSON: %v\n%s", err, out.String())
+	}
+	if !payload.Saved || payload.CredentialsPath != cause.Path || payload.PermissionsVerified || payload.Error == "" || payload.Code == 0 {
+		t.Fatalf("permission failure envelope = %+v, want saved path, unsafe permissions, error, and non-zero code", payload)
+	}
+}
 
 // TestIsCobraUsageError covers the six pre-RunE error shapes Cobra and
 // pflag can produce before any user RunE runs. Each must be detected so
@@ -135,10 +646,16 @@ func TestFilterFields(t *testing.T) {
 			want:   `{"projects":[{"id":"a"}]}`,
 		},
 		{
-			name:   "flat object no match returns empty (no array fallback)",
+			name:   "flat object no match preserves input",
 			input:  `{"a":1,"b":2}`,
 			fields: "c",
-			want:   `{}`,
+			want:   `{"a":1,"b":2}`,
+		},
+		{
+			name:   "unknown selector preserves nested array objects",
+			input:  `{"items":[{"id":"a","name":"Alpha"},{"id":"b","name":"Beta"}]}`,
+			fields: "missing",
+			want:   `{"items":[{"id":"a","name":"Alpha"},{"id":"b","name":"Beta"}]}`,
 		},
 		{
 			// Null pagination cursors are common envelope metadata.
@@ -152,12 +669,11 @@ func TestFilterFields(t *testing.T) {
 		},
 		{
 			// Without a real array sibling the envelope fallback does not
-			// fire, so a flat object whose only "extra" key is null still
-			// returns {} for a non-matching selector.
-			name:   "flat object with null sibling no match returns empty",
+			// fire, but an invalid selector still preserves the input.
+			name:   "flat object with null sibling no match preserves input",
 			input:  `{"a":1,"b":null}`,
 			fields: "c",
-			want:   `{}`,
+			want:   `{"a":1,"b":null}`,
 		},
 		{
 			// Multiple array siblings at the same level each receive the
@@ -169,16 +685,13 @@ func TestFilterFields(t *testing.T) {
 			want:   `{"events":[{"id":"e1"}],"speakers":[{"id":"s1"}]}`,
 		},
 		{
-			// Envelope fallback is intentionally one level deep. A nested
-			// object envelope like {"data":{"items":[...]}} surfaces no
-			// array at the outer level, so the fallback does not fire and
-			// the result is the empty-object that flat-no-match would
-			// produce. Pins the boundary so a future deeper-walk change
-			// is an explicit decision, not an accident.
-			name:   "nested object envelope returns empty (one-level only)",
+			// Generic object descent supports type-keyed envelopes such as
+			// {"data":{"items":[...]}} while keeping the fail-closed
+			// behavior for objects with no collection below them.
+			name:   "nested object envelope descends into collection",
 			input:  `{"data":{"items":[{"id":"a","other":"y"}]}}`,
 			fields: "id",
-			want:   `{}`,
+			want:   `{"data":{"items":[{"id":"a"}]}}`,
 		},
 	}
 	for _, tc := range cases {

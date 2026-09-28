@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"sentinelone-pp-cli/internal/cliutil"
 )
 
 // FeedbackEntry is one line in the local feedback ledger. Every run of
@@ -31,13 +32,12 @@ type FeedbackEntry struct {
 const feedbackMaxTextLen = 4096
 
 func feedbackFilePath() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := cliutil.DataDir()
 	if err != nil {
-		return "", fmt.Errorf("resolving home dir: %w", err)
+		return "", err
 	}
-	dir := filepath.Join(home, ".local", "share", "sentinelone-cli")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("creating state dir: %w", err)
+		return "", fmt.Errorf("creating feedback data dir: %w", err)
 	}
 	return filepath.Join(dir, "feedback.jsonl"), nil
 }
@@ -100,7 +100,7 @@ func newFeedbackCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "feedback [text]",
 		Short: "Record feedback about this CLI (local by default; upstream opt-in)",
-		Long: `Feedback is captured locally first at ~/.local/share/sentinelone-cli/feedback.jsonl.
+		Long: `Feedback is captured locally first in the CLI data directory's feedback.jsonl.
 When ` + "`SENTINELONE_FEEDBACK_ENDPOINT`" + ` is set and either --send is
 passed or ` + "`SENTINELONE_FEEDBACK_AUTO_SEND=true`" + `, the entry is
 POSTed as JSON after the local write.
@@ -108,6 +108,9 @@ POSTed as JSON after the local write.
 Write what surprised you or tripped you up, not a bug report. The
 loop is: agent notices friction -> one invocation -> captured -> the
 maintainer sees it.`,
+		Example: `  sentinelone-cli feedback "docs said exclusive but the boundary is inclusive"
+  sentinelone-cli feedback --stdin < notes.txt
+  sentinelone-cli feedback list`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var text string
 			if useStdin {
@@ -191,6 +194,9 @@ func newFeedbackListCmd(flags *rootFlags) *cobra.Command {
   sentinelone-cli feedback list --limit 5
   sentinelone-cli feedback list --json`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if dryRunOK(flags) {
+				return writeDryRun(cmd.OutOrStdout(), flags, "feedback list")
+			}
 			p, err := feedbackFilePath()
 			if err != nil {
 				return err

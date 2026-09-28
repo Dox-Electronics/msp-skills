@@ -72,13 +72,12 @@ func newCloudDetectionGetAlertsCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli cloud-detection get-alerts",
 		Annotations: map[string]string{"pp:endpoint": "cloud-detection.get-alerts", "pp:method": "GET", "pp:path": "/cloud-detection/alerts", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/cloud-detection/alerts"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/cloud-detection/alerts"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "cloud-detection", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "cloud-detection", path, retainCLIQueryParams(cmd, map[string]string{
 				"scopes":                                formatCLIParamValue(flagScopes),
 				"ruleName__like_any":                    formatCLIParamValue(flagRuleNameLikeAny),
 				"incidentStatus__in":                    formatCLIParamValue(flagIncidentStatusIn),
@@ -130,10 +129,11 @@ func newCloudDetectionGetAlertsCmd(flags *rootFlags) *cobra.Command {
 				"origAgentName__like_any":               formatCLIParamValue(flagOrigAgentNameLikeAny),
 				"analystVerdict__in":                    formatCLIParamValue(flagAnalystVerdictIn),
 				"skipCount":                             formatCLIParamValue(flagSkipCount),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"scopes": {"scopes"}, "ruleName__like_any": {"rule-name-like-any"}, "incidentStatus__in": {"incident-status-in"}, "sourceProcessFileHashSha256__like_any": {"source-process-file-hash-sha256-like-any"}, "osType__in": {"os-type-in"}, "origAgentUuid__like_any": {"orig-agent-uuid-like-any"}, "siteIds": {"site-ids"}, "k8sNamespaceName__like_any": {"k8s-namespace-name-like-any"}, "sourceProcessFilePath__like_any": {"source-process-file-path-like-any"}, "machineType__in": {"machine-type-in"}, "reportedAt__gt": {"reported-at-gt"}, "createdAt__lt": {"created-at-lt"}, "skip": {"skip"}, "reportedAt__lt": {"reported-at-lt"}, "sortBy": {"sort-by"}, "createdAt__gt": {"created-at-gt"}, "k8sControllerLabels__like_any": {"k8s-controller-labels-like-any"}, "accountIds": {"account-ids"}, "reportedAt__gte": {"reported-at-gte"}, "k8sCluster__like_any": {"k8s-cluster-like-any"}, "tenant": {"tenant"}, "ids": {"ids"}, "query": {"query"}, "k8sControllerName__like_any": {"k8s-controller-name-like-any"}, "severity__in": {"severity-in"}, "createdAt__gte": {"created-at-gte"}, "sortOrder": {"sort-order"}, "k8sNamespaceLabels__like_any": {"k8s-namespace-labels-like-any"}, "reportedAt__lte": {"reported-at-lte"}, "k8sNode__like_any": {"k8s-node-like-any"}, "sourceProcessFileHashSha1__like_any": {"source-process-file-hash-sha1-like-any"}, "origAgentOsRevision__contains": {"orig-agent-os-revision-contains"}, "countOnly": {"count-only"}, "cursor": {"cursor"}, "groupIds": {"group-ids"}, "k8sPodLabels__like_any": {"k8s-pod-labels-like-any"}, "containerName__like_any": {"container-name-like-any"}, "containerImageName__like_any": {"container-image-name-like-any"}, "sourceProcessFileHashMd5__like_any": {"source-process-file-hash-md5-like-any"}, "containerLabels__like_any": {"container-labels-like-any"}, "k8sPod__like_any": {"k8s-pod-like-any"}, "createdAt__lte": {"created-at-lte"}, "limit": {"limit"}, "disablePagination": {"disable-pagination"}, "sourceProcessName__like_any": {"source-process-name-like-any"}, "origAgentVersion__like_any": {"orig-agent-version-like-any"}, "sourceProcessCommandline__like_any": {"source-process-commandline-like-any"}, "sourceProcessStoryline__like_any": {"source-process-storyline-like-any"}, "origAgentName__like_any": {"orig-agent-name-like-any"}, "analystVerdict__in": {"analyst-verdict-in"}, "skipCount": {"skip-count"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -141,7 +141,7 @@ func newCloudDetectionGetAlertsCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -150,22 +150,31 @@ func newCloudDetectionGetAlertsCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -175,7 +184,11 @@ func newCloudDetectionGetAlertsCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagScopes, "scopes", "", "Filter results by scope. Example: 'global'.")
