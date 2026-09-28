@@ -113,8 +113,10 @@ All remote agents need `sentinelone-mcp` reachable as a public **HTTPS** endpoin
 in HTTP mode with your credentials in the environment:
 
 ```bash
-SENTINELONE_API_TOKEN=<value> SENTINELONE_BASE_URL=<value> SENTINELONE_MCP_HTTP_TOKEN=<value> sentinelone-mcp --transport http --addr :7777
+SENTINELONE_API_TOKEN=<value> SENTINELONE_BASE_URL=<value> SENTINELONE_MCP_HTTP_TOKEN=<value> sentinelone-mcp --transport http
 ```
+
+Leave `--addr` at its default, which binds loopback only on port 7777, and let the tunnel terminate TLS: the server refuses a plaintext bind on any non-loopback address (including `--addr :7777`, which binds every interface) unless you pass `--tls-cert` and `--tls-key`. Every caller must send `Authorization: Bearer <SENTINELONE_MCP_HTTP_TOKEN>`.
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel
 (Cloudflare Tunnel, ngrok) or your own reverse proxy. The path is part of the
