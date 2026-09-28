@@ -25,6 +25,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -46,7 +47,12 @@ const doctorBaseURLEnv = "HUBSPOT_BASE_URL"
 // placeholder and doctor would never dial it. Refusing to check a healthy
 // install is the same class of defect as blessing a broken one, pointed the
 // other way.
-const doctorShippedBaseURL = "https://api.hubapi.com"
+//
+// HubSpot has ONE public API root for every portal (https://api.hubapi.com);
+// the shipped default is the operator's real endpoint, not a stand-in, so it
+// must not be treated as a placeholder. Empty disables the exact-match rule;
+// the template / YOUR_ / reserved-domain rules below still apply.
+const doctorShippedBaseURL = ""
 
 // doctorInfoKeys are report entries rendered without a status indicator:
 // paths, versions, and the free-text hints that tell an operator how to get a
@@ -253,4 +259,16 @@ func doctorUnexpectedStatus(status int, path string, report map[string]any) {
 		return
 	}
 	report["credentials"] = fmt.Sprintf("WARN not verified (HTTP %d from %s) - the endpoint did not confirm the credential.", status, path)
+}
+
+// doctorReachIsRefusedRedirect reports whether the reachability probe failed
+// only because the server answered with a redirect the client deliberately
+// refuses to follow (https->http downgrade, unsupported scheme, private
+// destination). The server responded, so the host is reachable; treating it as
+// "unreachable" skipped the credential probe and told every operator of a
+// working install that the API was down.
+func doctorReachIsRefusedRedirect(err error) bool {
+	return errors.Is(err, client.ErrRedirectProtocolDowngrade) ||
+		errors.Is(err, client.ErrRedirectUnsupportedScheme) ||
+		errors.Is(err, client.ErrRedirectPrivateDestination)
 }

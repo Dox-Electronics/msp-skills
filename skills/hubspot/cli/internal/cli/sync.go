@@ -229,7 +229,7 @@ Resource scoping:
 			// the API no longer returns after a complete walk, unless --no-prune
 			// disables it. Flat tenant-scoped / single-tenant reconcile (per
 			// resource) and dependent per-parent reconcile share this gate.
-			prune := full && !noPrune
+			prune := hsSyncPruneAllowed(full, noPrune, paramFlags, resourceParamFlags, globalParamFlags)
 			work := make(chan string, len(resources))
 			results := make(chan syncResult, len(resources))
 

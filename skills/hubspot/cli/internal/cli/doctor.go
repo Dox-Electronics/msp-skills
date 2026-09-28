@@ -336,6 +336,12 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 						} else {
 							report["api"] = fmt.Sprintf("reachable (HTTP %d at /)", status)
 						}
+					case doctorReachIsRefusedRedirect(reachErr):
+						// Hand-wired (handfixes.json: doctor-verdict-tracks-reality):
+						// the server answered / with a redirect the client refuses
+						// to follow (api.hubapi.com 302s to http://developers.hubspot.com).
+						// The host is reachable; the credential probe decides.
+						report["api"] = fmt.Sprintf("reachable (redirect at / not followed: %s)", reachErr)
 					default:
 						// Network-level failure: DNS, connection refused, TLS,
 						// transport init, etc. The transport itself didn't
@@ -351,7 +357,7 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 						// operator (or an agent parsing doctor --json) saw silence where
 						// the answer should have been.
 						report["credentials"] = "ERROR not verified: no credential is configured, so nothing was probed."
-					} else if reachErr != nil && !errors.As(reachErr, &reachAPIErr) {
+					} else if reachErr != nil && !errors.As(reachErr, &reachAPIErr) && !doctorReachIsRefusedRedirect(reachErr) {
 						report["credentials"] = "skipped (API unreachable)"
 					} else {
 						doctorProbeCredentials(cmd.Context(), c, cmd.Root(), "hubspot-cli", report)
