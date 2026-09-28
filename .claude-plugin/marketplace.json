@@ -1052,7 +1052,7 @@
       "name": "wordpress",
       "source": "./skills/wordpress",
       "description": "Publish and manage WordPress pages, posts, media",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "category": "marketing",
       "tags": [
         "wordpress",

@@ -4,6 +4,58 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.1.5] - 2026-09-28
+
+Reprinted on cli-printing-press **4.32.5** (from 4.26.1). Every command and flag that
+shipped in 0.1.4 is still here; the list below is what changed for an operator or an
+agent.
+
+### Changed
+- **Engine 4.32.5.** Runtime and MCP layers regenerated on the current press. Every MCP
+  tool-call value is now joined to its flag as one word (`--flag=value`, press #4647) by
+  generated code rather than a hand-fix, and the MCP server refuses argument names
+  carrying `=` and the local-store destination flags (`--db`, `--output`, `--audit-dir`,
+  ...) at the tool schema as well as at run time.
+- **Local store schema 4 -> 11.** The first 0.1.5 command that opens the local mirror
+  migrates it in place. An older binary cannot reopen a migrated store; re-run `sync`
+  if you go back to 0.1.4.
+- **`--agent` no longer implies `--yes`.** `--agent` still sets `--json --compact
+  --no-input --no-color`; a write that asks for confirmation now needs an explicit
+  `--yes`.
+- **New commands:** `teach`, `recall`, `learnings`, `playbook` (a local learning loop,
+  off with `--no-learn`) and `api` (browse the raw endpoint surface), with matching MCP
+  tools. The group-level MCP tools (`posts`, `pages`, `media`, `categories`, `tags`,
+  `users`, `settings`, `workflow`), which only returned their own help text, are gone;
+  every leaf tool (`posts_list`, `media_update`, `workflow_status`, ...) is unchanged.
+- **New global flags:** `--receipt` / `--receipt-file` / `--audit-dir` write a private
+  run receipt; `--client-profile` selects a tenant-gated client profile; `--rate-limit`
+  now defaults to `auto` (paces to the server's rate-limit headers).
+- **Credentials precedence.** When both `config.toml` and the credentials file hold a
+  credential, the config file now wins. 0.1.4 never wrote credentials into
+  `config.toml`, so this only matters if you put one there by hand.
+- **Remote MCP (`--transport http`)** now requires `WORDPRESS_MCP_HTTP_TOKEN` (callers
+  send `Authorization: Bearer <token>`) and binds loopback `127.0.0.1:7777` by default;
+  a non-loopback `--addr` needs `--tls-cert` and `--tls-key`. `mcp-install.md` and the
+  ChatGPT FAQ now show the working command (the old `--addr :7777` line is refused).
+- **Two new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+  `mcp-install.md`): `WORDPRESS_MCP_HTTP_TOKEN` and `PRINTING_PRESS_CLIENT_PROFILE`.
+  `WORDPRESS_BASE_URL` and `WORDPRESS_BASIC_AUTH` are unchanged.
+- **Release artifacts:** the `.mcpb` bundle carries the companion `wordpress-cli`, and
+  `wordpress-mcp` reports its real version (`0.1.5`) instead of `0.0.0-dev`.
+
+### Fixed
+- **`doctor` checks the credential against `/users/me`.** It used to probe the public
+  `/categories` route, so a web server that strips the `Authorization` header (a common
+  Application Password failure) still read "valid". A site that disables `/users/me`
+  gets a not-verified warning instead of a wrong-base_url error.
+- **`--config` / `WORDPRESS_CONFIG` keep one credentials file.** `auth set-token` and
+  `auth logout` now write and clear the same `data/credentials.toml` beside the config
+  that loading reads, including through a symlinked config, so a stale token can no
+  longer survive a new `set-token` or a `logout`.
+- **MCP `search` and `sql` read the store `sync` wrote.** On a fresh install `sync`
+  writes a credential-scoped `data-<hash>.db`; the MCP tools looked only for `data.db`
+  and reported no local data.
+
 ## [0.1.4] - 2026-09-10
 
 ### Fixed
