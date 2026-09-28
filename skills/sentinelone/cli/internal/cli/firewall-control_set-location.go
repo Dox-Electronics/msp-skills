@@ -20,6 +20,7 @@ func newFirewallControlSetLocationCmd(flags *rootFlags) *cobra.Command {
 		Short:       "Set location attributes for a Location Aware Firewall Control rule.",
 		Example:     "  sentinelone-cli firewall-control set-location",
 		Annotations: map[string]string{"pp:endpoint": "firewall-control.set-location", "pp:method": "POST", "pp:path": "/firewall-control/set-location"},
+		Args:        firewallControlLeafArgs("set-location"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !stdinBody {
 			}

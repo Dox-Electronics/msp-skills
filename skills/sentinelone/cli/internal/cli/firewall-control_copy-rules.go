@@ -20,6 +20,7 @@ func newFirewallControlCopyRulesCmd(flags *rootFlags) *cobra.Command {
 		Short:       "Copy a set of rules to other scopes. In the filter of the body, enter the properties to define the source.",
 		Example:     "  sentinelone-cli firewall-control copy-rules",
 		Annotations: map[string]string{"pp:endpoint": "firewall-control.copy-rules", "pp:method": "POST", "pp:path": "/firewall-control/copy-rules"},
+		Args:        firewallControlLeafArgs("copy-rules"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !stdinBody {
 			}

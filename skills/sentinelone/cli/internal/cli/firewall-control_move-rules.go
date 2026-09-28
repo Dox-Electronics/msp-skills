@@ -20,6 +20,7 @@ func newFirewallControlMoveRulesCmd(flags *rootFlags) *cobra.Command {
 		Short:       "Remove Firewall Rules, defined with the ID of the rules (run 'firewall-control')",
 		Example:     "  sentinelone-cli firewall-control move-rules",
 		Annotations: map[string]string{"pp:endpoint": "firewall-control.move-rules", "pp:method": "POST", "pp:path": "/firewall-control/move-rules"},
+		Args:        firewallControlLeafArgs("move-rules"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !stdinBody {
 			}

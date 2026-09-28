@@ -276,6 +276,45 @@
      "code_only": true
     }
    ]
+  },
+  {
+   "id": "firewall-control-renamed-by-category",
+   "summary": "firewall-control copy-rules / move-rules / set-location refuse stray positionals, and name the new `item-<name> by-category` path when the pre-reprint spelling `<name> by-category` is used",
+   "why": "On cli-printing-press 4.24 the generator registered two constructors under the same name in firewall-control, so `copy-rules`, `move-rules` and `set-location` were groups whose only child was `by-category` and the leaf endpoints were unreachable. The 4.32.5 reprint (2026-09-28) disambiguated them: the three names are now the leaf POST endpoints and the by-category operations moved to `firewall-control item-<name> by-category`. The generated leaf commands accept and ignore positionals, so a script still typing `firewall-control move-rules by-category --stdin` silently POSTed its body to a different mutation (/firewall-control/move-rules) - found by the Codex review of the reprint (P1). firewallControlLeafArgs rejects any positional before a request is built. A reprint regenerates the three leaf files without the Args line and go build stays green; these asserts notice. TestFirewallControlOldSpellingSendsNothing proves the old spelling sends zero requests (it fails, with one request sent, when the Args line is removed) and TestFirewallControlOldBySpellingIsRefused proves the bare leaf and the new item-* path still resolve.",
+   "status": "active",
+   "spec_encode_followup": "cli-printing-press should emit Args: cobra.NoArgs on endpoint commands that declare no positionals, which would make a mistyped subcommand an error fleet-wide; this entry then reduces to the migration message.",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/firewall-control_copy-rules.go",
+     "contains": "Args:        firewallControlLeafArgs(\"copy-rules\"),",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall-control_move-rules.go",
+     "contains": "Args:        firewallControlLeafArgs(\"move-rules\"),",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall-control_set-location.go",
+     "contains": "Args:        firewallControlLeafArgs(\"set-location\"),",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall_control_compat.go",
+     "contains": "func firewallControlLeafArgs(name string) cobra.PositionalArgs {",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall_control_compat_test.go",
+     "contains": "func TestFirewallControlOldSpellingSendsNothing(",
+     "min_count": 1,
+     "code_only": true
+    }
+   ]
   }
  ]
 }
