@@ -456,15 +456,34 @@ class GoPackage(Scope):
 RE_ASSIGN = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(.+?)[\t ]*$")
 # A package-level (or local) `var names = []string{` whose literal spans several
 # lines. RE_ASSIGN stops at the end of the first line and binds the useless
-# opener `[]string{`; this binds the whole literal so a reader that ranges over
-# the var (`for _, name := range JournalHarnessSessionEnvVars { os.Getenv(name) }`,
-# printing-press 4.32.5+ internal/learn/journal.go) resolves to its element
-# names instead of being reported as an unresolvable read.
-# The body excludes '{' as well as '}': a nested literal (`pick([]string{"x"}),`)
-# would otherwise end the match at ITS closing brace and bind a truncated
-# literal that looks complete. A literal with nested braces is left unbound, so
-# its opener keeps RE_ASSIGN's unresolvable binding and the read stays reported.
-RE_ASSIGN_SLICE = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(\[\]string\s*\{[^{}]*\})")
+# opener `[]string{`; slice_literal_bindings() binds the whole literal so a
+# reader that ranges over the var (`for _, name := range
+# JournalHarnessSessionEnvVars { os.Getenv(name) }`, printing-press 4.32.5+
+# internal/learn/journal.go) resolves to its element names instead of being
+# reported as an unresolvable read. Only the HEAD is a regex: the literal's end
+# is found with match_close(), which balances braces and skips string/rune
+# literals, so neither a nested literal nor a quoted '}' can truncate it into a
+# binding that looks complete while omitting later elements.
+RE_ASSIGN_SLICE_HEAD = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(\[\]string\s*\{)")
+
+
+def slice_literal_bindings(src: str) -> list[tuple[int, str, str]]:
+    """[(line_start, name, literal)] for every MULTI-LINE []string literal.
+
+    An unbalanced literal is not bound at all, so its opener keeps RE_ASSIGN's
+    unresolvable binding and the read stays reported.
+    """
+    out = []
+    for m in RE_ASSIGN_SLICE_HEAD.finditer(src):
+        brace = m.end(2) - 1
+        close = match_close(src, brace, "{", "}")
+        if close == -1:
+            continue
+        literal = src[m.start(2):close + 1]
+        if "\n" not in literal:
+            continue  # single-line literals are already bound whole by RE_ASSIGN
+        out.append((m.start(), m.group(1), literal))
+    return out
 RE_RANGE_LIT = re.compile(r"for\s+[\w,\s_]*?([A-Za-z_]\w*)\s*:=\s*range\s+(\[\]string\{[^}]*\}|[A-Za-z_]\w*)")
 RE_FUNC = re.compile(r"(?m)^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(")
 # A function LITERAL. Go's `name := func(args) { ... }` is a callable helper with
@@ -547,19 +566,23 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
         pkg.spans[path] = spans
         pkg.decl_sites[path] = decls
 
-        # Line starts where RE_ASSIGN_SLICE bound a complete multi-line []string
-        # literal. Only THOSE openers are skipped below: any other `x := T{`
-        # opener (a map index, a struct literal) keeps its unresolvable binding,
-        # so a read through it stays reported instead of silently falling back
-        # to an unrelated package-level binding of the same name.
-        slice_starts = {m.start() for m in RE_ASSIGN_SLICE.finditer(src)}
-        for regex, group in ((RE_ASSIGN, 2), (RE_ASSIGN_SLICE, 2), (RE_RANGE_LIT, 2)):
+        # Line starts where a complete multi-line []string literal was bound
+        # whole. Only THOSE openers are skipped below: any other `x := T{` opener
+        # (a map index, a struct literal, an unbalanced literal) keeps its
+        # unresolvable binding, so a read through it stays reported instead of
+        # silently falling back to an unrelated package-level binding.
+        slices = slice_literal_bindings(src)
+        slice_starts = {start for start, _, _ in slices}
+        for start, name, literal in slices:
+            scope = pkg.func_at(path, start) or pkg
+            scope.bind(name, literal)
+        for regex, group in ((RE_ASSIGN, 2), (RE_RANGE_LIT, 2)):
             for m in regex.finditer(src):
                 rhs = m.group(group)
                 if regex is RE_ASSIGN and m.start() in slice_starts and rhs.rstrip().endswith("{"):
-                    # The first line of a multi-line []string literal that
-                    # RE_ASSIGN_SLICE bound whole; binding the bare opener too
-                    # would put UNRESOLVED into the union.
+                    # The first line of a multi-line []string literal bound whole
+                    # above; binding the bare opener too would put UNRESOLVED
+                    # into the union.
                     continue
                 scope = pkg.func_at(path, m.start()) or pkg
                 scope.bind(m.group(1), rhs)
@@ -1502,7 +1525,16 @@ _fixture(
     'var names = []string{\n\tpick([]string{"x"}),\n\t"COVE_PASSWORD",\n}\n'
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
-    set(), {"name"},
+    {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
+)
+_fixture(
+    "multi-line []string with a quoted '}' is not truncated into a falsely complete binding",
+    'package cli\nimport "os"\n'
+    'func pick(v string) string {\n\treturn "CODEX_THREAD_ID"\n}\n'
+    'var names = []string{\n\tpick("}"),\n\t"COVE_PASSWORD",\n}\n'
+    'func a() string {\n\tfor _, name := range names {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
