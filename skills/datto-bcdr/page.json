@@ -93,10 +93,10 @@
     },
     {
       "q": "Can it change anything in Datto, or just read?",
-      "a": "Read-only for everyday use - every analysis, list, and report command only reads. The single exception is `import`, an explicit bulk data-load command you would never run by accident; preview it with --dry-run first."
+      "a": "Read-only. Every analysis, list, and report command only reads, and the Datto BCDR API this connector targets exposes no write endpoints, so there is no command that can change anything in Datto. The only things it writes are on your own machine: the local SQLite mirror (`sync`), an optional export file, and the local learning store."
     }
   ],
-  "governance_summary": "The datto-bcdr skill is read-only for everyday use: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and writes only to a local SQLite mirror on your machine. The single API-mutating command is `import`, a bulk data load you preview with --dry-run; nothing else can change remote state. Scope the partner key pair to what your workflow needs, and keep autonomous agents to read plus previewed imports.",
+  "governance_summary": "The datto-bcdr skill is read-only against Datto: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and the API it targets exposes no write endpoints, so no command can change remote state. It writes only to your own machine - the local SQLite mirror, an optional export file, and the local learning store. Scope the partner key pair to what your workflow needs; the only human-in-the-loop commands are the ones that replace or clear the stored credential.",
   "safety_tiers": [
     {
       "tier": "Read",
@@ -105,12 +105,17 @@
     },
     {
       "tier": "Write (routine)",
-      "examples": "import (POST each record to the Datto BCDR API)",
-      "policy": "Preview with --dry-run, then a reviewed write"
+      "examples": "none - the Datto BCDR API exposes no write endpoints",
+      "policy": "n/a"
+    },
+    {
+      "tier": "Local state",
+      "examples": "sync, export (GET from Datto, write the SQLite mirror or a local file), teach*, learnings, playbook amend, profile, feedback (local learning store and settings; never contact Datto)",
+      "policy": "Allow"
     },
     {
       "tier": "Credential / config",
-      "examples": "auth set-token, auth logout (replace or clear stored credentials)",
+      "examples": "auth set-credentials, auth logout (replace or clear stored credentials)",
       "policy": "Human-in-the-loop only"
     }
   ]

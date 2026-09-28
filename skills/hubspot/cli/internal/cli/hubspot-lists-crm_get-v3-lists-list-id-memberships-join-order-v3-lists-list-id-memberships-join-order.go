@@ -20,27 +20,41 @@ func newHubspotListsCrmGetV3ListsListIdMembershipsJoinOrderV3ListsListIdMembersh
 	cmd := &cobra.Command{
 		Use:         "get-v3-lists-list-id-memberships-join-order-v3-lists-list-id-memberships-join-order <listId>",
 		Short:       "Get v3 lists list id memberships join order v3 lists list id memberships join order",
-		Example:     "  hubspot-cli hubspot-lists-crm get-v3-lists-list-id-memberships-join-order-v3-lists-list-id-memberships-join-order 550e8400-e29b-41d4-a716-446655440000",
 		Annotations: map[string]string{"pp:endpoint": "hubspot-lists-crm.get-v3-lists-list-id-memberships-join-order-v3-lists-list-id-memberships-join-order", "pp:method": "GET", "pp:path": "/crm/v3/lists/{listId}/memberships/join-order", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <listId>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <listId>"))
 			}
+			path := "/crm/v3/lists/{listId}/memberships/join-order"
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("listId is required\nUsage: %s <%s>", cmd.CommandPath(), "listId"))
+			}
+			path = replacePathParam(path, "listId", args[0])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/lists/{listId}/memberships/join-order"
-			path = replacePathParam(path, "listId", args[0])
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "hubspot-lists-crm", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "live", "hubspot-lists-crm", path, retainCLIQueryParams(cmd, map[string]string{
 				"after":  formatCLIParamValue(flagAfter),
 				"before": formatCLIParamValue(flagBefore),
 				"limit":  formatCLIParamValue(flagLimit),
-			}, nil, flagAll, "after", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"after": {"after"}, "before": {"before"}, "limit": {"limit"}}, "after", "cursor"), nil, flagAll, "after", "cursor", "limit", 100, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -48,7 +62,7 @@ func newHubspotListsCrmGetV3ListsListIdMembershipsJoinOrderV3ListsListIdMembersh
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -57,22 +71,31 @@ func newHubspotListsCrmGetV3ListsListIdMembershipsJoinOrderV3ListsListIdMembersh
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -82,7 +105,11 @@ func newHubspotListsCrmGetV3ListsListIdMembershipsJoinOrderV3ListsListIdMembersh
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagAfter, "after", "", "The paging cursor token of the last successfully read resource will be returned as the `paging.next.")

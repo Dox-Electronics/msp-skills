@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,13 +23,16 @@ import (
 	"hubspot-pp-cli/internal/client"
 	"hubspot-pp-cli/internal/cliutil"
 	"hubspot-pp-cli/internal/config"
+	"hubspot-pp-cli/internal/learn"
+	"hubspot-pp-cli/internal/mcp/bound"
 	"hubspot-pp-cli/internal/mcp/cobratree"
+	"hubspot-pp-cli/internal/platform"
 	"hubspot-pp-cli/internal/store"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
-	mcpToolResultMaxBytes = 60000
-	mcpToolResultMaxItems = 50
 	// MCP hosts can fan out tool calls faster than a human CLI session.
 	// Keep them on the same polite-client limiter path instead of disabling
 	// pacing with rate=0; users can still tune human CLI calls with --rate-limit.
@@ -36,8 +41,9 @@ const (
 
 // RegisterTools registers all API operations as MCP tools.
 func RegisterTools(s *server.MCPServer) {
-	// Code-orchestration mode — the full surface is covered by two tools
-	// (<api>_search + <api>_execute). Endpoint-mirror tools are suppressed.
+	installFreshTenantGate(s)
+	// Code-orchestration mode — the full surface is covered by registry tools
+	// (<api>_search, <api>_get, and <api>_execute). Endpoint-mirror tools are suppressed.
 	RegisterCodeOrchestrationTools(s)
 	// Search tool — faster than iterating list endpoints for finding specific items
 	s.AddTool(
@@ -54,7 +60,7 @@ func RegisterTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("sql",
 			mcplib.WithDescription("Run read-only SQL against local database. Use for ad-hoc analysis, aggregations, and joins across synced resources. Requires sync first."),
-			mcplib.WithString("query", mcplib.Required(), mcplib.Description("SQL query (SELECT or WITH...SELECT). Synced records live in resources(resource_type, id, data); filter by resource_type and use json_extract on data, e.g. SELECT json_extract(data,'$.name') FROM resources WHERE resource_type='items'.")),
+			mcplib.WithString("query", mcplib.Required(), mcplib.Description("SQL query (SELECT or WITH...SELECT). Synced records live in resources(resource_type, id, data); filter by resource_type and use json_extract on data, e.g. SELECT json_extract(data,'$.name') FROM resources WHERE resource_type='batch'.")),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 		),
@@ -69,7 +75,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 		),
-		handleContext,
+		handleContext(s),
 	)
 
 	// Runtime Cobra-tree mirror — exposes every user-facing command that is
@@ -83,8 +89,16 @@ type mcpParamBinding struct {
 	Location           string
 	BodyPath           []string
 	Format             string
+	QueryArray         bool
+	QueryStyle         string
+	QueryExplode       bool
 	RequestContentType string
 	Default            string
+}
+
+type mcpPageConfig struct {
+	CursorParam    string
+	NextCursorPath string
 }
 
 func formatMCPParamValue(v any) string {
@@ -111,8 +125,73 @@ func formatMCPParamValue(v any) string {
 		}
 		return strconv.FormatFloat(f, 'f', -1, 32)
 	default:
+		// Composite values (a native []any / map[string]any from an array or
+		// object param) reach this path when bound to a query or path slot;
+		// JSON-encode them so the wire value is valid JSON rather than Go's
+		// "[a b c]" / "map[...]" rendering. Body params never come through
+		// here — they are stored natively in bodyArgs and marshalled there.
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+func mcpPathValue(v any) string {
+	return cliutil.EscapePathParam(formatMCPParamValue(v))
+}
+func appendMCPArrayQueryParam(path, name string, value any, style string, explode bool) string {
+	var values []string
+	switch typed := value.(type) {
+	case []any:
+		values = make([]string, 0, len(typed))
+		for _, item := range typed {
+			values = append(values, formatMCPParamValue(item))
+		}
+	case []string:
+		values = typed
+	default:
+		raw := formatMCPParamValue(value)
+		var decoded []any
+		if json.Unmarshal([]byte(raw), &decoded) == nil {
+			for _, item := range decoded {
+				values = append(values, formatMCPParamValue(item))
+			}
+		} else {
+			for _, item := range strings.Split(raw, ",") {
+				if item = strings.TrimSpace(item); item != "" {
+					values = append(values, item)
+				}
+			}
+		}
+	}
+	if len(values) == 0 {
+		return path
+	}
+
+	query := url.Values{}
+	switch style {
+	case "spaceDelimited":
+		query.Set(name, strings.Join(values, " "))
+	case "pipeDelimited":
+		query.Set(name, strings.Join(values, "|"))
+	case "form":
+		if explode {
+			for _, item := range values {
+				query.Add(name, item)
+			}
+		} else {
+			query.Set(name, strings.Join(values, ","))
+		}
+	default:
+		query.Set(name, formatMCPParamValue(value))
+	}
+
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + query.Encode()
 }
 func mcpMultipartFieldValue(v any) string {
 	if s, ok := v.(string); ok {
@@ -144,17 +223,23 @@ func setNestedBodyArg(body map[string]any, path []string, value any) {
 }
 
 // makeAPIHandler creates a generic MCP tool handler for an API endpoint.
-func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse bool, headerOverrides map[string]string, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
+func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse bool, headerOverrides map[string]string, pageConfig mcpPageConfig, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-		c, err := newMCPClient()
+		c, platformSession, err := newMCPClient(ctx)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return mcpToolError(err.Error()), nil
+		}
+		if platformSession != nil {
+			defer platformSession.ZeroCredentials()
 		}
 
 		// mcp-go v0.47+ made CallToolParams.Arguments an `any` to support
 		// non-map payloads; GetArguments() returns the map[string]any shape
 		// we rely on here (or an empty map when the payload is something else).
 		args := req.GetArguments()
+		if err := cli.AdoptMCPOutputSemantics(platformSession, args); err != nil {
+			return mcpToolError(err.Error()), nil
+		}
 
 		// positionalParams mixes real URL path params with CLI positional
 		// args that map to query params (e.g. `search <query>` -> ?query=);
@@ -164,6 +249,24 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 		pathParams := make(map[string]bool, len(positionalParams))
 		params := make(map[string]string)
 		bodyArgs := make(map[string]any)
+		mcpCursor := ""
+		if pageConfig.CursorParam != "" {
+			knownArgs["cursor"] = true
+			if v, ok := args["cursor"]; ok {
+				s, ok := v.(string)
+				if !ok {
+					return mcpToolError("cursor must be an opaque string returned by a previous MCP response"), nil
+				}
+				mcpCursor = s
+				upstreamCursor, err := bound.UpstreamCursor(s)
+				if err != nil {
+					return mcpToolError(err.Error()), nil
+				}
+				if upstreamCursor != "" {
+					params[pageConfig.CursorParam] = upstreamCursor
+				}
+			}
+		}
 		var headers map[string]string
 		if len(headerOverrides) > 0 {
 			headers = make(map[string]string, len(headerOverrides)+1)
@@ -201,7 +304,12 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			case "path":
 				placeholder := "{" + binding.WireName + "}"
 				pathParams[binding.PublicName] = true
-				path = strings.Replace(path, placeholder, formatMCPParamValue(v), 1)
+				path = strings.Replace(path, placeholder, mcpPathValue(v), 1)
+			case "header":
+				if headers == nil {
+					headers = map[string]string{}
+				}
+				headers[binding.WireName] = formatMCPParamValue(v)
 			case "body":
 				if len(binding.BodyPath) > 0 {
 					setNestedBodyArg(bodyArgs, binding.BodyPath, v)
@@ -219,15 +327,19 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 				if s, ok := v.(string); ok && s != "" {
 					var parsed any
 					if err := json.Unmarshal([]byte(s), &parsed); err != nil {
-						return mcplib.NewToolResultError("body_json must be a valid JSON object: " + err.Error()), nil
+						return mcpToolError("body_json must be a valid JSON object: " + err.Error()), nil
 					}
 					if _, isMap := parsed.(map[string]any); !isMap {
-						return mcplib.NewToolResultError(fmt.Sprintf("body_json must be a JSON object, got JSON %T", parsed)), nil
+						return mcpToolError(fmt.Sprintf("body_json must be a JSON object, got JSON %T", parsed)), nil
 					}
 					bodyJSONOverride = json.RawMessage(s)
 				}
 			default:
-				params[binding.WireName] = formatMCPParamValue(v)
+				if binding.QueryArray {
+					path = appendMCPArrayQueryParam(path, binding.WireName, v, binding.QueryStyle, binding.QueryExplode)
+				} else {
+					params[binding.WireName] = formatMCPParamValue(v)
+				}
 			}
 		}
 		for _, p := range positionalParams {
@@ -237,7 +349,7 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			pathParams[p] = true
 			if v, ok := args[p]; ok {
-				path = strings.Replace(path, placeholder, formatMCPParamValue(v), 1)
+				path = strings.Replace(path, placeholder, mcpPathValue(v), 1)
 			}
 		}
 
@@ -260,10 +372,18 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 		switch method {
 		case "GET":
 			if len(headers) > 0 {
-				data, err = c.GetWithHeaders(ctx, path, params, headers)
+				if readOnly {
+					data, err = c.GetWithHeaders(ctx, path, params, headers)
+				} else {
+					data, err = c.GetMutatingWithHeaders(ctx, path, params, headers)
+				}
 				break
 			}
-			data, err = c.Get(ctx, path, params)
+			if readOnly {
+				data, err = c.Get(ctx, path, params)
+			} else {
+				data, err = c.GetMutating(ctx, path, params)
+			}
 		case "POST":
 			if multipart {
 				if len(headers) > 0 {
@@ -305,7 +425,15 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 		case "PUT":
 			if multipart {
 				if len(headers) > 0 {
+					if readOnly {
+						data, _, err = c.PutQueryMultipartWithParamsAndHeaders(ctx, path, params, multipartFields, multipartFileFields, headers)
+						break
+					}
 					data, _, err = c.PutMultipartWithParamsAndHeaders(ctx, path, params, multipartFields, multipartFileFields, headers)
+					break
+				}
+				if readOnly {
+					data, _, err = c.PutQueryMultipartWithParams(ctx, path, params, multipartFields, multipartFileFields)
 					break
 				}
 				data, _, err = c.PutMultipartWithParams(ctx, path, params, multipartFields, multipartFileFields)
@@ -313,21 +441,45 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			if len(bodyJSONOverride) > 0 {
 				if len(headers) > 0 {
-					data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyJSONOverride, headers)
+					if readOnly {
+						data, _, err = c.PutQueryWithParamsAndHeaders(ctx, path, params, bodyJSONOverride, headers)
+					} else {
+						data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyJSONOverride, headers)
+					}
 					break
 				}
-				data, _, err = c.PutWithParams(ctx, path, params, bodyJSONOverride)
+				if readOnly {
+					data, _, err = c.PutQueryWithParams(ctx, path, params, bodyJSONOverride)
+				} else {
+					data, _, err = c.PutWithParams(ctx, path, params, bodyJSONOverride)
+				}
 				break
 			}
 			if len(headers) > 0 {
-				data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				if readOnly {
+					data, _, err = c.PutQueryWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				} else {
+					data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				}
 				break
 			}
-			data, _, err = c.PutWithParams(ctx, path, params, bodyArgs)
+			if readOnly {
+				data, _, err = c.PutQueryWithParams(ctx, path, params, bodyArgs)
+			} else {
+				data, _, err = c.PutWithParams(ctx, path, params, bodyArgs)
+			}
 		case "PATCH":
 			if multipart {
 				if len(headers) > 0 {
+					if readOnly {
+						data, _, err = c.PatchQueryMultipartWithParamsAndHeaders(ctx, path, params, multipartFields, multipartFileFields, headers)
+						break
+					}
 					data, _, err = c.PatchMultipartWithParamsAndHeaders(ctx, path, params, multipartFields, multipartFileFields, headers)
+					break
+				}
+				if readOnly {
+					data, _, err = c.PatchQueryMultipartWithParams(ctx, path, params, multipartFields, multipartFileFields)
 					break
 				}
 				data, _, err = c.PatchMultipartWithParams(ctx, path, params, multipartFields, multipartFileFields)
@@ -335,17 +487,33 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			if len(bodyJSONOverride) > 0 {
 				if len(headers) > 0 {
-					data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyJSONOverride, headers)
+					if readOnly {
+						data, _, err = c.PatchQueryWithParamsAndHeaders(ctx, path, params, bodyJSONOverride, headers)
+					} else {
+						data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyJSONOverride, headers)
+					}
 					break
 				}
-				data, _, err = c.PatchWithParams(ctx, path, params, bodyJSONOverride)
+				if readOnly {
+					data, _, err = c.PatchQueryWithParams(ctx, path, params, bodyJSONOverride)
+				} else {
+					data, _, err = c.PatchWithParams(ctx, path, params, bodyJSONOverride)
+				}
 				break
 			}
 			if len(headers) > 0 {
-				data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				if readOnly {
+					data, _, err = c.PatchQueryWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				} else {
+					data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				}
 				break
 			}
-			data, _, err = c.PatchWithParams(ctx, path, params, bodyArgs)
+			if readOnly {
+				data, _, err = c.PatchQueryWithParams(ctx, path, params, bodyArgs)
+			} else {
+				data, _, err = c.PatchWithParams(ctx, path, params, bodyArgs)
+			}
 		case "DELETE":
 			if len(headers) > 0 {
 				data, _, err = c.DeleteWithParamsAndHeaders(ctx, path, params, headers)
@@ -353,187 +521,128 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			data, _, err = c.DeleteWithParams(ctx, path, params)
 		default:
-			return mcplib.NewToolResultError("unsupported method: " + method), nil
+			return mcpToolError("unsupported method: " + method), nil
 		}
 
 		if err != nil {
 			msg := err.Error()
 			switch {
 			case strings.Contains(msg, "HTTP 409"):
-				return mcplib.NewToolResultText("already exists (no-op)"), nil
+				return mcpToolTextWithPlatform("already exists (no-op)", platformSession), nil
 			case strings.Contains(msg, "HTTP 400") && cliutil.LooksLikeAuthError(msg):
-				return mcplib.NewToolResultError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: the API rejected the request — this usually means auth is missing or invalid." +
-					"\n      Set it with: hubspot-cli auth set-token <token> or export HUBSPOT_ACCESS_TOKEN=\"your-token-here\"" +
+					"\n      Set it with: echo \"$TOKEN\" | hubspot-cli auth set-token or export HUBSPOT_ACCESS_TOKEN=\"your-token-here\"" +
 					"\n      Get a key at: https://app.hubspot.com/private-apps" +
 					"\n      Create a private app, grant CRM scopes, and copy the access token." +
 					"\n      Run 'hubspot-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 401"):
-				return mcplib.NewToolResultError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: check your token." +
-					"\n      Set it with: hubspot-cli auth set-token <token> or export HUBSPOT_ACCESS_TOKEN=\"your-token-here\"" +
+					"\n      Set it with: echo \"$TOKEN\" | hubspot-cli auth set-token or export HUBSPOT_ACCESS_TOKEN=\"your-token-here\"" +
 					"\n      Get a key at: https://app.hubspot.com/private-apps" +
 					"\n      Create a private app, grant CRM scopes, and copy the access token." +
 					"\n      Run 'hubspot-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 403"):
-				return mcplib.NewToolResultError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: your credentials are valid but lack access to this resource. Check that they have the required permissions and match the API's expected auth scheme." +
-					"\n      Set it with: hubspot-cli auth set-token <token> or export HUBSPOT_ACCESS_TOKEN=\"your-token-here\"" +
+					"\n      Set it with: echo \"$TOKEN\" | hubspot-cli auth set-token or export HUBSPOT_ACCESS_TOKEN=\"your-token-here\"" +
 					"\n      Get a key at: https://app.hubspot.com/private-apps" +
 					"\n      Create a private app, grant CRM scopes, and copy the access token." +
 					"\n      Run 'hubspot-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 404"):
 				if method == "DELETE" {
-					return mcplib.NewToolResultText("already deleted (no-op)"), nil
+					return mcpToolTextWithPlatform("already deleted (no-op)", platformSession), nil
 				}
-				return mcplib.NewToolResultError("not found: " + msg), nil
+				return mcpToolError("not found: " + msg), nil
 			case strings.Contains(msg, "HTTP 429"):
-				return mcplib.NewToolResultError("rate limited: " + msg), nil
+				return mcpToolError("rate limited: " + msg), nil
 			default:
-				return mcplib.NewToolResultError(msg), nil
+				return mcpToolError(msg), nil
 			}
 		}
 
 		if binaryResponse {
-			out, _ := json.Marshal(map[string]any{
+			encoded := base64.StdEncoding.EncodeToString(data)
+			out, err := json.Marshal(map[string]any{
 				"content_encoding": "base64",
-				"data_base64":      base64.StdEncoding.EncodeToString(data),
+				"data_base64":      encoded,
 				"byte_count":       len(data),
 			})
-			return mcplib.NewToolResultText(string(out)), nil
+			if err != nil {
+				return mcpToolError(fmt.Sprintf("encoding binary result: %v", err)), nil
+			}
+			if len(out) > bound.MaxBytes {
+				return mcpToolError(fmt.Sprintf("binary response is too large for MCP text output: %d response bytes encode to %d base64 bytes and %d MCP result bytes, exceeding the %d byte budget. Use the companion CLI command with --output <file> to save the payload locally.", len(data), len(encoded), len(out), bound.MaxBytes)), nil
+			}
+			result := string(out)
+			if platformSession != nil {
+				result = bound.WithMetadata(result, platformSession.OutputMetadata())
+			}
+			return mcplib.NewToolResultText(result), nil
 		}
-		return mcpToolResultText(method, data), nil
+		if pageConfig.CursorParam != "" {
+			return mcpToolPageResultTextWithPlatform(method, data, pageConfig, mcpCursor, platformSession), nil
+		}
+		return mcpToolResultTextWithPlatform(method, data, platformSession), nil
 	}
 }
 
 func mcpToolResultText(method string, data json.RawMessage) *mcplib.CallToolResult {
-	trimmed := strings.TrimSpace(string(data))
-	if strings.EqualFold(method, "GET") && len(trimmed) > 0 && trimmed[0] == '[' {
-		var items []json.RawMessage
-		if json.Unmarshal(data, &items) == nil {
-			return mcplib.NewToolResultText(string(mcpBoundedListEnvelope("items", items, len(data))))
-		}
-	}
-	if len(data) <= mcpToolResultMaxBytes {
-		return mcplib.NewToolResultText(string(data))
-	}
-	if strings.EqualFold(method, "GET") {
-		if out, ok := mcpBoundedSingleArrayObject(data); ok {
-			return mcplib.NewToolResultText(string(out))
-		}
-	}
-	return mcplib.NewToolResultText(string(mcpOversizedPreviewEnvelope(data)))
+	return mcpToolResultTextWithPlatform(method, data, nil)
 }
 
-func mcpBoundedSingleArrayObject(data json.RawMessage) ([]byte, bool) {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(data, &obj) != nil {
-		return nil, false
+func mcpToolTextWithPlatform(result string, platformSession *platform.Session) *mcplib.CallToolResult {
+	if platformSession != nil {
+		result = bound.WithMetadata(result, platformSession.OutputMetadata())
 	}
-	arrayField := ""
-	var items []json.RawMessage
-	for key, raw := range obj {
-		trimmed := strings.TrimSpace(string(raw))
-		if len(trimmed) == 0 || trimmed[0] != '[' {
-			continue
-		}
-		var candidate []json.RawMessage
-		if json.Unmarshal(raw, &candidate) != nil {
-			continue
-		}
-		if arrayField != "" {
-			return nil, false
-		}
-		arrayField = key
-		items = candidate
-	}
-	if arrayField == "" {
-		return nil, false
-	}
-	build := func(subset []json.RawMessage) any {
-		out := make(map[string]any, len(obj)+6)
-		for key, raw := range obj {
-			if key == arrayField {
-				out[key] = subset
-				continue
-			}
-			out[key] = raw
-		}
-		if len(subset) < len(items) {
-			out["_pp_truncated"] = true
-			out["_pp_total_count"] = len(items)
-			out["_pp_returned_count"] = len(subset)
-			out["_pp_original_bytes"] = len(data)
-			out["_pp_max_bytes"] = mcpToolResultMaxBytes
-			out["_pp_note"] = "Typed MCP endpoint response exceeded the tool result budget. Narrow the request with limit, offset, filters, search/sql, or a command-mirror tool with --agent/--compact/--select."
-		}
-		return out
-	}
-	out := mcpFitJSONItems(items, build)
-	if len(out) > mcpToolResultMaxBytes {
-		return nil, false
-	}
-	return out, true
+	return mcplib.NewToolResultText(result)
 }
 
-func mcpBoundedListEnvelope(field string, items []json.RawMessage, originalBytes int) []byte {
-	build := func(subset []json.RawMessage) any {
-		out := map[string]any{
-			"count": len(items),
-			field:   subset,
-		}
-		if len(subset) < len(items) {
-			out["truncated"] = true
-			out["returned_count"] = len(subset)
-			out["original_bytes"] = originalBytes
-			out["max_bytes"] = mcpToolResultMaxBytes
-			out["note"] = "Typed MCP endpoint response exceeded the tool result budget. Narrow the request with limit, offset, filters, search/sql, or a command-mirror tool with --agent/--compact/--select."
-		}
-		return out
-	}
-	return mcpFitJSONItems(items, build)
+func mcpToolResultTextWithPlatform(method string, data json.RawMessage, platformSession *platform.Session) *mcplib.CallToolResult {
+	result := bound.EndpointResponse(method, data)
+	return mcpToolTextWithPlatform(result, platformSession)
 }
 
-func mcpFitJSONItems(items []json.RawMessage, build func([]json.RawMessage) any) []byte {
-	limit := len(items)
-	if limit > mcpToolResultMaxItems {
-		limit = mcpToolResultMaxItems
-	}
-	for n := limit; n >= 0; n-- {
-		out, err := json.Marshal(build(items[:n]))
-		if err != nil {
-			continue
-		}
-		if len(out) <= mcpToolResultMaxBytes || n == 0 {
-			return out
-		}
-	}
-	out, _ := json.Marshal(build(items[:0]))
-	return out
+// mcpToolError keeps provider-controlled typed endpoint errors within the MCP
+// text-result budget just like successful endpoint results.
+func mcpToolError(message string) *mcplib.CallToolResult {
+	return mcplib.NewToolResultError(bound.Text(message))
 }
 
-func mcpOversizedPreviewEnvelope(data json.RawMessage) []byte {
-	previewBytes := data
-	if len(previewBytes) > 4000 {
-		previewBytes = previewBytes[:4000]
-	}
-	out, _ := json.Marshal(map[string]any{
-		"truncated":      true,
-		"original_bytes": len(data),
-		"max_bytes":      mcpToolResultMaxBytes,
-		"preview":        string(previewBytes),
-		"note":           "Typed MCP endpoint response exceeded the tool result budget and was not a recognized list envelope. Narrow the request with filters, search/sql, or a command-mirror tool with --agent/--compact/--select.",
+func mcpToolPageResultText(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string) *mcplib.CallToolResult {
+	return mcpToolPageResultTextWithPlatform(method, data, pageConfig, cursor, nil)
+}
+
+func mcpToolPageResultTextWithPlatform(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string, platformSession *platform.Session) *mcplib.CallToolResult {
+	result := bound.EndpointPageResponse(method, data, bound.PageOptions{
+		Cursor:         cursor,
+		CursorParam:    pageConfig.CursorParam,
+		NextCursorPath: pageConfig.NextCursorPath,
 	})
-	return out
+	if platformSession != nil {
+		result = bound.WithMetadata(result, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(result)
 }
 
-func newMCPClient() (*client.Client, error) {
-	home, _ := os.UserHomeDir()
-	cfgPath := filepath.Join(home, ".config", "hubspot-cli", "config.toml")
-	cfg, err := config.Load(cfgPath)
+func newMCPClient(ctx context.Context) (*client.Client, *platform.Session, error) {
+	cfg, err := newMCPConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	return newMCPClientFromConfig(ctx, cfg)
+}
+
+func newMCPConfig() (*config.Config, error) {
+	cfg, err := config.Load("")
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
+	return cfg, nil
+}
+
+func newMCPClientFromConfig(ctx context.Context, cfg *config.Config) (*client.Client, *platform.Session, error) {
 	c := client.New(cfg, 60*time.Second, defaultMCPRateLimit)
 	// Agents calling through MCP need fresh data every call. The on-disk
 	// response cache survives across MCP server invocations, so a
@@ -541,16 +650,94 @@ func newMCPClient() (*client.Client, error) {
 	// pre-mutation snapshot for up to the cache TTL. The interactive CLI
 	// constructs its own client and is unaffected.
 	c.NoCache = true
-	return c, nil
+	session, err := cli.BindMCPClient(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cli.ApplyClientHooks(c); err != nil {
+		if session != nil {
+			session.ZeroCredentials()
+		}
+		return nil, nil, fmt.Errorf("initializing MCP client: %w", err)
+	}
+	return c, session, nil
 }
 
-func dbPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "hubspot-cli", "data.db")
+func mcpDBPath() (string, error) {
+	dir, err := cliutil.DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "data.db"), nil
 }
 
-// Note: MCP tools use their own dbPath() because they are in a separate package (main, not cli).
-// The CLI's defaultDBPath() in the cli package uses the same canonical path.
+type mcpStoreStatusKind string
+
+const (
+	mcpStoreStatusEmpty   mcpStoreStatusKind = "empty"
+	mcpStoreStatusPartial mcpStoreStatusKind = "partial"
+	mcpStoreStatusReady   mcpStoreStatusKind = "ready"
+)
+
+func openMCPReadOnlyStore(path string) (*store.Store, *mcplib.CallToolResult) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, mcplib.NewToolResultError(mcpMissingStoreMessage(path))
+		}
+		return nil, mcplib.NewToolResultError(fmt.Sprintf("checking local data store %s: %v", path, err))
+	}
+	db, err := store.OpenReadOnly(path)
+	if err != nil {
+		return nil, mcplib.NewToolResultError(fmt.Sprintf("opening local data store %s: %v. Run hubspot-cli sync to refresh the store, or use live endpoint MCP tools for unsynced data.", path, err))
+	}
+	return db, nil
+}
+
+func mcpMissingStoreMessage(path string) string {
+	return fmt.Sprintf("No local data store found at %s. Run hubspot-cli sync before using MCP search/sql, or use live endpoint MCP tools for unsynced data.", path)
+}
+
+func mcpStoreStatus(db *store.Store) (mcpStoreStatusKind, error) {
+	status, err := db.Status()
+	if err != nil {
+		return "", err
+	}
+	var checkpoints, completed int
+	err = db.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN last_attempt_complete = 1 THEN 1 ELSE 0 END), 0) FROM sync_state`).Scan(&checkpoints, &completed)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no such column: last_attempt_complete") {
+		// Read-only stores have not run the conservative completion migration.
+		// Legacy timestamps were also written by partial walks, so prove nothing.
+		err = db.DB().QueryRow(`SELECT COUNT(*), 0 FROM sync_state`).Scan(&checkpoints, &completed)
+	}
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such table") || strings.Contains(msg, "no such column") {
+			if len(status) > 0 {
+				return mcpStoreStatusReady, nil
+			}
+			return mcpStoreStatusEmpty, nil
+		}
+		return "", err
+	}
+	if checkpoints > 0 {
+		if completed == checkpoints {
+			return mcpStoreStatusReady, nil
+		}
+		return mcpStoreStatusPartial, nil
+	}
+	if len(status) > 0 {
+		return mcpStoreStatusReady, nil
+	}
+	return mcpStoreStatusEmpty, nil
+}
+
+func mcpEmptyStoreNextStep() string {
+	return "Run hubspot-cli sync to populate the local SQLite store before using MCP search/sql."
+}
+
+func mcpPartialStoreNextStep() string {
+	return "The latest sync attempt is incomplete. Resume or rerun hubspot-cli sync before treating local search/sql results as a complete snapshot."
+}
 
 func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
@@ -564,9 +751,13 @@ func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.Call
 		limit = int(v)
 	}
 
-	db, err := store.OpenReadOnly(dbPath())
+	path, err := mcpDBPath()
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("opening database: %v", err)), nil
+		return mcplib.NewToolResultError(fmt.Sprintf("resolving database: %v", err)), nil
+	}
+	db, toolErr := openMCPReadOnlyStore(path)
+	if toolErr != nil {
+		return toolErr, nil
 	}
 	defer db.Close()
 
@@ -574,8 +765,35 @@ func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.Call
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}
+	storeStatus, err := mcpStoreStatus(db)
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("reading store status: %v", err)), nil
+	}
 
-	return toolResultJSON(results)
+	return toolResultJSON(mcpSearchEnvelope(results, storeStatus))
+}
+
+func mcpSearchEnvelope(results []json.RawMessage, storeStatus mcpStoreStatusKind) map[string]any {
+	if results == nil {
+		results = []json.RawMessage{}
+	}
+	out := map[string]any{
+		"count":        len(results),
+		"results":      results,
+		"store_status": storeStatus,
+		"resumable":    false,
+	}
+	if storeStatus == mcpStoreStatusPartial {
+		out["warning"] = "Local data may be incomplete because the latest sync attempt did not finish."
+		out["next_step"] = mcpPartialStoreNextStep()
+	} else if len(results) == 0 {
+		if storeStatus == mcpStoreStatusEmpty {
+			out["next_step"] = mcpEmptyStoreNextStep()
+		} else {
+			out["next_step"] = "No local search matches. Try a broader query, a lower-specificity FTS expression, or sync again if data may be stale."
+		}
+	}
+	return out
 }
 
 // validateReadOnlyQuery gates the MCP sql tool. The agent contract advertised
@@ -728,6 +946,8 @@ func hasTrailingSQLStatement(query string) bool {
 	return false
 }
 
+const mcpSQLMaxValueBytes = 4 << 20
+
 func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
 	query, ok := args["query"].(string)
@@ -739,15 +959,32 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
 
-	db, err := store.OpenReadOnly(dbPath())
+	path, err := mcpDBPath()
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("opening database: %v", err)), nil
+		return mcplib.NewToolResultError(fmt.Sprintf("resolving database: %v", err)), nil
+	}
+	db, toolErr := openMCPReadOnlyStore(path)
+	if toolErr != nil {
+		return toolErr, nil
 	}
 	defer db.Close()
 
-	rows, err := db.Query(query)
+	queryCtx, cancel := bound.WithSQLQueryDeadline(ctx)
+	defer cancel()
+
+	conn, err := db.DB().Conn(queryCtx)
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("query failed: %v", err)), nil
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+	}
+	defer conn.Close()
+
+	if _, err := sqlite.Limit(conn, sqlite3.SQLITE_LIMIT_LENGTH, mcpSQLMaxValueBytes); err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("setting SQL value length cap: %v", err)), nil
+	}
+
+	rows, err := conn.QueryContext(queryCtx, query)
+	if err != nil {
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
 	}
 	defer rows.Close()
 
@@ -755,7 +992,7 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("reading columns: %v", err)), nil
 	}
-	var results []map[string]any
+	scan := bound.NewSQLScanState(cols)
 	for rows.Next() {
 		values := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -763,41 +1000,141 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 			ptrs[i] = &values[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
+			if mcpSQLValueTooBig(err) {
+				return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+			}
 			return mcplib.NewToolResultError(fmt.Sprintf("scanning row: %v", err)), nil
 		}
 		row := make(map[string]any)
 		for i, col := range cols {
 			row[col] = values[i]
 		}
-		results = append(results, row)
+		if !scan.Add(row) {
+			break
+		}
 	}
 	// rows.Next() stops on a mid-iteration error without failing the loop, so
 	// skipping rows.Err() would return a truncated result set as success.
 	if err := rows.Err(); err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("reading rows: %v", err)), nil
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+	}
+	storeStatus, err := mcpStoreStatus(db)
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("reading store status: %v", err)), nil
 	}
 
-	return toolResultJSON(results)
+	return toolResultJSON(mcpSQLEnvelope(scan.Rows, cols, storeStatus, scan.Truncated))
+}
+
+func mcpSQLEnvelope(rows []map[string]any, columns []string, storeStatus mcpStoreStatusKind, truncated bool) map[string]any {
+	if rows == nil {
+		rows = []map[string]any{}
+	}
+	out := map[string]any{
+		"count":        len(rows),
+		"columns":      columns,
+		"rows":         rows,
+		"store_status": storeStatus,
+		"resumable":    false,
+		"truncated":    truncated,
+	}
+	if truncated {
+		out["returned_count"] = len(rows)
+		out["max_bytes"] = bound.MaxBytes
+		out["note"] = bound.SQLResultBoundNote
+	}
+	if storeStatus == mcpStoreStatusPartial {
+		out["warning"] = "Local data may be incomplete because the latest sync attempt did not finish."
+		out["next_step"] = mcpPartialStoreNextStep()
+	} else if len(rows) == 0 && !truncated {
+		if storeStatus == mcpStoreStatusEmpty {
+			out["next_step"] = mcpEmptyStoreNextStep()
+		} else {
+			out["next_step"] = "The read-only SQL query returned no rows. Check resource_type filters, json_extract paths, or run sync again if data may be stale."
+		}
+	}
+	return out
+}
+
+func mcpSQLQueryError(queryCtx context.Context, err error) string {
+	if queryCtx.Err() != nil {
+		return fmt.Sprintf("query cancelled: %v. MCP SQL queries are bounded to %s; narrow the query with WHERE, GROUP BY, or an aggregate.", err, bound.SQLQueryTimeout)
+	}
+	if mcpSQLValueTooBig(err) {
+		return fmt.Sprintf("query failed: a string or blob exceeds the MCP SQL value cap of %d bytes (4 MiB). Narrow the selected columns or use substr, json_extract, or length instead of returning oversized values.", mcpSQLMaxValueBytes)
+	}
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "no such table") {
+		return fmt.Sprintf("query failed: %v. Synced records live in resources(resource_type, id, data), not one SQL table per resource. Filter by resource_type, for example resource_type='batch', and read JSON fields with json_extract(data,'$.field').", err)
+	}
+	return fmt.Sprintf("query failed: %v", err)
+}
+
+func mcpSQLValueTooBig(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_TOOBIG
 }
 
 // toolResultJSON renders v as the indented JSON body of an MCP text result,
 // surfacing a marshal failure as a tool error instead of empty content.
 func toolResultJSON(v any) (*mcplib.CallToolResult, error) {
-	data, err := json.MarshalIndent(v, "", "  ")
+	text, err := bound.JSON(v)
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("encoding result: %v", err)), nil
 	}
-	return mcplib.NewToolResultText(string(data)), nil
+	return mcplib.NewToolResultText(text), nil
+}
+func registeredCommandMirrorCapabilities(s *server.MCPServer, capabilities []map[string]string) []map[string]string {
+	registered := make([]map[string]string, 0, len(capabilities))
+	root := cli.RootCmd()
+	for _, capability := range capabilities {
+		toolName := cobratree.ToolNameForCommand(s, root, capability["cli_command"])
+		if toolName == "" {
+			continue
+		}
+		entry := s.GetTool(toolName)
+		if entry == nil || entry.Tool.Meta == nil || entry.Tool.Meta.AdditionalFields["pp:tenant-gate"] != "child-cli" {
+			continue
+		}
+		capability["mcp_tool"] = toolName
+		registered = append(registered, capability)
+	}
+	return registered
 }
 
-func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+func handleContext(s *server.MCPServer) func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		return handleContextResult(s, ctx, req)
+	}
+}
+
+func handleContextResult(s *server.MCPServer, _ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	paths := map[string]string{}
+	if dir, err := cliutil.ConfigDir(); err == nil {
+		paths["config_dir"] = dir
+	}
+	if dir, err := cliutil.DataDir(); err == nil {
+		paths["data_dir"] = dir
+	}
+	if dir, err := cliutil.StateDir(); err == nil {
+		paths["state_dir"] = dir
+	}
+	if dir, err := cliutil.CacheDir(); err == nil {
+		paths["cache_dir"] = dir
+	}
 	ctx := map[string]any{
 		"api":         "hubspot",
 		"description": "Every Sales Hub feature, plus offline cross-object queries and retained property-change history.",
 		"archetype":   "crm",
-		"tool_count":  232,
+		"tool_count":  len(s.ListTools()),
+		"paths":       paths,
 		// tool_surface tells agents which surface a capability lives on.
 		"tool_surface": "MCP exposes typed endpoint tools plus a runtime mirror of user-facing CLI commands. Endpoint tools keep typed schemas; command-mirror tools shell out to the companion hubspot-cli binary.",
+		// learn_protocol is generated from the single shared source of
+		// truth (the exported constant internal/learn.RecallFirstProtocol)
+		// also consumed by the CLI agent-context command, so the MCP and
+		// CLI agent surfaces cannot drift.
+		"learn_protocol": learn.RecallFirstProtocol,
 		"auth": map[string]any{
 			"type": "bearer_token",
 			"env_vars": []map[string]any{
@@ -818,18 +1155,21 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"description": "Manage batch",
 				"endpoints":   []string{"post-crm-v3-objects-object-type-archive-archive", "post-crm-v3-objects-object-type-create-create", "post-crm-v3-objects-object-type-read-read", "post-crm-v3-objects-object-type-update-update", "post-crm-v3-objects-object-type-upsert-upsert"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "crm",
 				"description": "Manage crm",
 				"endpoints":   []string{"delete-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-archive", "get-v4-objects-object-type-object-id-associations-to-object-type-get-page", "post-v4-associations-from-object-type-to-object-type-batch-archive-archive", "post-v4-associations-from-object-type-to-object-type-batch-associate-default-create-default", "post-v4-associations-from-object-type-to-object-type-batch-create-create", "post-v4-associations-from-object-type-to-object-type-batch-labels-archive-archive-labels", "post-v4-associations-from-object-type-to-object-type-batch-read-get-page", "post-v4-associations-usage-high-usage-report-user-id-request", "put-v4-objects-from-object-type-from-object-id-associations-default-to-object-type-to-object-id-create-default", "put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "groups",
 				"description": "Manage groups",
 				"endpoints":   []string{"delete-crm-v3-properties-object-type-name-archive", "get-crm-v3-properties-object-type-get-all", "get-crm-v3-properties-object-type-name-get-by-name", "patch-crm-v3-properties-object-type-name-update", "post-crm-v3-properties-object-type-create"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-calls-crm",
@@ -837,6 +1177,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-calls-call-id-archive", "get-v3-objects-calls-call-id-get-by-id", "get-v3-objects-calls-get-page", "patch-v3-objects-calls-call-id-update", "post-v3-objects-calls-batch-archive-archive", "post-v3-objects-calls-batch-create-create", "post-v3-objects-calls-batch-read-read", "post-v3-objects-calls-batch-update-update", "post-v3-objects-calls-batch-upsert-upsert", "post-v3-objects-calls-create", "post-v3-objects-calls-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-companies-crm",
@@ -844,6 +1185,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-companies-company-id-archive", "get-v3-objects-companies-company-id-get-by-id", "get-v3-objects-companies-get-page", "patch-v3-objects-companies-company-id-update", "post-v3-objects-companies-batch-archive-archive", "post-v3-objects-companies-batch-create-create", "post-v3-objects-companies-batch-read-read", "post-v3-objects-companies-batch-update-update", "post-v3-objects-companies-batch-upsert-upsert", "post-v3-objects-companies-create", "post-v3-objects-companies-merge-merge", "post-v3-objects-companies-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-contacts-crm",
@@ -851,6 +1193,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-contacts-contact-id", "get-v3-objects-contacts", "get-v3-objects-contacts-contact-id", "patch-v3-objects-contacts-contact-id", "post-v3-objects-contacts", "post-v3-objects-contacts-batch-archive", "post-v3-objects-contacts-batch-create", "post-v3-objects-contacts-batch-read", "post-v3-objects-contacts-batch-update", "post-v3-objects-contacts-gdpr-delete", "post-v3-objects-contacts-merge", "post-v3-objects-contacts-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-deals-crm",
@@ -858,6 +1201,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-0-3-deal-id-archive", "get-v3-objects-0-3-deal-id-get-by-id", "get-v3-objects-0-3-get-page", "patch-v3-objects-0-3-deal-id-update", "post-v3-objects-0-3-batch-archive-archive", "post-v3-objects-0-3-batch-create-create", "post-v3-objects-0-3-batch-read-read", "post-v3-objects-0-3-batch-update-update", "post-v3-objects-0-3-batch-upsert-upsert", "post-v3-objects-0-3-create", "post-v3-objects-0-3-merge-merge", "post-v3-objects-0-3-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-emails-crm",
@@ -865,6 +1209,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-emails-email-id-archive", "get-v3-objects-emails-email-id-get-by-id", "get-v3-objects-emails-get-page", "patch-v3-objects-emails-email-id-update", "post-v3-objects-emails-batch-archive-archive", "post-v3-objects-emails-batch-create-create", "post-v3-objects-emails-batch-read-read", "post-v3-objects-emails-batch-update-update", "post-v3-objects-emails-batch-upsert-upsert", "post-v3-objects-emails-create", "post-v3-objects-emails-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-imports-crm",
@@ -872,6 +1217,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"get-v3-imports-import-id-errors-v3-imports-import-id-errors", "get-v3-imports-import-id-v3-imports-import-id", "get-v3-imports-v3-imports", "post-v3-imports-import-id-cancel-v3-imports-import-id-cancel", "post-v3-imports-v3-imports"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-leads-crm",
@@ -879,6 +1225,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-leads-leads-id-archive", "get-v3-objects-leads-get-page", "get-v3-objects-leads-leads-id-get-by-id", "patch-v3-objects-leads-leads-id-update", "post-v3-objects-leads-batch-archive-archive", "post-v3-objects-leads-batch-create-create", "post-v3-objects-leads-batch-read-read", "post-v3-objects-leads-batch-update-update", "post-v3-objects-leads-batch-upsert-upsert", "post-v3-objects-leads-create", "post-v3-objects-leads-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-line-items-crm",
@@ -886,6 +1233,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-line-items-line-item-id-archive", "get-v3-objects-line-items-get-page", "get-v3-objects-line-items-line-item-id-get-by-id", "patch-v3-objects-line-items-line-item-id-update", "post-v3-objects-line-items-batch-archive-archive", "post-v3-objects-line-items-batch-create-create", "post-v3-objects-line-items-batch-read-read", "post-v3-objects-line-items-batch-update-update", "post-v3-objects-line-items-batch-upsert-upsert", "post-v3-objects-line-items-create", "post-v3-objects-line-items-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-lists-crm",
@@ -893,6 +1241,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-lists-folders-folder-id-v3-lists-folders-folder-id", "delete-v3-lists-list-id-memberships-v3-lists-list-id-memberships", "delete-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion", "delete-v3-lists-list-id-v3-lists-list-id", "get-v3-lists-folders-v3-lists-folders", "get-v3-lists-idmapping-v3-lists-idmapping", "get-v3-lists-list-id-memberships-join-order-v3-lists-list-id-memberships-join-order", "get-v3-lists-list-id-memberships-v3-lists-list-id-memberships", "get-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion", "get-v3-lists-list-id-size-and-edits-history-between-v3-lists-list-id-size-and-edits-history-between", "get-v3-lists-list-id-v3-lists-list-id", "get-v3-lists-object-type-id-object-type-id-name-list-name-v3-lists-object-type-id-object-type-id-name-list-name", "get-v3-lists-records-object-type-id-record-id-memberships-v3-lists-records-object-type-id-record-id-memberships", "get-v3-lists-v3-lists", "post-v3-lists-folders-v3-lists-folders", "post-v3-lists-idmapping-v3-lists-idmapping", "post-v3-lists-records-memberships-batch-read-v3-lists-records-memberships-batch-read", "post-v3-lists-search-v3-lists-search", "post-v3-lists-v3-lists", "put-v3-lists-folders-folder-id-move-new-parent-folder-id-v3-lists-folders-folder-id-move-new-parent-folder-id", "put-v3-lists-folders-folder-id-rename-v3-lists-folders-folder-id-rename", "put-v3-lists-folders-move-list-v3-lists-folders-move-list", "put-v3-lists-list-id-memberships-add-and-remove-v3-lists-list-id-memberships-add-and-remove", "put-v3-lists-list-id-memberships-add-from-source-list-id-v3-lists-list-id-memberships-add-from-source-list-id", "put-v3-lists-list-id-memberships-add-v3-lists-list-id-memberships-add", "put-v3-lists-list-id-memberships-remove-v3-lists-list-id-memberships-remove", "put-v3-lists-list-id-restore-v3-lists-list-id-restore", "put-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion", "put-v3-lists-list-id-update-list-filters-v3-lists-list-id-update-list-filters", "put-v3-lists-list-id-update-list-name-v3-lists-list-id-update-list-name"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-meetings-crm",
@@ -900,6 +1249,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-meetings-meeting-id-archive", "get-v3-objects-meetings-get-page", "get-v3-objects-meetings-meeting-id-get-by-id", "patch-v3-objects-meetings-meeting-id-update", "post-v3-objects-meetings-batch-archive-archive", "post-v3-objects-meetings-batch-create-create", "post-v3-objects-meetings-batch-read-read", "post-v3-objects-meetings-batch-update-update", "post-v3-objects-meetings-batch-upsert-upsert", "post-v3-objects-meetings-create", "post-v3-objects-meetings-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-notes-crm",
@@ -907,12 +1257,14 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-notes-note-id-archive", "get-v3-objects-notes-get-page", "get-v3-objects-notes-note-id-get-by-id", "patch-v3-objects-notes-note-id-update", "post-v3-objects-notes-batch-archive-archive", "post-v3-objects-notes-batch-create-create", "post-v3-objects-notes-batch-read-read", "post-v3-objects-notes-batch-update-update", "post-v3-objects-notes-batch-upsert-upsert", "post-v3-objects-notes-create", "post-v3-objects-notes-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-objects-crm",
 				"description": "Manage hubspot objects crm",
 				"endpoints":   []string{"delete-v3-objects-object-type-object-id-archive", "get-v3-objects-object-type-get-page", "get-v3-objects-object-type-object-id-get-by-id", "patch-v3-objects-object-type-object-id-update", "post-v3-objects-object-type-create"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-owners-crm",
@@ -926,6 +1278,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"description": "Manage hubspot pipelines crm",
 				"endpoints":   []string{"delete-v3-pipelines-object-type-pipeline-id-archive", "delete-v3-pipelines-object-type-pipeline-id-stages-stage-id-archive", "get-v3-pipelines-object-type-get-all", "get-v3-pipelines-object-type-pipeline-id-audit-get-audit", "get-v3-pipelines-object-type-pipeline-id-get-by-id", "get-v3-pipelines-object-type-pipeline-id-stages-get-all", "get-v3-pipelines-object-type-pipeline-id-stages-stage-id-audit-get-audit", "get-v3-pipelines-object-type-pipeline-id-stages-stage-id-get-by-id", "patch-v3-pipelines-object-type-pipeline-id-stages-stage-id-update", "patch-v3-pipelines-object-type-pipeline-id-update", "post-v3-pipelines-object-type-create", "post-v3-pipelines-object-type-pipeline-id-stages-create", "put-v3-pipelines-object-type-pipeline-id-replace", "put-v3-pipelines-object-type-pipeline-id-stages-stage-id-replace"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-products-crm",
@@ -933,18 +1286,21 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-products-product-id-archive", "get-v3-objects-products-get-page", "get-v3-objects-products-product-id-get-by-id", "patch-v3-objects-products-product-id-update", "post-v3-objects-products-batch-archive-archive", "post-v3-objects-products-batch-create-create", "post-v3-objects-products-batch-read-read", "post-v3-objects-products-batch-update-update", "post-v3-objects-products-batch-upsert-upsert", "post-v3-objects-products-create", "post-v3-objects-products-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-properties-batch",
 				"description": "Manage hubspot properties batch",
 				"endpoints":   []string{"post-crm-v3-properties-object-type-archive-archive", "post-crm-v3-properties-object-type-create-create", "post-crm-v3-properties-object-type-read-read"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-properties-crm",
 				"description": "Manage hubspot properties crm",
 				"endpoints":   []string{"delete-v3-properties-object-type-property-name-archive", "get-v3-properties-object-type-get-all", "get-v3-properties-object-type-property-name-get-by-name", "patch-v3-properties-object-type-property-name-update", "post-v3-properties-object-type-create"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-quotes-crm",
@@ -952,6 +1308,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-quotes-quote-id-archive", "get-v3-objects-quotes-get-page", "get-v3-objects-quotes-quote-id-get-by-id", "patch-v3-objects-quotes-quote-id-update", "post-v3-objects-quotes-batch-archive-archive", "post-v3-objects-quotes-batch-create-create", "post-v3-objects-quotes-batch-read-read", "post-v3-objects-quotes-batch-update-update", "post-v3-objects-quotes-batch-upsert-upsert", "post-v3-objects-quotes-create", "post-v3-objects-quotes-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-tasks-crm",
@@ -959,6 +1316,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-tasks-task-id-archive", "get-v3-objects-tasks-get-page", "get-v3-objects-tasks-task-id-get-by-id", "patch-v3-objects-tasks-task-id-update", "post-v3-objects-tasks-batch-archive-archive", "post-v3-objects-tasks-batch-create-create", "post-v3-objects-tasks-batch-read-read", "post-v3-objects-tasks-batch-update-update", "post-v3-objects-tasks-batch-upsert-upsert", "post-v3-objects-tasks-create", "post-v3-objects-tasks-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "hubspot-tickets-crm",
@@ -966,12 +1324,14 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-v3-objects-tickets-ticket-id-archive", "get-v3-objects-tickets-get-page", "get-v3-objects-tickets-ticket-id-get-by-id", "patch-v3-objects-tickets-ticket-id-update", "post-v3-objects-tickets-batch-archive-archive", "post-v3-objects-tickets-batch-create-create", "post-v3-objects-tickets-batch-read-read", "post-v3-objects-tickets-batch-update-update", "post-v3-objects-tickets-batch-upsert-upsert", "post-v3-objects-tickets-create", "post-v3-objects-tickets-merge-merge", "post-v3-objects-tickets-search-do-search"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "objects_search",
 				"description": "Manage objects search",
 				"endpoints":   []string{"post-crm-v3-objects-object-type-search-do-search"},
 				"searchable":  true,
+				"writable":    true,
 			},
 		},
 		"query_tips": []string{
@@ -983,27 +1343,27 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 		},
 		// Command-mirror capabilities are exposed through MCP by shelling out
 		// to the companion CLI binary.
-		"command_mirror_capabilities": []map[string]string{
-			{"name": "Stale objects", "command": "stale", "description": "Find contacts or deals with no engagement in N days, scoped by owner or pipeline stage — instantly, offline.", "rationale": "Left-joins the engagement tables against contacts/deals locally; the live API has no 'no engagement since' filter shape.", "via": "mcp-command-mirror"},
-			{"name": "Owner load", "command": "owner-load", "description": "Open deals per rep per pipeline stage with $ totals, count, and oldest-deal age — the Monday-morning sales-lead report.", "rationale": "SQL GROUP BY on deals × owners × pipeline_stages; HubSpot's web UI requires the Deal Owner report plus a Sheets pivot to assemble this.", "via": "mcp-command-mirror"},
-			{"name": "Pipeline health", "command": "pipeline-health", "description": "Per-stage rollup of count, $ total, $ at risk (idle deals near their close date), and the oldest-stuck deal — one query for a sales-ops dashboard. Closed Lost weighted at probability 0, Closed Won at 1.0.", "rationale": "Local join across deals × pipeline_stages × engagements with mechanical scoring (amount × probability × idle-flag); the web UI cannot answer '$ at risk of slipping this quarter' in one screen. Uses HubSpot-provided stage probabilities — Closed Lost is 0, not 0.5 (PR #549 review fix).", "via": "mcp-command-mirror"},
-			{"name": "Nurture queue", "command": "nurture queue", "description": "Ranked 'who to contact today' list scored by stale-days × deal amount × stage probability, with the rationale exposed as columns.", "rationale": "Designed for the nurture skill loop — replaces ad-hoc Python in meetings/. Local SQL ranking with explicit columns means the agent doesn't have to recompute aggregations in-process.", "via": "mcp-command-mirror"},
-			{"name": "Top deals by opportunity score", "command": "deals top", "description": "Composite-ranked top-N deals by (signal × amount × stage-probability × inverse-days-since-contact) with the score breakdown exposed as columns.", "rationale": "Implements the same scoring formula Damien has been running in Python (pipeline-review/score_urgency.py) but locally over the synced store — one offline command instead of a 30-line script with live API calls per deal.", "via": "mcp-command-mirror"},
-			{"name": "Per-meeting property history", "command": "meetings history", "description": "Show the full timeline of property changes for a single meeting (outcome, title, owner, custom fields) — when each value was set, by whom, and from what source.", "rationale": "Reads the local hubspot_property_history snapshot table populated by sync --with-history; zero API calls at query time. No incumbent CLI or MCP retains property history across syncs.", "via": "mcp-command-mirror"},
-			{"name": "Meetings ever-had query", "command": "meetings ever-had", "description": "Find every meeting whose given property was EVER set to a given value within a date range — even if it has since changed.", "rationale": "SELECT DISTINCT object_id FROM hubspot_property_history filtered on object_type='meetings', property, value, and timestamp range. HubSpot's /search API physically cannot answer this: it sees only current property values, not the history.", "via": "mcp-command-mirror"},
-			{"name": "Monthly meeting status report", "command": "meetings status-report", "description": "Composes the meetings ever-had query into the canonical monthly-report shape: every meeting that touched the given status in the given month, with owner, title, current status, and the timestamp of the original status set.", "rationale": "Wraps meetings ever-had with a calendar-month window and an opinionated report shape (JSON or CSV) ready for handoff. Built for the Servosity customer use case (monthly 'every meeting ever Scheduled in April' report) but generalizes to any property + month.", "via": "mcp-command-mirror"},
-			{"name": "Sync with property history", "command": "sync --with-history", "description": "Opt-in sync flag that requests propertiesWithHistory for the named properties on meetings (and on deals, contacts, companies when scoped to those). Persists per-property snapshots into the shared hubspot_property_history table.", "rationale": "Adds ?propertiesWithHistory=<list> to the per-object GET leg of sync; writes both the current value and the full history block in one transaction. Composite PK (object_type+object_id+property+timestamp) makes re-sync idempotent. Foundation for meetings history / ever-had / status-report and for future per-object ever-had commands on the other three object types.", "via": "mcp-command-mirror"},
-			{"name": "Engagements of", "command": "engagements of", "description": "Unified chronological timeline of every call, email, meeting, note, and task touching a contact, deal, or company.", "rationale": "Local associations graph table joins all five engagement tables in one SQL query, replacing N+1 round trips across HubSpot's per-engagement endpoints.", "via": "mcp-command-mirror"},
-			{"name": "Note signal extraction", "command": "notes signals", "description": "Scan note bodies for buying / lost signals (meeting scheduled, budget approved, no response, competitor chosen) and emit per-deal signal counts with the source note id.", "rationale": "Pure regex over local hs_note_body — no LLM dependency. The patterns came from real pipeline-review work, so they reflect signals that have actually moved Damien's deals.", "via": "mcp-command-mirror"},
-			{"name": "Since", "command": "since", "description": "What changed across contacts, deals, and engagements since a given timestamp — agent-friendly cross-object delta.", "rationale": "Scans hs_lastmodifieddate cursors stored in the local mirror; no aggregated 'what changed everywhere' endpoint exists on HubSpot's API.", "via": "mcp-command-mirror"},
-			{"name": "Nurture mine", "command": "nurture-mine", "description": "Surface the contacts assigned to you that have gone cold but still have open deals — the daily 'who do I call' list, computed across local SQLite.", "rationale": "Joins contacts × associations × engagements × deals × pipeline_stages × owners — five tables no single HubSpot API call can compose. The web UI requires three filter passes per object; every incumbent MCP demands live calls per query.", "via": "mcp-command-mirror"},
-			{"name": "Bulk update from CSV with schema validation", "command": "contacts bulk-update", "description": "Apply a CSV of property changes to many contacts at once, pre-validating each row against HubSpot's property schema (types, picklists) before any mutation.", "rationale": "Reads the locally cached properties table and rejects bad rows up-front, then dispatches valid rows through batch endpoints. HubSpot's own Imports API silently drops bad rows — this surfaces them.", "via": "mcp-command-mirror"},
-			{"name": "Deal velocity / time-in-stage", "command": "deals velocity", "description": "Per-deal days-in-current-stage and per-stage median/p90 dwell time, computed from dealstage change history — find where deals rot.", "rationale": "Computes time-in-stage from dealstage transitions retained in the local hubspot_property_history table; no single API call returns time-in-stage.", "via": "mcp-command-mirror"},
-			{"name": "Lifecycle-stage funnel", "command": "contacts funnel", "description": "One-shot funnel table of contacts per lifecycle stage (subscriber → lead → MQL → SQL → opportunity → customer) with stage-to-stage conversion ratios.", "rationale": "Local GROUP BY over contacts.lifecyclestage with derived conversion ratios; the API returns rows, not a funnel rollup.", "via": "mcp-command-mirror"},
-			{"name": "Orphaned / dead-owner deals", "command": "deals unowned", "description": "Open deals with no owner or owned by a deactivated rep, with per-stage dollar exposure — the hygiene gap owner-load can't see.", "rationale": "Anti-joins open deals against active owners in local SQLite; the HubSpot UI has no dead-owner or unassigned-exposure view.", "via": "mcp-command-mirror"},
-			{"name": "Post-win re-engagement (win-back)", "command": "contacts win-back", "description": "Contacts attached to a Closed Won deal but with no engagement in N days — the customer-expansion and re-engage list.", "rationale": "Joins Closed Won deals × associations × engagements locally; no single API call composes won-then-cold.", "via": "mcp-command-mirror"},
-			{"name": "Weighted forecast by close-month", "command": "deals forecast", "description": "Probability-weighted pipeline forecast bucketed by close-date month — the canonical GM revenue question, answered offline.", "rationale": "Sums amount × stage-probability across open deals grouped by close month locally, reusing pipeline-health's probability map (Closed Lost = 0, Closed Won = 1.0).", "via": "mcp-command-mirror"},
-		},
+		"command_mirror_capabilities": registeredCommandMirrorCapabilities(s, []map[string]string{
+			{"name": "Stale objects", "command": "stale", "cli_command": "stale", "description": "Find contacts or deals with no engagement in N days, scoped by owner or pipeline stage — instantly, offline.", "rationale": "Left-joins the engagement tables against contacts/deals locally; the live API has no 'no engagement since' filter shape.", "via": "mcp-command-mirror"},
+			{"name": "Owner load", "command": "owner-load", "cli_command": "owner-load", "description": "Open deals per rep per pipeline stage with $ totals, count, and oldest-deal age — the Monday-morning sales-lead report.", "rationale": "SQL GROUP BY on deals × owners × pipeline_stages", "via": "mcp-command-mirror"},
+			{"name": "Pipeline health", "command": "pipeline-health", "cli_command": "pipeline-health", "description": "Per-stage rollup of count, $ total, $ at risk (idle deals near their close date)", "rationale": "Local join across deals × pipeline_stages × engagements with mechanical scoring (amount × probability × idle-flag)", "via": "mcp-command-mirror"},
+			{"name": "Nurture queue", "command": "nurture queue", "cli_command": "nurture queue", "description": "Ranked 'who to contact today' list scored by stale-days × deal amount × stage probability", "rationale": "Designed for the nurture skill loop — replaces ad-hoc Python in meetings/.", "via": "mcp-command-mirror"},
+			{"name": "Top deals by opportunity score", "command": "deals top", "cli_command": "deals top", "description": "Composite-ranked top-N deals by (signal × amount × stage-probability × inverse-days-since-contact)", "rationale": "Implements the same scoring formula Damien has been running in Python (pipeline-review/score_urgency.", "via": "mcp-command-mirror"},
+			{"name": "Per-meeting property history", "command": "meetings history", "cli_command": "meetings history", "description": "Show the full timeline of property changes for a single meeting (outcome, title, owner, custom fields)", "rationale": "Reads the local hubspot_property_history snapshot table populated by sync --with-history; zero API calls at query time.", "via": "mcp-command-mirror"},
+			{"name": "Meetings ever-had query", "command": "meetings ever-had", "cli_command": "meetings ever-had", "description": "Find every meeting whose given property was EVER set to a given value within a date range — even if it has since", "rationale": "SELECT DISTINCT object_id FROM hubspot_property_history filtered on object_type='meetings', property, value", "via": "mcp-command-mirror"},
+			{"name": "Monthly meeting status report", "command": "meetings status-report", "cli_command": "meetings status-report", "description": "Composes the meetings ever-had query into the canonical monthly-report shape", "rationale": "Wraps meetings ever-had with a calendar-month window and an opinionated report shape (JSON or CSV) ready for handoff.", "via": "mcp-command-mirror"},
+			{"name": "Sync with property history", "command": "sync --with-history", "cli_command": "sync --with-history", "description": "Opt-in sync flag that requests propertiesWithHistory for the named properties on meetings (and on deals, contacts", "rationale": "Adds ?", "via": "mcp-command-mirror"},
+			{"name": "Engagements of", "command": "engagements of", "cli_command": "engagements of", "description": "Unified chronological timeline of every call, email, meeting, note, and task touching a contact, deal, or company.", "rationale": "Local associations graph table joins all five engagement tables in one SQL query", "via": "mcp-command-mirror"},
+			{"name": "Note signal extraction", "command": "notes signals", "cli_command": "notes signals", "description": "Scan note bodies for buying / lost signals (meeting scheduled, budget approved, no response, competitor chosen)", "rationale": "Pure regex over local hs_note_body — no LLM dependency.", "via": "mcp-command-mirror"},
+			{"name": "Since", "command": "since", "cli_command": "since", "description": "What changed across contacts, deals, and engagements since a given timestamp — agent-friendly cross-object delta.", "rationale": "Scans hs_lastmodifieddate cursors stored in the local mirror", "via": "mcp-command-mirror"},
+			{"name": "Nurture mine", "command": "nurture-mine", "cli_command": "nurture-mine", "description": "Surface the contacts assigned to you that have gone cold but still have open deals — the daily 'who do I call' list", "rationale": "Joins contacts × associations × engagements × deals × pipeline_stages × owners — five tables no single HubSpot API call", "via": "mcp-command-mirror"},
+			{"name": "Bulk update from CSV with schema validation", "command": "contacts bulk-update", "cli_command": "contacts bulk-update", "description": "Apply a CSV of property changes to many contacts at once", "rationale": "Reads the locally cached properties table and rejects bad rows up-front", "via": "mcp-command-mirror"},
+			{"name": "Deal velocity / time-in-stage", "command": "deals velocity", "cli_command": "deals velocity", "description": "Per-deal days-in-current-stage and per-stage median/p90 dwell time", "rationale": "Computes time-in-stage from dealstage transitions retained in the local hubspot_property_history table", "via": "mcp-command-mirror"},
+			{"name": "Lifecycle-stage funnel", "command": "contacts funnel", "cli_command": "contacts funnel", "description": "One-shot funnel table of contacts per lifecycle stage (subscriber → lead → MQL → SQL → opportunity → customer)", "rationale": "Local GROUP BY over contacts.lifecyclestage with derived conversion ratios; the API returns rows, not a funnel rollup.", "via": "mcp-command-mirror"},
+			{"name": "Orphaned / dead-owner deals", "command": "deals unowned", "cli_command": "deals unowned", "description": "Open deals with no owner or owned by a deactivated rep", "rationale": "Anti-joins open deals against active owners in local SQLite", "via": "mcp-command-mirror"},
+			{"name": "Post-win re-engagement (win-back)", "command": "contacts win-back", "cli_command": "contacts win-back", "description": "Contacts attached to a Closed Won deal but with no engagement in N days — the customer-expansion and re-engage list.", "rationale": "Joins Closed Won deals × associations × engagements locally; no single API call composes won-then-cold.", "via": "mcp-command-mirror"},
+			{"name": "Weighted forecast by close-month", "command": "deals forecast", "cli_command": "deals forecast", "description": "Probability-weighted pipeline forecast bucketed by close-date month — the canonical GM revenue question", "rationale": "Sums amount × stage-probability across open deals grouped by close month locally", "via": "mcp-command-mirror"},
+		}),
 		"playbook": []map[string]string{
 			{"topic": "Stale objects", "insight": "Left-joins the engagement tables against contacts/deals locally; the live API has no 'no engagement since' filter shape."},
 			{"topic": "Owner load", "insight": "SQL GROUP BY on deals × owners × pipeline_stages; HubSpot's web UI requires the Deal Owner report plus a Sheets pivot to assemble this."},

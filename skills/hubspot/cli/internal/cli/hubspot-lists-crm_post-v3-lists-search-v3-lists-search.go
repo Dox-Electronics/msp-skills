@@ -18,7 +18,7 @@ func newHubspotListsCrmPostV3ListsSearchV3ListsSearchCmd(flags *rootFlags) *cobr
 	var bodyCount int
 	var bodyListIds string
 	var bodyObjectTypeId string
-	var bodyOffset string
+	var bodyOffset int
 	var bodyProcessingTypes string
 	var bodyQuery string
 	var bodySort string
@@ -27,31 +27,41 @@ func newHubspotListsCrmPostV3ListsSearchV3ListsSearchCmd(flags *rootFlags) *cobr
 	cmd := &cobra.Command{
 		Use:         "post-v3-lists-search-v3-lists-search",
 		Short:       "Post v3 lists search v3 lists search",
-		Example:     "  hubspot-cli hubspot-lists-crm post-v3-lists-search-v3-lists-search",
-		Annotations: map[string]string{"pp:endpoint": "hubspot-lists-crm.post-v3-lists-search-v3-lists-search", "pp:method": "POST", "pp:path": "/crm/v3/lists/search"},
+		Annotations: map[string]string{"pp:endpoint": "hubspot-lists-crm.post-v3-lists-search-v3-lists-search", "pp:method": "POST", "pp:path": "/crm/v3/lists/search", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("additional-properties") && !flags.dryRun {
+				if !cmd.Flags().Changed("additional-properties") && bodyAdditionalProperties == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "additional-properties")
 				}
-				if !cmd.Flags().Changed("offset") && !flags.dryRun {
+				if !cmd.Flags().Changed("offset") && bodyOffset == 0 && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "offset")
 				}
 			}
+			path := "/crm/v3/lists/search"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/lists/search"
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -63,35 +73,48 @@ func newHubspotListsCrmPostV3ListsSearchV3ListsSearchCmd(flags *rootFlags) *cobr
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
-				if bodyAdditionalProperties != "" {
-					body["additionalProperties"] = cliutil.SplitCSV(bodyAdditionalProperties)
+				bodyMap := map[string]any{}
+				body = bodyMap
+				if cmd.Flags().Changed("additional-properties") {
+					parsedAdditionalProperties, parseErr := cliutil.ParseStringList(bodyAdditionalProperties)
+					if parseErr != nil {
+						return fmt.Errorf("parsing --additional-properties list: %w", parseErr)
+					}
+					bodyMap["additionalProperties"] = parsedAdditionalProperties
 				}
-				if bodyCount != 0 {
-					body["count"] = bodyCount
+				if cmd.Flags().Changed("count") || bodyCount != 0 {
+					bodyMap["count"] = bodyCount
 				}
-				if bodyListIds != "" {
-					body["listIds"] = cliutil.SplitCSV(bodyListIds)
+				if cmd.Flags().Changed("list-ids") {
+					parsedListIds, parseErr := cliutil.ParseStringList(bodyListIds)
+					if parseErr != nil {
+						return fmt.Errorf("parsing --list-ids list: %w", parseErr)
+					}
+					bodyMap["listIds"] = parsedListIds
 				}
-				if bodyObjectTypeId != "" {
-					body["objectTypeId"] = bodyObjectTypeId
+				if cmd.Flags().Changed("object-type-id") || bodyObjectTypeId != "" {
+					bodyMap["objectTypeId"] = bodyObjectTypeId
 				}
-				if bodyOffset != "" {
-					body["offset"] = bodyOffset
+				if cmd.Flags().Changed("offset") || bodyOffset != 0 {
+					bodyMap["offset"] = bodyOffset
 				}
-				if bodyProcessingTypes != "" {
-					body["processingTypes"] = cliutil.SplitCSV(bodyProcessingTypes)
+				if cmd.Flags().Changed("processing-types") {
+					parsedProcessingTypes, parseErr := cliutil.ParseStringList(bodyProcessingTypes)
+					if parseErr != nil {
+						return fmt.Errorf("parsing --processing-types list: %w", parseErr)
+					}
+					bodyMap["processingTypes"] = parsedProcessingTypes
 				}
-				if bodyQuery != "" {
-					body["query"] = bodyQuery
+				if cmd.Flags().Changed("query") || bodyQuery != "" {
+					bodyMap["query"] = bodyQuery
 				}
-				if bodySort != "" {
-					body["sort"] = bodySort
+				if cmd.Flags().Changed("sort") || bodySort != "" {
+					bodyMap["sort"] = bodySort
 				}
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -156,6 +179,9 @@ func newHubspotListsCrmPostV3ListsSearchV3ListsSearchCmd(flags *rootFlags) *cobr
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -181,55 +207,73 @@ func newHubspotListsCrmPostV3ListsSearchV3ListsSearchCmd(flags *rootFlags) *cobr
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-lists-crm", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, nil)
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-lists-crm", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyAdditionalProperties, "additional-properties", "", "The property names of any additional list properties to include in the response.")
 	cmd.Flags().IntVar(&bodyCount, "count", 0, "The number of lists to include in the response. Defaults to `20` if no value is provided. The max `count` is `500`.")
 	cmd.Flags().StringVar(&bodyListIds, "list-ids", "", "ILS list ids to be included in search results. If not specified, all lists matching other criteria will be included")
 	cmd.Flags().StringVar(&bodyObjectTypeId, "object-type-id", "", "Object type id")
-	cmd.Flags().StringVar(&bodyOffset, "offset", "", "Value used to paginate through lists.")
+	cmd.Flags().IntVar(&bodyOffset, "offset", 0, "Value used to paginate through lists.")
 	cmd.Flags().StringVar(&bodyProcessingTypes, "processing-types", "", "List processing types to be included in search results.")
 	cmd.Flags().StringVar(&bodyQuery, "query", "", "The `query` that will be used to search for lists by list name.")
 	cmd.Flags().StringVar(&bodySort, "sort", "", "Sort field and order")
