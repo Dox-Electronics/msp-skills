@@ -363,21 +363,6 @@
    ]
   },
   {
-   "id": "base-url-env-read-resolvable",
-   "summary": "config.go reads HUBSPOT_BASE_URL through a literal os.Getenv wrapped in cliutil.EffectiveEnv instead of the 4.32.x cliutil.EnvOverride helper, so check_env_schema.py can prove the binary reads the variable it prompts for",
-   "why": "cli-printing-press 4.32.x routes env overrides through cliutil.EnvOverride(name) (os.Getenv plus MCPB-placeholder scrubbing). tools/maintainer/check_env_schema.py promotes name-as-parameter helpers only inside their own package, so the cross-package call in config.go reads as 'no source file reads HUBSPOT_BASE_URL' and the gate fails the PR (false-RED: the variable is read). Semantics are identical (EnvOverride is exactly EffectiveEnv(os.Getenv(name))). Retire this entry once the gate follows qualified helper calls (cliutil.EnvOverride) across packages.",
-   "status": "active",
-   "spec_encode_followup": "msp-skills tooling: teach check_env_schema.py to follow <pkg>.<helper>( calls into imported internal packages",
-   "asserts": [
-    {
-     "file": "cli/internal/config/config.go",
-     "contains": "cliutil.EffectiveEnv(os.Getenv(\"HUBSPOT_BASE_URL\"))",
-     "min_count": 1,
-     "code_only": true
-    }
-   ]
-  },
-  {
    "id": "sync-prune-skips-filtered-walk",
    "summary": "`sync --full` prunes local rows only when the walk was unfiltered: any --param, --resource-param or --global-param disables deletion reconciliation (hsSyncPruneAllowed)",
    "why": "cli-printing-press 4.32 made `sync --full` delete local rows the API did not return on a complete walk (prune := full && !noPrune). An operator query parameter can narrow the enumerated collection - `sync --resources hubspot-contacts-crm --full --param archived=true` lists only archived contacts - and pruning against that walk deletes every cached active contact (an empty archived set clears the mirror). The shipped 4.24 tree never pruned, so this was a regression the reprint introduced; found by the Codex review of the 2026-09-28 reprint. The one-line body edit in the generated sync.go routes the decision through the hand-authored hs_sync_prune.go; hs_sync_prune_test.go pins both directions (unfiltered full walk still prunes; each filter flag disables it).",
