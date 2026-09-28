@@ -468,8 +468,9 @@
     },
     {
      "file": "cli/internal/cli/procurement_get-catalog-by-id.go",
-     "contains": "\"procurement-catalog\", false, // single-record",
-     "min_count": 1
+     "contains": "resolveReadWithStrategy(cmd.Context(), c, flags, \"auto\", \"procurement-catalog\", false,",
+     "min_count": 1,
+     "code_only": true
     },
     {
      "file": "cli/internal/cli/procurement_get-catalog-count.go",
