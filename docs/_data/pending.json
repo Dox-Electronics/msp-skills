@@ -156,7 +156,7 @@
   "datto-bcdr": {
     "state": "up-to-date",
     "version": "0.1.5",
-    "latest_tag": "datto-bcdr-v0.1.5",
+    "latest_tag": "datto-bcdr-v0.1.6",
     "current_hash": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630",
     "released_hash": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630"
   },
