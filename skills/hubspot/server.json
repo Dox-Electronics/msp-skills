@@ -46,6 +46,18 @@
           "description": "Email address that `--owner me` resolves to when git config user.email is not set. Leave blank to name the owner on each call.",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "HUBSPOT_MCP_HTTP_TOKEN",
+          "description": "Bearer token required by `hubspot-mcp --transport http`; unused by the default stdio transport.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PRINTING_PRESS_CLIENT_PROFILE",
+          "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

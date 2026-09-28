@@ -39,7 +39,9 @@ Add (or merge with your existing `mcpServers` block):
       "env": {
         "HUBSPOT_ACCESS_TOKEN": "<your-hubspot_access_token>",
         "HUBSPOT_BASE_URL": "https://api.hubapi.com",
-        "HUBSPOT_OWNER_EMAIL": ""
+        "HUBSPOT_OWNER_EMAIL": "",
+        "HUBSPOT_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -66,7 +68,9 @@ Configuration**) and add:
       "env": {
         "HUBSPOT_ACCESS_TOKEN": "<your-hubspot_access_token>",
         "HUBSPOT_BASE_URL": "https://api.hubapi.com",
-        "HUBSPOT_OWNER_EMAIL": ""
+        "HUBSPOT_OWNER_EMAIL": "",
+        "HUBSPOT_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -89,7 +93,9 @@ Claude Desktop:
       "env": {
         "HUBSPOT_ACCESS_TOKEN": "<your-hubspot_access_token>",
         "HUBSPOT_BASE_URL": "https://api.hubapi.com",
-        "HUBSPOT_OWNER_EMAIL": ""
+        "HUBSPOT_OWNER_EMAIL": "",
+        "HUBSPOT_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -107,7 +113,7 @@ All remote agents need `hubspot-mcp` reachable as a public **HTTPS** endpoint. R
 in HTTP mode with your credentials in the environment:
 
 ```bash
-HUBSPOT_ACCESS_TOKEN=<value> HUBSPOT_BASE_URL=<value> HUBSPOT_OWNER_EMAIL=<value> hubspot-mcp --transport http --addr :7777
+HUBSPOT_ACCESS_TOKEN=<value> HUBSPOT_BASE_URL=<value> HUBSPOT_OWNER_EMAIL=<value> HUBSPOT_MCP_HTTP_TOKEN=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> hubspot-mcp --transport http --addr :7777
 ```
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel

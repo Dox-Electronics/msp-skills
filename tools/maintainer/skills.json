@@ -703,7 +703,7 @@
       "category": "CRM",
       "display_name": "HubSpot",
       "tagline": "Pipeline health, stale deals, and owner workload for every client by asking.",
-      "cli_hash": "sha256:11adf0bc84900c54d3f826e68adfbf72ab20640d7110aa5fb23e39c411f3c973",
+      "cli_hash": "sha256:bb561635e397aaa01e70ea449b86df286093cad9368b4ff0a91cfbecf196ba2f",
       "template_version": 3,
       "version": "0.1.6",
       "cli_hash_at_release": "sha256:9731f5877dcffc6043b0e60cd34155bc079fab63da62ad4f286ae3203188d927",
