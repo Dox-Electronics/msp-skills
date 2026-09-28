@@ -191,7 +191,7 @@
   "halopsa": {
     "state": "up-to-date",
     "version": "0.2.16",
-    "latest_tag": "halopsa-v0.2.16",
+    "latest_tag": "halopsa-v0.2.17",
     "current_hash": "sha256:1a1739a59a3780d135ab536d288e6f7cb78d9e933f97f8a5f5af30a03a929b7c",
     "released_hash": "sha256:1a1739a59a3780d135ab536d288e6f7cb78d9e933f97f8a5f5af30a03a929b7c"
   },
@@ -205,7 +205,7 @@
   "hudu": {
     "state": "up-to-date",
     "version": "0.1.10",
-    "latest_tag": "hudu-v0.1.10",
+    "latest_tag": "hudu-v0.1.11",
     "current_hash": "sha256:0b0679ec6aa291ca880a69f26cb9df2ea5bd9382796eadea5a8b177a4b2ae55e",
     "released_hash": "sha256:0b0679ec6aa291ca880a69f26cb9df2ea5bd9382796eadea5a8b177a4b2ae55e"
   },
@@ -399,11 +399,11 @@
     "released_hash": "sha256:c74b9f70dfa00153c3082b954f8ff1439cf732a4019f6f2bd27419a4f4a99e90"
   },
   "sentinelone": {
-    "state": "version-pending",
-    "version": "0.2.0",
+    "state": "up-to-date",
+    "version": "0.1.5",
     "latest_tag": "sentinelone-v0.1.5",
-    "current_hash": "sha256:e091267027efecd0d9afeefff3a166382f222094a425d9fecd2bbf0eef6d610b",
-    "released_hash": "sha256:e091267027efecd0d9afeefff3a166382f222094a425d9fecd2bbf0eef6d610b"
+    "current_hash": "sha256:eafa613b1f738f42bb1f3e09fc2d57057638cf52af043f05415c9def2d296748",
+    "released_hash": "sha256:eafa613b1f738f42bb1f3e09fc2d57057638cf52af043f05415c9def2d296748"
   },
   "servosity": {
     "state": "up-to-date",
