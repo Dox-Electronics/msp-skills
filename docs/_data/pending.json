@@ -135,7 +135,7 @@
   "cove": {
     "state": "up-to-date",
     "version": "0.1.7",
-    "latest_tag": "cove-v0.1.7",
+    "latest_tag": "cove-v0.1.8",
     "current_hash": "sha256:4e03d39ec90ef858f92538ec0cf842570fe6c8a6b59388f1871f87d2a913aa9e",
     "released_hash": "sha256:4e03d39ec90ef858f92538ec0cf842570fe6c8a6b59388f1871f87d2a913aa9e"
   },
