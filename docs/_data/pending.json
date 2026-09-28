@@ -429,7 +429,7 @@
   "superops": {
     "state": "up-to-date",
     "version": "0.1.7",
-    "latest_tag": "superops-v0.1.7",
+    "latest_tag": "superops-v0.1.8",
     "current_hash": "sha256:bb62f1a57e6b195a1112c85f79b0231341d13b6d6a76bf2a7d4bf086696cc544",
     "released_hash": "sha256:bb62f1a57e6b195a1112c85f79b0231341d13b6d6a76bf2a7d4bf086696cc544"
   },
