@@ -149,7 +149,7 @@
   "datagate": {
     "state": "up-to-date",
     "version": "0.1.0",
-    "latest_tag": "datagate-v0.1.0",
+    "latest_tag": "datagate-v0.1.1",
     "current_hash": "sha256:e514d47e0987ad022c3eded8f7b8d418f871057619c50b7d0f93c7be55ace44a",
     "released_hash": "sha256:e514d47e0987ad022c3eded8f7b8d418f871057619c50b7d0f93c7be55ace44a"
   },
