@@ -356,7 +356,7 @@
       "name": "datto-bcdr",
       "source": "./skills/datto-bcdr",
       "description": "Sync your whole Datto BCDR fleet into local SQLite and answer the questions the per-appliance Partner Portal can't: which backups failed screenshot verification, which are stale, and which clients are at risk.",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "category": "backup-dr",
       "tags": [
         "datto-bcdr",
@@ -455,7 +455,7 @@
       "name": "hubspot",
       "source": "./skills/hubspot",
       "description": "Every HubSpot Sales Hub feature, plus offline cross-object queries, property-change-history reporting, and an agent-native data layer no other HubSpot tool has.",
-      "version": "0.1.6",
+      "version": "0.2.0",
       "category": "crm",
       "tags": [
         "hubspot",

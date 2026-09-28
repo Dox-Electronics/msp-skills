@@ -19,46 +19,59 @@ func newHubspotObjectsCrmGetV3ObjectsObjectTypeObjectIdGetByIdCmd(flags *rootFla
 	var flagPropertiesWithHistory string
 
 	cmd := &cobra.Command{
-		Use:   "get-v3-objects-object-type-object-id-get-by-id <objectId> <objectType>",
-		Short: "Read an Object identified by `{objectId}`.",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  hubspot-cli hubspot-objects-crm get-v3-objects-object-type-object-id-get-by-id 550e8400-e29b-41d4-a716-446655440000 example-value",
+		Use:         "get-v3-objects-object-type-object-id-get-by-id <objectType> <objectId>",
+		Short:       "Read an Object identified by `{objectId}`.",
 		Annotations: map[string]string{"pp:endpoint": "hubspot-objects-crm.get-v3-objects-object-type-object-id-get-by-id", "pp:method": "GET", "pp:path": "/crm/v3/objects/{objectType}/{objectId}", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <objectType> <objectId>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <objectType> <objectId>"))
 			}
+			path := "/crm/v3/objects/{objectType}/{objectId}"
+			if len(args) < 2 || args[1] == "" {
+				return usageErr(fmt.Errorf("objectId is required\nUsage: %s <%s>", cmd.CommandPath(), "objectId"))
+			}
+			path = replacePathParam(path, "objectId", args[1])
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("objectType is required\nUsage: %s <%s>", cmd.CommandPath(), "objectType"))
+			}
+			path = replacePathParam(path, "objectType", args[0])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/objects/{objectType}/{objectId}"
-			path = replacePathParam(path, "objectId", args[0])
-			if len(args) < 2 {
-				return usageErr(fmt.Errorf("objectType is required\nUsage: %s <%s>", cmd.CommandPath(), "objectType"))
+			if flagAssociations != "" {
+				path = appendArrayQueryParam(path, "associations", flagAssociations, "form", true)
 			}
-			path = replacePathParam(path, "objectType", args[1])
+			if flagProperties != "" {
+				path = appendArrayQueryParam(path, "properties", flagProperties, "form", true)
+			}
+			if flagPropertiesWithHistory != "" {
+				path = appendArrayQueryParam(path, "propertiesWithHistory", flagPropertiesWithHistory, "form", true)
+			}
 			params := map[string]string{}
 			if flagArchived != false {
 				params["archived"] = formatCLIParamValue(flagArchived)
 			}
-			if flagAssociations != "" {
-				params["associations"] = formatCLIParamValue(flagAssociations)
-			}
 			if flagIdProperty != "" {
 				params["idProperty"] = formatCLIParamValue(flagIdProperty)
 			}
-			if flagProperties != "" {
-				params["properties"] = formatCLIParamValue(flagProperties)
-			}
-			if flagPropertiesWithHistory != "" {
-				params["propertiesWithHistory"] = formatCLIParamValue(flagPropertiesWithHistory)
-			}
-			data, prov, err := resolveReadWithStrategy(cmd.Context(), c, flags, "auto", "hubspot-objects-crm", false, path, params, nil, cmd.ErrOrStderr())
+			data, prov, err := resolveReadWithStrategyAndResponsePath(cmd.Context(), c, flags, "live", "hubspot-objects-crm", false, path, params, nil, "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := data
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -66,7 +79,7 @@ func newHubspotObjectsCrmGetV3ObjectsObjectTypeObjectIdGetByIdCmd(flags *rootFla
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -75,22 +88,31 @@ func newHubspotObjectsCrmGetV3ObjectsObjectTypeObjectIdGetByIdCmd(flags *rootFla
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"archivedAt": true, "createdAt": true, "id": true, "objectWriteTraceId": true, "updatedAt": true, "url": true})
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -100,7 +122,11 @@ func newHubspotObjectsCrmGetV3ObjectsObjectTypeObjectIdGetByIdCmd(flags *rootFla
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, map[string]bool{"archivedAt": true, "createdAt": true, "id": true, "objectWriteTraceId": true, "updatedAt": true, "url": true})
 		},
 	}
 	cmd.Flags().BoolVar(&flagArchived, "archived", false, "Whether to return only results that have been archived.")

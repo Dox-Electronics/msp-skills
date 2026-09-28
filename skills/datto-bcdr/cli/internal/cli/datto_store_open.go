@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"datto-bcdr-pp-cli/internal/cliutil"
 	"datto-bcdr-pp-cli/internal/store"
 )
 
@@ -45,4 +46,21 @@ func nvOpenStore(ctx context.Context, dbPath string) (*store.Store, error) {
 		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 	}
 	return nil, lastErr
+}
+
+// MCPStoreDBPath resolves the local mirror path the same way `sync` does, for
+// the MCP server's in-process search/sql tools. Press 4.32 scopes the mirror
+// to the credential (data-<sha256[:12]>.db) in the CLI, but the generated
+// mcpDBPath hardcoded data.db, so after a fresh sync the MCP tools reported
+// "No local data store found". Loading the default config and applying the
+// same scope keeps both surfaces on one resolver, including the legacy
+// unscoped data.db fallback. Hand-wired: reprint-survival ledger
+// mcp-store-path-matches-sync.
+func MCPStoreDBPath() (string, error) {
+	dir, err := cliutil.DataDir()
+	if err != nil {
+		return "", err
+	}
+	configureDefaultDBScope("")
+	return defaultDBPathInDir(dir), nil
 }

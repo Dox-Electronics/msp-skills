@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "datto-bcdr-mcp",
   "display_name": "Datto BCDR",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Sync your whole Datto BCDR fleet into local SQLite and answer the questions the per-appliance Partner Portal can't: which backups failed screenshot verification, which are stale, and which clients are at risk.",
   "author": {
     "name": "Servosity Inc."
@@ -17,7 +17,10 @@
       "env": {
         "DATTO_BCDR_BASE_URL": "${user_config.datto_bcdr_base_url}",
         "DATTO_BCDR_PUBLIC_KEY": "${user_config.datto_bcdr_public_key}",
-        "DATTO_BCDR_SECRET_KEY": "${user_config.datto_bcdr_secret_key}"
+        "DATTO_BCDR_SECRET_KEY": "${user_config.datto_bcdr_secret_key}",
+        "DATTO_BCDR_MCP_HTTP_TOKEN": "${user_config.datto_bcdr_mcp_http_token}",
+        "DATTO_BCDR_USER_AGENT": "${user_config.datto_bcdr_user_agent}",
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
       }
     }
   },
@@ -42,6 +45,26 @@
       "description": "Base URL for the Datto BCDR API. Leave the prefilled default unless your account uses a different regional or self-hosted host.",
       "required": false,
       "default": "https://api.datto.com/v1"
+    },
+    "datto_bcdr_mcp_http_token": {
+      "type": "string",
+      "title": "MCP HTTP transport bearer token",
+      "description": "Required only when running the MCP server with --transport http (a remote/hosted deployment). Callers must send a matching Authorization: Bearer header. Not needed for the default local stdio transport that Claude Desktop uses.",
+      "required": false,
+      "sensitive": true
+    },
+    "datto_bcdr_user_agent": {
+      "type": "string",
+      "title": "User-Agent header",
+      "description": "Overrides the User-Agent the CLI sends on Datto BCDR requests. Leave blank to use the CLI's own built-in User-Agent.",
+      "required": false
+    },
+    "printing_press_client_profile": {
+      "type": "string",
+      "title": "Client profile (optional)",
+      "description": "Only used when the MCP server is bound to a tenant-gated Printing Press client profile. This connector registers no tenant-gated source, so leave it blank unless you set one up yourself.",
+      "required": false,
+      "sensitive": true
     }
   },
   "compatibility": {
@@ -52,11 +75,11 @@
       "win32"
     ]
   },
-  "printing_press_version": "4.24.0",
+  "printing_press_version": "4.32.5",
   "press_provenance": {
-    "printing_press_version": "4.24.0",
-    "generated_at": "2026-06-13T03:37:08.341788Z",
-    "spec_checksum": "sha256:203fe07fd8be9cbdf93be4d5debbb7507583051b606b2c4794026ccc2a8c81d1",
+    "printing_press_version": "4.32.5",
+    "generated_at": "2026-09-28T17:27:30.168239Z",
+    "spec_checksum": "sha256:f86e0bb38d59e32c8ad4b98b92af7e0f95d197e56051d7d2879b54b4586729eb",
     "spec_format": "internal"
   }
 }

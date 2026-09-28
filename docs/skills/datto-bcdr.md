@@ -26,7 +26,7 @@ faqs:
   - q: "Does this replace the Datto Partner Portal?"
     a: "No. It answers the fleet-wide, cross-client questions the per-appliance portal can't, and it's read-only for everyday use - you still use the portal for restores, virtualization, and device configuration."
   - q: "Can it change anything in Datto, or just read?"
-    a: "Read-only for everyday use - every analysis, list, and report command only reads. The single exception is `import`, an explicit bulk data-load command you would never run by accident; preview it with --dry-run first."
+    a: "Read-only. Every analysis, list, and report command only reads, and the Datto BCDR API this connector targets exposes no write endpoints, so there is no command that can change anything in Datto. The only things it writes are on your own machine: the local SQLite mirror (`sync`), an optional export file, and the local learning store."
 howto:
   - name: "Run the one-line installer"
     text: "macOS/Linux: bash <(curl -fsSL https://raw.githubusercontent.com/Servosity/msp-skills/main/skills/datto-bcdr/install.sh) - Windows PowerShell: iwr -useb https://raw.githubusercontent.com/Servosity/msp-skills/main/skills/datto-bcdr/install.ps1 | iex"
@@ -136,10 +136,11 @@ After install, authenticate once with your Datto BCDR credentials, then verify w
 | Tier | Examples | Recommended agent policy |
 | --- | --- | --- |
 | Read | screenshots, stale-backups, recoverability, client-risk, alert-triage, storage-runway, forgotten-assets, agent-versions, client-report, device/agent/asset/shares/alert/vm-restore, sync, search, analytics | Allow |
-| Write (routine) | import (POST each record to the Datto BCDR API) | Preview with --dry-run, then a reviewed write |
-| Credential / config | auth set-token, auth logout (replace or clear stored credentials) | Human-in-the-loop only |
+| Write (routine) | none - the Datto BCDR API exposes no write endpoints | n/a |
+| Local state | sync, export (GET from Datto, write the SQLite mirror or a local file), teach*, learnings, playbook amend, profile, feedback (local learning store and settings; never contact Datto) | Allow |
+| Credential / config | auth set-credentials, auth logout (replace or clear stored credentials) | Human-in-the-loop only |
 
-The datto-bcdr skill is read-only for everyday use: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and writes only to a local SQLite mirror on your machine. The single API-mutating command is `import`, a bulk data load you preview with --dry-run; nothing else can change remote state. Scope the partner key pair to what your workflow needs, and keep autonomous agents to read plus previewed imports. Full details in [governance.md](https://github.com/servosity/msp-skills/blob/main/skills/datto-bcdr/governance.md).
+The datto-bcdr skill is read-only against Datto: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and the API it targets exposes no write endpoints, so no command can change remote state. It writes only to your own machine - the local SQLite mirror, an optional export file, and the local learning store. Scope the partner key pair to what your workflow needs; the only human-in-the-loop commands are the ones that replace or clear the stored credential. Full details in [governance.md](https://github.com/servosity/msp-skills/blob/main/skills/datto-bcdr/governance.md).
 
 ## Frequently asked questions
 
@@ -181,7 +182,7 @@ No. It answers the fleet-wide, cross-client questions the per-appliance portal c
 
 ### Can it change anything in Datto, or just read?
 
-Read-only for everyday use - every analysis, list, and report command only reads. The single exception is `import`, an explicit bulk data-load command you would never run by accident; preview it with --dry-run first.
+Read-only. Every analysis, list, and report command only reads, and the Datto BCDR API this connector targets exposes no write endpoints, so there is no command that can change anything in Datto. The only things it writes are on your own machine: the local SQLite mirror (`sync`), an optional export file, and the local learning store.
 
 
 ## More Backup/DR connectors

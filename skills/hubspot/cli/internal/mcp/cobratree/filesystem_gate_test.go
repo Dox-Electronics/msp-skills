@@ -16,7 +16,7 @@ import (
 // handler uses, with nothing pre-blocked by the caller, so the assertions below
 // measure this file's gate and not a per-command denylist computed elsewhere.
 func forwardedCLIArgs(args map[string]any) []string {
-	return cliArgsFromMCP(args)
+	return cliArgsFromMCP(args, nil)
 }
 
 func hasFlagPair(argv []string, flag, value string) bool {

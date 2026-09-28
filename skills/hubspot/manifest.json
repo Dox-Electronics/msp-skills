@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "hubspot-mcp",
   "display_name": "HubSpot",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Every HubSpot Sales Hub feature, plus offline cross-object queries, property-change-history reporting, and an agent-native data layer no other HubSpot tool has.",
   "author": {
     "name": "Servosity Inc."
@@ -17,7 +17,10 @@
       "env": {
         "HUBSPOT_ACCESS_TOKEN": "${user_config.hubspot_access_token}",
         "HUBSPOT_BASE_URL": "${user_config.hubspot_base_url}",
-        "HUBSPOT_OWNER_EMAIL": "${user_config.hubspot_owner_email}"
+        "HUBSPOT_OWNER_EMAIL": "${user_config.hubspot_owner_email}",
+        "HUBSPOT_MCP_HTTP_TOKEN": "${user_config.hubspot_mcp_http_token}",
+        "HUBSPOT_USER_AGENT": "${user_config.hubspot_user_agent}",
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
       }
     }
   },
@@ -41,6 +44,25 @@
       "title": "Default owner email",
       "description": "Email address that `--owner me` resolves to when git config user.email is not set. Leave blank to name the owner on each call.",
       "required": false
+    },
+    "hubspot_mcp_http_token": {
+      "type": "string",
+      "title": "HTTP transport bearer token",
+      "description": "Bearer token that `hubspot-mcp --transport http` requires from every HTTP client (Authorization: Bearer). Leave blank for the default stdio transport, which Claude Desktop uses and which never reads it.",
+      "sensitive": true,
+      "required": false
+    },
+    "hubspot_user_agent": {
+      "type": "string",
+      "title": "User-Agent header",
+      "description": "Overrides the User-Agent the CLI sends on HubSpot requests. Leave blank to use the CLI's own built-in User-Agent.",
+      "required": false
+    },
+    "printing_press_client_profile": {
+      "type": "string",
+      "title": "Client profile",
+      "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
+      "required": false
     }
   },
   "compatibility": {
@@ -51,11 +73,11 @@
       "win32"
     ]
   },
-  "printing_press_version": "4.24.0",
+  "printing_press_version": "4.32.5",
   "press_provenance": {
-    "printing_press_version": "4.24.0",
-    "generated_at": "2026-06-13T04:36:42.540934Z",
-    "spec_checksum": null,
-    "spec_format": null
+    "printing_press_version": "4.32.5",
+    "generated_at": "2026-09-28T17:26:58.378855Z",
+    "spec_checksum": "sha256:ef8bded66c004ef2ec92019b4f0a4a942494165e2d27cf38ffef6743905bc723",
+    "spec_format": "printing-press-combined"
   }
 }
