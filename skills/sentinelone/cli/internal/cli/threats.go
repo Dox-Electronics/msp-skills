@@ -11,8 +11,7 @@ func newThreatsCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "threats",
 		Short:       "Get, fetch, disable, create, add, and update threats",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -33,10 +32,10 @@ func newThreatsCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newThreatsNotesCmd(flags))
 	cmd.AddCommand(newThreatsTimelineCmd(flags))
 	cmd.AddCommand(newThreatsWhiteningOptionsCmd(flags))
-	cmd.AddCommand(newNovelThreatsBlastRadiusCmd(flags))
-	cmd.AddCommand(newNovelThreatsMttrCmd(flags))
-	cmd.AddCommand(newNovelThreatsRecurrenceCmd(flags))
-	cmd.AddCommand(newNovelThreatsTriageCmd(flags))
-	cmd.AddCommand(newNovelThreatsVerdictsCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelThreatsBlastRadiusCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelThreatsMttrCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelThreatsRecurrenceCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelThreatsTriageCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelThreatsVerdictsCmd(flags))
 	return cmd
 }

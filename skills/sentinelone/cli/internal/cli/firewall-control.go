@@ -11,8 +11,7 @@ func newFirewallControlCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "firewall-control",
 		Short:       "Get, enable, create, add, update, delete, and remove firewall control",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -38,14 +37,14 @@ func newFirewallControlCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newFirewallControlUpdateFirewallRuleByCategoryCmd(flags))
 	cmd.AddCommand(newFirewallControlAddTagsCmd(flags))
 	cmd.AddCommand(newFirewallControlConfigurationCmd(flags))
-	cmd.AddCommand(newFirewallControlCopyRulesCmd(flags))
+	cmd.AddCommand(newFirewallControlItemCopyRulesCmd(flags))
 	cmd.AddCommand(newFirewallControlEnableCmd(flags))
 	cmd.AddCommand(newFirewallControlExportCmd(flags))
 	cmd.AddCommand(newFirewallControlImportCmd(flags))
-	cmd.AddCommand(newFirewallControlMoveRulesCmd(flags))
+	cmd.AddCommand(newFirewallControlItemMoveRulesCmd(flags))
 	cmd.AddCommand(newFirewallControlProtocolsCmd(flags))
 	cmd.AddCommand(newFirewallControlRemoveTagsCmd(flags))
 	cmd.AddCommand(newFirewallControlReorderCmd(flags))
-	cmd.AddCommand(newFirewallControlSetLocationCmd(flags))
+	cmd.AddCommand(newFirewallControlItemSetLocationCmd(flags))
 	return cmd
 }

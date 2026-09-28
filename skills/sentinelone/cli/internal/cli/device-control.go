@@ -11,8 +11,7 @@ func newDeviceControlCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "device-control",
 		Short:       "Get, enable, create, update, and delete device control",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 

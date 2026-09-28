@@ -11,7 +11,7 @@ func newFirewallControlAddTagsCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "add-tags",
 		Short:       "Add add tags for firewall control",
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 

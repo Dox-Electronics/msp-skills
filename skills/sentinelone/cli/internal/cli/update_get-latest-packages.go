@@ -43,13 +43,12 @@ func newUpdateGetLatestPackagesCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli update get-latest-packages",
 		Annotations: map[string]string{"pp:endpoint": "update.get-latest-packages", "pp:method": "GET", "pp:path": "/update/agent/packages", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/update/agent/packages"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/update/agent/packages"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "update", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "update", path, retainCLIQueryParams(cmd, map[string]string{
 				"skip":          formatCLIParamValue(flagSkip),
 				"sortOrder":     formatCLIParamValue(flagSortOrder),
 				"version":       formatCLIParamValue(flagVersion),
@@ -72,10 +71,11 @@ func newUpdateGetLatestPackagesCmd(flags *rootFlags) *cobra.Command {
 				"skipCount":     formatCLIParamValue(flagSkipCount),
 				"packageType":   formatCLIParamValue(flagPackageType),
 				"countOnly":     formatCLIParamValue(flagCountOnly),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"skip": {"skip"}, "sortOrder": {"sort-order"}, "version": {"version"}, "status": {"status"}, "ids": {"ids"}, "packageTypes": {"package-types"}, "minorVersion": {"minor-version"}, "osTypes": {"os-types"}, "osArches": {"os-arches"}, "siteIds": {"site-ids"}, "sortBy": {"sort-by"}, "limit": {"limit"}, "platformTypes": {"platform-types"}, "query": {"query"}, "sha1": {"sha1"}, "accountIds": {"account-ids"}, "fileExtension": {"file-extension"}, "cursor": {"cursor"}, "rangerVersion": {"ranger-version"}, "skipCount": {"skip-count"}, "packageType": {"package-type"}, "countOnly": {"count-only"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -83,7 +83,7 @@ func newUpdateGetLatestPackagesCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -92,22 +92,31 @@ func newUpdateGetLatestPackagesCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -117,7 +126,11 @@ func newUpdateGetLatestPackagesCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagSkip, "skip", "", "Skip first number of items (0-1000). To iterate over more than 1000 items, use 'cursor'. Example: '150'.")

@@ -11,8 +11,7 @@ func newConfigOverrideCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "config-override",
 		Short:       "Get, create, update, and delete config override",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 

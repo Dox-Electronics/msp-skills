@@ -3,7 +3,7 @@
   "name": "io.github.Servosity/sentinelone-mcp",
   "title": "SentinelOne MCP",
   "description": "Every SentinelOne v2.1 management endpoint, plus an offline SQLite store and cross-entity analytics",
-  "version": "0.1.5",
+  "version": "0.2.1",
   "icons": [
     {
       "src": "https://raw.githubusercontent.com/servosity/msp-skills/main/docs/assets/social/sentinelone/sentinelone-512x512.png",
@@ -21,8 +21,8 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/servosity/msp-skills/releases/download/sentinelone-v0.1.5/sentinelone-mcp.mcpb",
-      "version": "0.1.5",
+      "identifier": "https://github.com/servosity/msp-skills/releases/download/sentinelone-v0.2.1/sentinelone-mcp.mcpb",
+      "version": "0.2.1",
       "fileSha256": "PLACEHOLDER_SHA256_FILLED_BY_CI",
       "transport": {
         "type": "stdio"
@@ -38,6 +38,24 @@
           "name": "SENTINELONE_BASE_URL",
           "description": "Base URL of your SentinelOne management console API, including the version path, e.g. https://usea1-partners.sentinelone.net/web/api/v2.1. The shipped default points at an example host.",
           "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "SENTINELONE_USER_AGENT",
+          "description": "Overrides the User-Agent the CLI sends on SentinelOne requests.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SENTINELONE_MCP_HTTP_TOKEN",
+          "description": "Bearer token callers must present when the server runs with --transport http; not used by the stdio transport.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PRINTING_PRESS_CLIENT_PROFILE",
+          "description": "Optional: bind the MCP server to one tenant-gated client profile; leave unset to use default_client_profile.",
+          "isRequired": false,
           "isSecret": false
         }
       ]

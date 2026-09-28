@@ -85,13 +85,12 @@ func newRangerGetGatewaysCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli ranger get-gateways",
 		Annotations: map[string]string{"pp:endpoint": "ranger.get-gateways", "pp:method": "GET", "pp:path": "/ranger/gateways", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/ranger/gateways"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/ranger/gateways"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "ranger", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "ranger", path, retainCLIQueryParams(cmd, map[string]string{
 				"updatedAt__gt":             formatCLIParamValue(flagUpdatedAtGt),
 				"scanOnlyLocalSubnets":      formatCLIParamValue(flagScanOnlyLocalSubnets),
 				"updatedAt__lt":             formatCLIParamValue(flagUpdatedAtLt),
@@ -157,10 +156,11 @@ func newRangerGetGatewaysCmd(flags *rootFlags) *cobra.Command {
 				"archived":                  formatCLIParamValue(flagArchived),
 				"ip__contains":              formatCLIParamValue(flagIpContains),
 				"createdAt__gt":             formatCLIParamValue(flagCreatedAtGt),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"updatedAt__gt": {"updated-at-gt"}, "scanOnlyLocalSubnets": {"scan-only-local-subnets"}, "updatedAt__lt": {"updated-at-lt"}, "createdAt__lt": {"created-at-lt"}, "networkName__contains": {"network-name-contains"}, "skip": {"skip"}, "sortOrder": {"sort-order"}, "numberOfRangers__between": {"number-of-rangers-between"}, "totalAgents__lt": {"total-agents-lt"}, "createdAt__lte": {"created-at-lte"}, "icmpScan": {"icmp-scan"}, "mdnsScan": {"mdns-scan"}, "new": {"new"}, "numberOfRangers__gte": {"number-of-rangers-gte"}, "connectedRangers__lt": {"connected-rangers-lt"}, "udpPorts__contains": {"udp-ports-contains"}, "smbScan": {"smb-scan"}, "macAddress__contains": {"mac-address-contains"}, "connectedRangers__between": {"connected-rangers-between"}, "numberOfRangers__lt": {"number-of-rangers-lt"}, "ip": {"ip"}, "ids": {"ids"}, "numberOfAgents__lte": {"number-of-agents-lte"}, "totalAgents__gte": {"total-agents-gte"}, "agentPercentage__lt": {"agent-percentage-lt"}, "numberOfAgents__gte": {"number-of-agents-gte"}, "agentPercentage__between": {"agent-percentage-between"}, "updatedAt__between": {"updated-at-between"}, "rdnsScan": {"rdns-scan"}, "createdAt__gte": {"created-at-gte"}, "updatedAt__lte": {"updated-at-lte"}, "totalAgents__lte": {"total-agents-lte"}, "manufacturer": {"manufacturer"}, "snmpScan": {"snmp-scan"}, "agentPercentage__lte": {"agent-percentage-lte"}, "sortBy": {"sort-by"}, "numberOfAgents__between": {"number-of-agents-between"}, "limit": {"limit"}, "connectedRangers__lte": {"connected-rangers-lte"}, "tcpPorts__contains": {"tcp-ports-contains"}, "query": {"query"}, "totalAgents__gt": {"total-agents-gt"}, "accountIds": {"account-ids"}, "macAddress": {"mac-address"}, "numberOfRangers__lte": {"number-of-rangers-lte"}, "cursor": {"cursor"}, "updatedAt__gte": {"updated-at-gte"}, "numberOfAgents__lt": {"number-of-agents-lt"}, "allowScan": {"allow-scan"}, "numberOfRangers__gt": {"number-of-rangers-gt"}, "externalIp__contains": {"external-ip-contains"}, "externalIp": {"external-ip"}, "totalAgents__between": {"total-agents-between"}, "createdAt__between": {"created-at-between"}, "agentPercentage__gt": {"agent-percentage-gt"}, "skipCount": {"skip-count"}, "manufacturer__contains": {"manufacturer-contains"}, "numberOfAgents__gt": {"number-of-agents-gt"}, "agentPercentage__gte": {"agent-percentage-gte"}, "countOnly": {"count-only"}, "connectedRangers__gt": {"connected-rangers-gt"}, "connectedRangers__gte": {"connected-rangers-gte"}, "archived": {"archived"}, "ip__contains": {"ip-contains"}, "createdAt__gt": {"created-at-gt"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -168,7 +168,7 @@ func newRangerGetGatewaysCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -177,22 +177,31 @@ func newRangerGetGatewaysCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -202,7 +211,11 @@ func newRangerGetGatewaysCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagUpdatedAtGt, "updated-at-gt", "", "Gateway updated after this timestamp. Example: '2018-02-27T04:49:26.257525Z'.")

@@ -46,12 +46,11 @@ func newFirewallControlExportRulesCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli firewall-control export-rules",
 		Annotations: map[string]string{"pp:endpoint": "firewall-control.export-rules", "pp:method": "GET", "pp:path": "/firewall-control/export", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/firewall-control/export"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/firewall-control/export"
 			params := map[string]string{}
 			if flagName != "" {
 				params["name"] = formatCLIParamValue(flagName)
@@ -131,10 +130,11 @@ func newFirewallControlExportRulesCmd(flags *rootFlags) *cobra.Command {
 			if flagCreatedAtGt != "" {
 				params["createdAt__gt"] = formatCLIParamValue(flagCreatedAtGt)
 			}
-			data, prov, err := resolveReadWithStrategy(cmd.Context(), c, flags, "auto", "firewall-control", false, path, params, nil, cmd.ErrOrStderr())
+			data, prov, err := resolveReadWithStrategyAndResponsePath(cmd.Context(), c, flags, "auto", "firewall-control", false, path, params, nil, "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := data
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -142,7 +142,7 @@ func newFirewallControlExportRulesCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -151,22 +151,31 @@ func newFirewallControlExportRulesCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -176,7 +185,11 @@ func newFirewallControlExportRulesCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagName, "name", "", "Return firewall rules with the filtered name.")

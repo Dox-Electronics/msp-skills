@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -17,17 +18,20 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 	"sentinelone-pp-cli/internal/cli"
 	"sentinelone-pp-cli/internal/client"
 	"sentinelone-pp-cli/internal/cliutil"
 	"sentinelone-pp-cli/internal/config"
+	"sentinelone-pp-cli/internal/learn"
+	"sentinelone-pp-cli/internal/mcp/bound"
 	"sentinelone-pp-cli/internal/mcp/cobratree"
+	"sentinelone-pp-cli/internal/platform"
 	"sentinelone-pp-cli/internal/store"
 )
 
 const (
-	mcpToolResultMaxBytes = 60000
-	mcpToolResultMaxItems = 50
 	// MCP hosts can fan out tool calls faster than a human CLI session.
 	// Keep them on the same polite-client limiter path instead of disabling
 	// pacing with rate=0; users can still tune human CLI calls with --rate-limit.
@@ -36,9 +40,12 @@ const (
 
 // RegisterTools registers all API operations as MCP tools.
 func RegisterTools(s *server.MCPServer) {
-	// Code-orchestration mode — the full surface is covered by two tools
-	// (<api>_search + <api>_execute). Endpoint-mirror tools are suppressed.
+	installFreshTenantGate(s)
+	// Code-orchestration mode — the full surface is covered by registry tools
+	// (<api>_search, <api>_get, and <api>_execute). Endpoint-mirror tools are suppressed.
 	RegisterCodeOrchestrationTools(s)
+	// Intent tools — higher-level compositions declared in the spec or lifted from recipes.
+	RegisterIntents(s)
 	// Search tool — faster than iterating list endpoints for finding specific items
 	s.AddTool(
 		mcplib.NewTool("search",
@@ -54,7 +61,7 @@ func RegisterTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("sql",
 			mcplib.WithDescription("Run read-only SQL against local database. Use for ad-hoc analysis, aggregations, and joins across synced resources. Requires sync first."),
-			mcplib.WithString("query", mcplib.Required(), mcplib.Description("SQL query (SELECT or WITH...SELECT). Synced records live in resources(resource_type, id, data); filter by resource_type and use json_extract on data, e.g. SELECT json_extract(data,'$.name') FROM resources WHERE resource_type='items'.")),
+			mcplib.WithString("query", mcplib.Required(), mcplib.Description("SQL query (SELECT or WITH...SELECT). Synced records live in resources(resource_type, id, data); filter by resource_type and use json_extract on data, e.g. SELECT json_extract(data,'$.name') FROM resources WHERE resource_type='accounts'.")),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 		),
@@ -69,7 +76,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 		),
-		handleContext,
+		handleContext(s),
 	)
 
 	// Runtime Cobra-tree mirror — exposes every user-facing command that is
@@ -81,6 +88,11 @@ type mcpParamBinding struct {
 	PublicName string
 	WireName   string
 	Location   string
+}
+
+type mcpPageConfig struct {
+	CursorParam    string
+	NextCursorPath string
 }
 
 func formatMCPParamValue(v any) string {
@@ -107,22 +119,40 @@ func formatMCPParamValue(v any) string {
 		}
 		return strconv.FormatFloat(f, 'f', -1, 32)
 	default:
+		// Composite values (a native []any / map[string]any from an array or
+		// object param) reach this path when bound to a query or path slot;
+		// JSON-encode them so the wire value is valid JSON rather than Go's
+		// "[a b c]" / "map[...]" rendering. Body params never come through
+		// here — they are stored natively in bodyArgs and marshalled there.
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
 		return fmt.Sprintf("%v", v)
 	}
 }
 
+func mcpPathValue(v any) string {
+	return cliutil.EscapePathParam(formatMCPParamValue(v))
+}
+
 // makeAPIHandler creates a generic MCP tool handler for an API endpoint.
-func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse bool, headerOverrides map[string]string, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
+func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse bool, headerOverrides map[string]string, pageConfig mcpPageConfig, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-		c, err := newMCPClient()
+		c, platformSession, err := newMCPClient(ctx)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return mcpToolError(err.Error()), nil
+		}
+		if platformSession != nil {
+			defer platformSession.ZeroCredentials()
 		}
 
 		// mcp-go v0.47+ made CallToolParams.Arguments an `any` to support
 		// non-map payloads; GetArguments() returns the map[string]any shape
 		// we rely on here (or an empty map when the payload is something else).
 		args := req.GetArguments()
+		if err := cli.AdoptMCPOutputSemantics(platformSession, args); err != nil {
+			return mcpToolError(err.Error()), nil
+		}
 
 		// positionalParams mixes real URL path params with CLI positional
 		// args that map to query params (e.g. `search <query>` -> ?query=);
@@ -132,6 +162,24 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 		pathParams := make(map[string]bool, len(positionalParams))
 		params := make(map[string]string)
 		bodyArgs := make(map[string]any)
+		mcpCursor := ""
+		if pageConfig.CursorParam != "" {
+			knownArgs["cursor"] = true
+			if v, ok := args["cursor"]; ok {
+				s, ok := v.(string)
+				if !ok {
+					return mcpToolError("cursor must be an opaque string returned by a previous MCP response"), nil
+				}
+				mcpCursor = s
+				upstreamCursor, err := bound.UpstreamCursor(s)
+				if err != nil {
+					return mcpToolError(err.Error()), nil
+				}
+				if upstreamCursor != "" {
+					params[pageConfig.CursorParam] = upstreamCursor
+				}
+			}
+		}
 		var headers map[string]string
 		if len(headerOverrides) > 0 {
 			headers = make(map[string]string, len(headerOverrides)+1)
@@ -155,7 +203,12 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			case "path":
 				placeholder := "{" + binding.WireName + "}"
 				pathParams[binding.PublicName] = true
-				path = strings.Replace(path, placeholder, formatMCPParamValue(v), 1)
+				path = strings.Replace(path, placeholder, mcpPathValue(v), 1)
+			case "header":
+				if headers == nil {
+					headers = map[string]string{}
+				}
+				headers[binding.WireName] = formatMCPParamValue(v)
 			case "body":
 				bodyArgs[binding.WireName] = v
 			default:
@@ -169,7 +222,7 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			pathParams[p] = true
 			if v, ok := args[p]; ok {
-				path = strings.Replace(path, placeholder, formatMCPParamValue(v), 1)
+				path = strings.Replace(path, placeholder, mcpPathValue(v), 1)
 			}
 		}
 
@@ -189,10 +242,18 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 		switch method {
 		case "GET":
 			if len(headers) > 0 {
-				data, err = c.GetWithHeaders(ctx, path, params, headers)
+				if readOnly {
+					data, err = c.GetWithHeaders(ctx, path, params, headers)
+				} else {
+					data, err = c.GetMutatingWithHeaders(ctx, path, params, headers)
+				}
 				break
 			}
-			data, err = c.Get(ctx, path, params)
+			if readOnly {
+				data, err = c.Get(ctx, path, params)
+			} else {
+				data, err = c.GetMutating(ctx, path, params)
+			}
 		case "POST":
 			if len(headers) > 0 {
 				if readOnly {
@@ -209,16 +270,32 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 		case "PUT":
 			if len(headers) > 0 {
-				data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				if readOnly {
+					data, _, err = c.PutQueryWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				} else {
+					data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				}
 				break
 			}
-			data, _, err = c.PutWithParams(ctx, path, params, bodyArgs)
+			if readOnly {
+				data, _, err = c.PutQueryWithParams(ctx, path, params, bodyArgs)
+			} else {
+				data, _, err = c.PutWithParams(ctx, path, params, bodyArgs)
+			}
 		case "PATCH":
 			if len(headers) > 0 {
-				data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				if readOnly {
+					data, _, err = c.PatchQueryWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				} else {
+					data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				}
 				break
 			}
-			data, _, err = c.PatchWithParams(ctx, path, params, bodyArgs)
+			if readOnly {
+				data, _, err = c.PatchQueryWithParams(ctx, path, params, bodyArgs)
+			} else {
+				data, _, err = c.PatchWithParams(ctx, path, params, bodyArgs)
+			}
 		case "DELETE":
 			if len(headers) > 0 {
 				data, _, err = c.DeleteWithParamsAndHeaders(ctx, path, params, headers)
@@ -226,184 +303,125 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			data, _, err = c.DeleteWithParams(ctx, path, params)
 		default:
-			return mcplib.NewToolResultError("unsupported method: " + method), nil
+			return mcpToolError("unsupported method: " + method), nil
 		}
 
 		if err != nil {
 			msg := err.Error()
 			switch {
 			case strings.Contains(msg, "HTTP 409"):
-				return mcplib.NewToolResultText("already exists (no-op)"), nil
+				return mcpToolTextWithPlatform("already exists (no-op)", platformSession), nil
 			case strings.Contains(msg, "HTTP 400") && cliutil.LooksLikeAuthError(msg):
-				return mcplib.NewToolResultError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: the API rejected the request — this usually means auth is missing or invalid." +
 					"\n      Set your API key with: export SENTINELONE_API_TOKEN=\"your-token-here\"" +
 					"\n      See API docs: https://twitter.com/frikkylikeme" +
 					"\n      Run 'sentinelone-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 401"):
-				return mcplib.NewToolResultError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: check your API key." +
 					"\n      Set your API key with: export SENTINELONE_API_TOKEN=\"your-token-here\"" +
 					"\n      See API docs: https://twitter.com/frikkylikeme" +
 					"\n      Run 'sentinelone-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 403"):
-				return mcplib.NewToolResultError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: your credentials are valid but lack access to this resource. Check that they have the required permissions and match the API's expected auth scheme." +
 					"\n      Set your API key with: export SENTINELONE_API_TOKEN=\"your-token-here\"" +
 					"\n      See API docs: https://twitter.com/frikkylikeme" +
 					"\n      Run 'sentinelone-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 404"):
 				if method == "DELETE" {
-					return mcplib.NewToolResultText("already deleted (no-op)"), nil
+					return mcpToolTextWithPlatform("already deleted (no-op)", platformSession), nil
 				}
-				return mcplib.NewToolResultError("not found: " + msg), nil
+				return mcpToolError("not found: " + msg), nil
 			case strings.Contains(msg, "HTTP 429"):
-				return mcplib.NewToolResultError("rate limited: " + msg), nil
+				return mcpToolError("rate limited: " + msg), nil
 			default:
-				return mcplib.NewToolResultError(msg), nil
+				return mcpToolError(msg), nil
 			}
 		}
 
 		if binaryResponse {
-			out, _ := json.Marshal(map[string]any{
+			encoded := base64.StdEncoding.EncodeToString(data)
+			out, err := json.Marshal(map[string]any{
 				"content_encoding": "base64",
-				"data_base64":      base64.StdEncoding.EncodeToString(data),
+				"data_base64":      encoded,
 				"byte_count":       len(data),
 			})
-			return mcplib.NewToolResultText(string(out)), nil
+			if err != nil {
+				return mcpToolError(fmt.Sprintf("encoding binary result: %v", err)), nil
+			}
+			if len(out) > bound.MaxBytes {
+				return mcpToolError(fmt.Sprintf("binary response is too large for MCP text output: %d response bytes encode to %d base64 bytes and %d MCP result bytes, exceeding the %d byte budget. Use the companion CLI command with --output <file> to save the payload locally.", len(data), len(encoded), len(out), bound.MaxBytes)), nil
+			}
+			result := string(out)
+			if platformSession != nil {
+				result = bound.WithMetadata(result, platformSession.OutputMetadata())
+			}
+			return mcplib.NewToolResultText(result), nil
 		}
-		return mcpToolResultText(method, data), nil
+		if pageConfig.CursorParam != "" {
+			return mcpToolPageResultTextWithPlatform(method, data, pageConfig, mcpCursor, platformSession), nil
+		}
+		return mcpToolResultTextWithPlatform(method, data, platformSession), nil
 	}
 }
 
 func mcpToolResultText(method string, data json.RawMessage) *mcplib.CallToolResult {
-	trimmed := strings.TrimSpace(string(data))
-	if strings.EqualFold(method, "GET") && len(trimmed) > 0 && trimmed[0] == '[' {
-		var items []json.RawMessage
-		if json.Unmarshal(data, &items) == nil {
-			return mcplib.NewToolResultText(string(mcpBoundedListEnvelope("items", items, len(data))))
-		}
-	}
-	if len(data) <= mcpToolResultMaxBytes {
-		return mcplib.NewToolResultText(string(data))
-	}
-	if strings.EqualFold(method, "GET") {
-		if out, ok := mcpBoundedSingleArrayObject(data); ok {
-			return mcplib.NewToolResultText(string(out))
-		}
-	}
-	return mcplib.NewToolResultText(string(mcpOversizedPreviewEnvelope(data)))
+	return mcpToolResultTextWithPlatform(method, data, nil)
 }
 
-func mcpBoundedSingleArrayObject(data json.RawMessage) ([]byte, bool) {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(data, &obj) != nil {
-		return nil, false
+func mcpToolTextWithPlatform(result string, platformSession *platform.Session) *mcplib.CallToolResult {
+	if platformSession != nil {
+		result = bound.WithMetadata(result, platformSession.OutputMetadata())
 	}
-	arrayField := ""
-	var items []json.RawMessage
-	for key, raw := range obj {
-		trimmed := strings.TrimSpace(string(raw))
-		if len(trimmed) == 0 || trimmed[0] != '[' {
-			continue
-		}
-		var candidate []json.RawMessage
-		if json.Unmarshal(raw, &candidate) != nil {
-			continue
-		}
-		if arrayField != "" {
-			return nil, false
-		}
-		arrayField = key
-		items = candidate
-	}
-	if arrayField == "" {
-		return nil, false
-	}
-	build := func(subset []json.RawMessage) any {
-		out := make(map[string]any, len(obj)+6)
-		for key, raw := range obj {
-			if key == arrayField {
-				out[key] = subset
-				continue
-			}
-			out[key] = raw
-		}
-		if len(subset) < len(items) {
-			out["_pp_truncated"] = true
-			out["_pp_total_count"] = len(items)
-			out["_pp_returned_count"] = len(subset)
-			out["_pp_original_bytes"] = len(data)
-			out["_pp_max_bytes"] = mcpToolResultMaxBytes
-			out["_pp_note"] = "Typed MCP endpoint response exceeded the tool result budget. Narrow the request with limit, offset, filters, search/sql, or a command-mirror tool with --agent/--compact/--select."
-		}
-		return out
-	}
-	out := mcpFitJSONItems(items, build)
-	if len(out) > mcpToolResultMaxBytes {
-		return nil, false
-	}
-	return out, true
+	return mcplib.NewToolResultText(result)
 }
 
-func mcpBoundedListEnvelope(field string, items []json.RawMessage, originalBytes int) []byte {
-	build := func(subset []json.RawMessage) any {
-		out := map[string]any{
-			"count": len(items),
-			field:   subset,
-		}
-		if len(subset) < len(items) {
-			out["truncated"] = true
-			out["returned_count"] = len(subset)
-			out["original_bytes"] = originalBytes
-			out["max_bytes"] = mcpToolResultMaxBytes
-			out["note"] = "Typed MCP endpoint response exceeded the tool result budget. Narrow the request with limit, offset, filters, search/sql, or a command-mirror tool with --agent/--compact/--select."
-		}
-		return out
-	}
-	return mcpFitJSONItems(items, build)
+func mcpToolResultTextWithPlatform(method string, data json.RawMessage, platformSession *platform.Session) *mcplib.CallToolResult {
+	result := bound.EndpointResponse(method, data)
+	return mcpToolTextWithPlatform(result, platformSession)
 }
 
-func mcpFitJSONItems(items []json.RawMessage, build func([]json.RawMessage) any) []byte {
-	limit := len(items)
-	if limit > mcpToolResultMaxItems {
-		limit = mcpToolResultMaxItems
-	}
-	for n := limit; n >= 0; n-- {
-		out, err := json.Marshal(build(items[:n]))
-		if err != nil {
-			continue
-		}
-		if len(out) <= mcpToolResultMaxBytes || n == 0 {
-			return out
-		}
-	}
-	out, _ := json.Marshal(build(items[:0]))
-	return out
+// mcpToolError keeps provider-controlled typed endpoint errors within the MCP
+// text-result budget just like successful endpoint results.
+func mcpToolError(message string) *mcplib.CallToolResult {
+	return mcplib.NewToolResultError(bound.Text(message))
 }
 
-func mcpOversizedPreviewEnvelope(data json.RawMessage) []byte {
-	previewBytes := data
-	if len(previewBytes) > 4000 {
-		previewBytes = previewBytes[:4000]
-	}
-	out, _ := json.Marshal(map[string]any{
-		"truncated":      true,
-		"original_bytes": len(data),
-		"max_bytes":      mcpToolResultMaxBytes,
-		"preview":        string(previewBytes),
-		"note":           "Typed MCP endpoint response exceeded the tool result budget and was not a recognized list envelope. Narrow the request with filters, search/sql, or a command-mirror tool with --agent/--compact/--select.",
+func mcpToolPageResultText(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string) *mcplib.CallToolResult {
+	return mcpToolPageResultTextWithPlatform(method, data, pageConfig, cursor, nil)
+}
+
+func mcpToolPageResultTextWithPlatform(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string, platformSession *platform.Session) *mcplib.CallToolResult {
+	result := bound.EndpointPageResponse(method, data, bound.PageOptions{
+		Cursor:         cursor,
+		CursorParam:    pageConfig.CursorParam,
+		NextCursorPath: pageConfig.NextCursorPath,
 	})
-	return out
+	if platformSession != nil {
+		result = bound.WithMetadata(result, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(result)
 }
 
-func newMCPClient() (*client.Client, error) {
-	home, _ := os.UserHomeDir()
-	cfgPath := filepath.Join(home, ".config", "sentinelone-cli", "config.toml")
-	cfg, err := config.Load(cfgPath)
+func newMCPClient(ctx context.Context) (*client.Client, *platform.Session, error) {
+	cfg, err := newMCPConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	return newMCPClientFromConfig(ctx, cfg)
+}
+
+func newMCPConfig() (*config.Config, error) {
+	cfg, err := config.Load("")
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
+	return cfg, nil
+}
+
+func newMCPClientFromConfig(ctx context.Context, cfg *config.Config) (*client.Client, *platform.Session, error) {
 	c := client.New(cfg, 60*time.Second, defaultMCPRateLimit)
 	// Agents calling through MCP need fresh data every call. The on-disk
 	// response cache survives across MCP server invocations, so a
@@ -411,16 +429,94 @@ func newMCPClient() (*client.Client, error) {
 	// pre-mutation snapshot for up to the cache TTL. The interactive CLI
 	// constructs its own client and is unaffected.
 	c.NoCache = true
-	return c, nil
+	session, err := cli.BindMCPClient(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cli.ApplyClientHooks(c); err != nil {
+		if session != nil {
+			session.ZeroCredentials()
+		}
+		return nil, nil, fmt.Errorf("initializing MCP client: %w", err)
+	}
+	return c, session, nil
 }
 
-func dbPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "sentinelone-cli", "data.db")
+func mcpDBPath() (string, error) {
+	dir, err := cliutil.DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "data.db"), nil
 }
 
-// Note: MCP tools use their own dbPath() because they are in a separate package (main, not cli).
-// The CLI's defaultDBPath() in the cli package uses the same canonical path.
+type mcpStoreStatusKind string
+
+const (
+	mcpStoreStatusEmpty   mcpStoreStatusKind = "empty"
+	mcpStoreStatusPartial mcpStoreStatusKind = "partial"
+	mcpStoreStatusReady   mcpStoreStatusKind = "ready"
+)
+
+func openMCPReadOnlyStore(path string) (*store.Store, *mcplib.CallToolResult) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, mcplib.NewToolResultError(mcpMissingStoreMessage(path))
+		}
+		return nil, mcplib.NewToolResultError(fmt.Sprintf("checking local data store %s: %v", path, err))
+	}
+	db, err := store.OpenReadOnly(path)
+	if err != nil {
+		return nil, mcplib.NewToolResultError(fmt.Sprintf("opening local data store %s: %v. Run sentinelone-cli sync to refresh the store, or use live endpoint MCP tools for unsynced data.", path, err))
+	}
+	return db, nil
+}
+
+func mcpMissingStoreMessage(path string) string {
+	return fmt.Sprintf("No local data store found at %s. Run sentinelone-cli sync before using MCP search/sql, or use live endpoint MCP tools for unsynced data.", path)
+}
+
+func mcpStoreStatus(db *store.Store) (mcpStoreStatusKind, error) {
+	status, err := db.Status()
+	if err != nil {
+		return "", err
+	}
+	var checkpoints, completed int
+	err = db.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN last_attempt_complete = 1 THEN 1 ELSE 0 END), 0) FROM sync_state`).Scan(&checkpoints, &completed)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no such column: last_attempt_complete") {
+		// Read-only stores have not run the conservative completion migration.
+		// Legacy timestamps were also written by partial walks, so prove nothing.
+		err = db.DB().QueryRow(`SELECT COUNT(*), 0 FROM sync_state`).Scan(&checkpoints, &completed)
+	}
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such table") || strings.Contains(msg, "no such column") {
+			if len(status) > 0 {
+				return mcpStoreStatusReady, nil
+			}
+			return mcpStoreStatusEmpty, nil
+		}
+		return "", err
+	}
+	if checkpoints > 0 {
+		if completed == checkpoints {
+			return mcpStoreStatusReady, nil
+		}
+		return mcpStoreStatusPartial, nil
+	}
+	if len(status) > 0 {
+		return mcpStoreStatusReady, nil
+	}
+	return mcpStoreStatusEmpty, nil
+}
+
+func mcpEmptyStoreNextStep() string {
+	return "Run sentinelone-cli sync to populate the local SQLite store before using MCP search/sql."
+}
+
+func mcpPartialStoreNextStep() string {
+	return "The latest sync attempt is incomplete. Resume or rerun sentinelone-cli sync before treating local search/sql results as a complete snapshot."
+}
 
 func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
@@ -434,9 +530,13 @@ func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.Call
 		limit = int(v)
 	}
 
-	db, err := store.OpenReadOnly(dbPath())
+	path, err := mcpDBPath()
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("opening database: %v", err)), nil
+		return mcplib.NewToolResultError(fmt.Sprintf("resolving database: %v", err)), nil
+	}
+	db, toolErr := openMCPReadOnlyStore(path)
+	if toolErr != nil {
+		return toolErr, nil
 	}
 	defer db.Close()
 
@@ -444,8 +544,35 @@ func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.Call
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}
+	storeStatus, err := mcpStoreStatus(db)
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("reading store status: %v", err)), nil
+	}
 
-	return toolResultJSON(results)
+	return toolResultJSON(mcpSearchEnvelope(results, storeStatus))
+}
+
+func mcpSearchEnvelope(results []json.RawMessage, storeStatus mcpStoreStatusKind) map[string]any {
+	if results == nil {
+		results = []json.RawMessage{}
+	}
+	out := map[string]any{
+		"count":        len(results),
+		"results":      results,
+		"store_status": storeStatus,
+		"resumable":    false,
+	}
+	if storeStatus == mcpStoreStatusPartial {
+		out["warning"] = "Local data may be incomplete because the latest sync attempt did not finish."
+		out["next_step"] = mcpPartialStoreNextStep()
+	} else if len(results) == 0 {
+		if storeStatus == mcpStoreStatusEmpty {
+			out["next_step"] = mcpEmptyStoreNextStep()
+		} else {
+			out["next_step"] = "No local search matches. Try a broader query, a lower-specificity FTS expression, or sync again if data may be stale."
+		}
+	}
+	return out
 }
 
 // validateReadOnlyQuery gates the MCP sql tool. The agent contract advertised
@@ -598,6 +725,8 @@ func hasTrailingSQLStatement(query string) bool {
 	return false
 }
 
+const mcpSQLMaxValueBytes = 4 << 20
+
 func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
 	query, ok := args["query"].(string)
@@ -609,15 +738,32 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
 
-	db, err := store.OpenReadOnly(dbPath())
+	path, err := mcpDBPath()
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("opening database: %v", err)), nil
+		return mcplib.NewToolResultError(fmt.Sprintf("resolving database: %v", err)), nil
+	}
+	db, toolErr := openMCPReadOnlyStore(path)
+	if toolErr != nil {
+		return toolErr, nil
 	}
 	defer db.Close()
 
-	rows, err := db.Query(query)
+	queryCtx, cancel := bound.WithSQLQueryDeadline(ctx)
+	defer cancel()
+
+	conn, err := db.DB().Conn(queryCtx)
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("query failed: %v", err)), nil
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+	}
+	defer conn.Close()
+
+	if _, err := sqlite.Limit(conn, sqlite3.SQLITE_LIMIT_LENGTH, mcpSQLMaxValueBytes); err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("setting SQL value length cap: %v", err)), nil
+	}
+
+	rows, err := conn.QueryContext(queryCtx, query)
+	if err != nil {
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
 	}
 	defer rows.Close()
 
@@ -625,7 +771,7 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("reading columns: %v", err)), nil
 	}
-	var results []map[string]any
+	scan := bound.NewSQLScanState(cols)
 	for rows.Next() {
 		values := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -633,41 +779,141 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 			ptrs[i] = &values[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
+			if mcpSQLValueTooBig(err) {
+				return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+			}
 			return mcplib.NewToolResultError(fmt.Sprintf("scanning row: %v", err)), nil
 		}
 		row := make(map[string]any)
 		for i, col := range cols {
 			row[col] = values[i]
 		}
-		results = append(results, row)
+		if !scan.Add(row) {
+			break
+		}
 	}
 	// rows.Next() stops on a mid-iteration error without failing the loop, so
 	// skipping rows.Err() would return a truncated result set as success.
 	if err := rows.Err(); err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("reading rows: %v", err)), nil
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+	}
+	storeStatus, err := mcpStoreStatus(db)
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("reading store status: %v", err)), nil
 	}
 
-	return toolResultJSON(results)
+	return toolResultJSON(mcpSQLEnvelope(scan.Rows, cols, storeStatus, scan.Truncated))
+}
+
+func mcpSQLEnvelope(rows []map[string]any, columns []string, storeStatus mcpStoreStatusKind, truncated bool) map[string]any {
+	if rows == nil {
+		rows = []map[string]any{}
+	}
+	out := map[string]any{
+		"count":        len(rows),
+		"columns":      columns,
+		"rows":         rows,
+		"store_status": storeStatus,
+		"resumable":    false,
+		"truncated":    truncated,
+	}
+	if truncated {
+		out["returned_count"] = len(rows)
+		out["max_bytes"] = bound.MaxBytes
+		out["note"] = bound.SQLResultBoundNote
+	}
+	if storeStatus == mcpStoreStatusPartial {
+		out["warning"] = "Local data may be incomplete because the latest sync attempt did not finish."
+		out["next_step"] = mcpPartialStoreNextStep()
+	} else if len(rows) == 0 && !truncated {
+		if storeStatus == mcpStoreStatusEmpty {
+			out["next_step"] = mcpEmptyStoreNextStep()
+		} else {
+			out["next_step"] = "The read-only SQL query returned no rows. Check resource_type filters, json_extract paths, or run sync again if data may be stale."
+		}
+	}
+	return out
+}
+
+func mcpSQLQueryError(queryCtx context.Context, err error) string {
+	if queryCtx.Err() != nil {
+		return fmt.Sprintf("query cancelled: %v. MCP SQL queries are bounded to %s; narrow the query with WHERE, GROUP BY, or an aggregate.", err, bound.SQLQueryTimeout)
+	}
+	if mcpSQLValueTooBig(err) {
+		return fmt.Sprintf("query failed: a string or blob exceeds the MCP SQL value cap of %d bytes (4 MiB). Narrow the selected columns or use substr, json_extract, or length instead of returning oversized values.", mcpSQLMaxValueBytes)
+	}
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "no such table") {
+		return fmt.Sprintf("query failed: %v. Synced records live in resources(resource_type, id, data), not one SQL table per resource. Filter by resource_type, for example resource_type='accounts', and read JSON fields with json_extract(data,'$.field').", err)
+	}
+	return fmt.Sprintf("query failed: %v", err)
+}
+
+func mcpSQLValueTooBig(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_TOOBIG
 }
 
 // toolResultJSON renders v as the indented JSON body of an MCP text result,
 // surfacing a marshal failure as a tool error instead of empty content.
 func toolResultJSON(v any) (*mcplib.CallToolResult, error) {
-	data, err := json.MarshalIndent(v, "", "  ")
+	text, err := bound.JSON(v)
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("encoding result: %v", err)), nil
 	}
-	return mcplib.NewToolResultText(string(data)), nil
+	return mcplib.NewToolResultText(text), nil
+}
+func registeredCommandMirrorCapabilities(s *server.MCPServer, capabilities []map[string]string) []map[string]string {
+	registered := make([]map[string]string, 0, len(capabilities))
+	root := cli.RootCmd()
+	for _, capability := range capabilities {
+		toolName := cobratree.ToolNameForCommand(s, root, capability["cli_command"])
+		if toolName == "" {
+			continue
+		}
+		entry := s.GetTool(toolName)
+		if entry == nil || entry.Tool.Meta == nil || entry.Tool.Meta.AdditionalFields["pp:tenant-gate"] != "child-cli" {
+			continue
+		}
+		capability["mcp_tool"] = toolName
+		registered = append(registered, capability)
+	}
+	return registered
 }
 
-func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+func handleContext(s *server.MCPServer) func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		return handleContextResult(s, ctx, req)
+	}
+}
+
+func handleContextResult(s *server.MCPServer, _ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	paths := map[string]string{}
+	if dir, err := cliutil.ConfigDir(); err == nil {
+		paths["config_dir"] = dir
+	}
+	if dir, err := cliutil.DataDir(); err == nil {
+		paths["data_dir"] = dir
+	}
+	if dir, err := cliutil.StateDir(); err == nil {
+		paths["state_dir"] = dir
+	}
+	if dir, err := cliutil.CacheDir(); err == nil {
+		paths["cache_dir"] = dir
+	}
 	ctx := map[string]any{
 		"api":         "sentinelone",
 		"description": "Every SentinelOne v2.1 management endpoint, plus an offline SQLite store and cross-entity analytics — fleet health, threat triage, blast radius, drift — that no console view offers.",
 		"archetype":   "project-management",
-		"tool_count":  340,
+		"tool_count":  len(s.ListTools()),
+		"paths":       paths,
 		// tool_surface tells agents which surface a capability lives on.
 		"tool_surface": "MCP exposes typed endpoint tools plus a runtime mirror of user-facing CLI commands. Endpoint tools keep typed schemas; command-mirror tools shell out to the companion sentinelone-cli binary.",
+		// learn_protocol is generated from the single shared source of
+		// truth (the exported constant internal/learn.RecallFirstProtocol)
+		// also consumed by the CLI agent-context command, so the MCP and
+		// CLI agent surfaces cannot drift.
+		"learn_protocol": learn.RecallFirstProtocol,
 		"auth": map[string]any{
 			"type": "api_key",
 			"env_vars": []map[string]any{
@@ -688,6 +934,37 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "get", "get-by-id", "update"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "accounts.expire-now",
+				"description": "Manage expire now",
+				"endpoints":   []string{"expire-an-account"},
+				"writable":    true,
+			},
+			{
+				"name":        "accounts.policy",
+				"description": "Manage policy",
+				"endpoints":   []string{"account", "update-account"},
+				"writable":    true,
+			},
+			{
+				"name":        "accounts.reactivate",
+				"description": "Manage reactivate",
+				"endpoints":   []string{"account"},
+				"writable":    true,
+			},
+			{
+				"name":        "accounts.revert-policy",
+				"description": "Manage revert policy",
+				"endpoints":   []string{"revert_policy"},
+				"writable":    true,
+			},
+			{
+				"name":        "accounts.uninstall-password",
+				"description": "Manage uninstall password",
+				"endpoints":   []string{"generate-regenerate", "get", "get-metadata", "revoke"},
+				"writable":    true,
 			},
 			{
 				"name":        "activities",
@@ -702,6 +979,17 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"abort-scan", "approve-uninstall", "broadcast-message", "can-run-remote-shell", "clear-remote-shell", "connect-to-network", "count", "decommission", "disable", "disable-ranger", "disconnect-from-network", "enable", "enable-ranger", "fetch-firewall-logs", "fetch-firewall-rules", "fetch-logs", "get", "get-application", "get-installed-apps-for", "get-passphrase", "initiate-scan", "mark-as-uptodate", "move-between-sites", "move-to-console", "processes", "randomize-uuid", "reject-uninstall", "reset-local-config", "restart", "set-external-id", "set-persistent-configuration-overrides", "shutdown", "start-remote-profiling", "start-remote-shell", "stop-remote-profiling", "terminate-remote-shell", "uninstall", "update-software"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "agents.actions",
+				"description": "Manage actions",
+				"endpoints":   []string{"fetch-files"},
+			},
+			{
+				"name":        "agents.uploads",
+				"description": "upload operations",
+				"endpoints":   []string{"export-agent-logs"},
 			},
 			{
 				"name":        "application-inventory",
@@ -723,11 +1011,17 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{},
 			},
 			{
+				"name":        "applications.forensics",
+				"description": "Manage forensics",
+				"endpoints":   []string{"application", "application-connections", "application-detailed", "export-application"},
+			},
+			{
 				"name":        "cloud-detection",
 				"description": "cloud-detection operations",
 				"endpoints":   []string{"activate-rules", "create-rule", "delete-rules", "disable-rules", "get-alerts", "get-rules", "update-alert-analyst-verdict", "update-rule", "updated-threat-incident"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "config-override",
@@ -735,6 +1029,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "delete", "delete-configoverride", "get", "update"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "device-control",
@@ -742,12 +1037,15 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"copy-rules", "create-rule", "delete-rules", "enable-disable-rules", "export-rules", "get-configuration", "get-device-rules", "get-events", "import-rules", "move-rules", "reorder-rules", "update-configuration", "update-device-rule"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "dv",
 				"description": "dv operations",
 				"endpoints":   []string{"cancel-running-query", "create-query-and-get-query-id", "download-source-process-file", "get-events", "get-events-by-type", "get-process-state", "get-query-status"},
+				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "exclusions",
@@ -755,6 +1053,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "delete", "get", "update", "validate-item"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "filters",
@@ -762,6 +1061,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete", "delete-deep-visibility", "get", "get-deep-visibility", "save", "save-deep-visibility", "update", "update-deep-visibility"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "firewall-control",
@@ -769,6 +1069,71 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"add-rule-tags", "copy-rules", "create-firewall-rule", "create-firewall-rule-by-category", "delete-rules", "delete-rules-by-category", "enable-disable-rules", "export-rules", "get-configuration", "get-firewall-rules", "get-firewall-rules-by-category", "get-protocols", "get-tag-firewall-rules", "import-rules", "move-rules", "remove-rule-tags", "reorder-rules", "set-location", "update-configuration", "update-firewall-rule-by-category"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.add-tags",
+				"description": "Manage add tags",
+				"endpoints":   []string{"add-rule-tags-by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.configuration",
+				"description": "Manage configuration",
+				"endpoints":   []string{"get-by-category", "update-by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.copy-rules",
+				"description": "Manage copy rules",
+				"endpoints":   []string{"by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.enable",
+				"description": "Manage enable",
+				"endpoints":   []string{"disable-rules-by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.export",
+				"description": "export operations",
+				"endpoints":   []string{"rules-by-category"},
+			},
+			{
+				"name":        "firewall-control.import",
+				"description": "Manage import",
+				"endpoints":   []string{"rules-by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.move-rules",
+				"description": "Manage move rules",
+				"endpoints":   []string{"by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.protocols",
+				"description": "Manage protocols",
+				"endpoints":   []string{"get-by-category"},
+			},
+			{
+				"name":        "firewall-control.remove-tags",
+				"description": "Manage remove tags",
+				"endpoints":   []string{"remove-rule-tags-by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.reorder",
+				"description": "Manage reorder",
+				"endpoints":   []string{"rules-by-category"},
+				"writable":    true,
+			},
+			{
+				"name":        "firewall-control.set-location",
+				"description": "Manage set location",
+				"endpoints":   []string{"by-category"},
+				"writable":    true,
 			},
 			{
 				"name":        "groups",
@@ -776,11 +1141,46 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "delete", "get", "get-by-id", "update", "update-ranks"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "groups.move-agents",
+				"description": "Manage move agents",
+				"endpoints":   []string{"move_agents"},
+				"writable":    true,
+			},
+			{
+				"name":        "groups.policy",
+				"description": "Manage policy",
+				"endpoints":   []string{"group", "update-group"},
+				"writable":    true,
+			},
+			{
+				"name":        "groups.regenerate-key",
+				"description": "Manage regenerate key",
+				"endpoints":   []string{"regenerate-group-token"},
+				"writable":    true,
+			},
+			{
+				"name":        "groups.revert-policy",
+				"description": "Manage revert policy",
+				"endpoints":   []string{"revert_policy"},
+				"writable":    true,
 			},
 			{
 				"name":        "hashes",
 				"description": "hashes operations",
 				"endpoints":   []string{},
+			},
+			{
+				"name":        "hashes.classification",
+				"description": "Manage classification",
+				"endpoints":   []string{"hash"},
+			},
+			{
+				"name":        "hashes.reputation",
+				"description": "Manage reputation",
+				"endpoints":   []string{"hash"},
 			},
 			{
 				"name":        "installed-applications",
@@ -802,6 +1202,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "delete", "get", "update"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "ranger",
@@ -809,6 +1210,12 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"add-cred-details", "add-new-deploy-command-for-device-from-agent-from-task-infra", "change-device-review", "change-device-review-in-bulk", "change-device-tags", "create-cred-group", "delete-cred-group", "delete-cred-group-detail", "export-data", "get-cred-group-details", "get-cred-groups", "get-gateways", "get-settings", "get-table", "update-cred-group", "update-cred-group-details", "update-gateway", "update-gateways", "update-settings"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "ranger.json",
+				"description": "Manage json",
+				"endpoints":   []string{"export-raw-data", "raw-data"},
 			},
 			{
 				"name":        "rbac",
@@ -816,6 +1223,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create-new-role", "delete-role", "get-all-roles", "get-specific-role-definition", "get-template-for-new-role", "update-role"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "remote-scripts",
@@ -823,6 +1231,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"get-scripts", "run", "upload-a-new-script"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "report-tasks",
@@ -830,6 +1239,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "get", "update"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "reports",
@@ -837,6 +1247,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete", "delete-tasks", "download", "get", "get-insight"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "restrictions",
@@ -844,6 +1255,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create-blacklist-item", "delete-blacklist-item", "get-blacklist", "update-blacklist-item", "validate-blacklist-item"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "rogues",
@@ -851,6 +1263,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"export-data", "get-settings", "get-table", "update-settings"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "sentinelone-export",
@@ -869,6 +1282,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"description": "settings operations",
 				"endpoints":   []string{"clear-pending-emails", "delete-notification-recipient", "get-ad", "get-ad-fqdns", "get-microsoft", "get-notification", "get-notification-recipients", "get-sms", "get-smtp", "get-sso", "get-syslog", "set-ad", "set-ad-fqdns", "set-microsoft", "set-notification", "set-notification-recipients", "set-sms", "set-smtp", "set-sso", "set-syslog", "test-ad", "test-microsoft", "test-smtp", "test-sso", "test-syslog"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "singularity-marketplace",
@@ -876,11 +1290,13 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-marketplace-application", "enable-or-disable-application", "get-applications-catalog", "get-configuration-fields", "get-configuration-fields-for-catalog-application", "get-marketplace-applications", "install-applications", "update-application-configuration"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "site-with-admin",
 				"description": "site-with-admin operations",
 				"endpoints":   []string{"create-site-and-user"},
+				"writable":    true,
 			},
 			{
 				"name":        "sites",
@@ -888,29 +1304,66 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"create", "create-duplicate", "delete", "get", "get-by-id", "update"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "sites.expire-now",
+				"description": "Manage expire now",
+				"endpoints":   []string{"expire-site"},
+				"writable":    true,
+			},
+			{
+				"name":        "sites.policy",
+				"description": "Manage policy",
+				"endpoints":   []string{"site", "update-site"},
+				"writable":    true,
+			},
+			{
+				"name":        "sites.reactivate",
+				"description": "Manage reactivate",
+				"endpoints":   []string{"site"},
+				"writable":    true,
+			},
+			{
+				"name":        "sites.regenerate-key",
+				"description": "Manage regenerate key",
+				"endpoints":   []string{"regenerate-site-key"},
+				"writable":    true,
+			},
+			{
+				"name":        "sites.revert-policy",
+				"description": "Manage revert policy",
+				"endpoints":   []string{"revert_policy"},
+				"writable":    true,
 			},
 			{
 				"name":        "system",
 				"description": "system operations",
 				"endpoints":   []string{"cache-status", "database-status", "get-config", "info", "set-config", "status"},
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "tags",
 				"description": "tags operations",
 				"endpoints":   []string{"create", "delete", "delete-by-id", "edit", "get"},
+				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "tasks-configuration",
 				"description": "tasks-configuration operations",
 				"endpoints":   []string{"create-task", "get-child-scope-task-configuration", "get-task-configuration", "has-child-scopes"},
+				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "tenant",
 				"description": "tenant operations",
 				"endpoints":   []string{"global-policy", "update-global-policy"},
+				"writable":    true,
 			},
 			{
 				"name":        "tests",
@@ -921,6 +1374,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"name":        "threat-intelligence",
 				"description": "threat-intelligence operations",
 				"endpoints":   []string{"create-io-cs", "delete-io-cs"},
+				"writable":    true,
 			},
 			{
 				"name":        "threats",
@@ -928,6 +1382,33 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"add-note-to-multiple", "add-to-blacklist", "add-to-exclusions", "disable-engines", "export", "export-mitigation-report", "fetch-file", "get", "mitigate", "update-analyst-verdict", "update-external-ticket-id", "updated-incident"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "threats.download-from-cloud",
+				"description": "Manage download from cloud",
+				"endpoints":   []string{"download_from_cloud"},
+			},
+			{
+				"name":        "threats.explore",
+				"description": "Manage explore",
+				"endpoints":   []string{"get-events"},
+			},
+			{
+				"name":        "threats.notes",
+				"description": "Manage notes",
+				"endpoints":   []string{"delete-threat", "get-threat", "update-threat"},
+				"writable":    true,
+			},
+			{
+				"name":        "threats.timeline",
+				"description": "Manage timeline",
+				"endpoints":   []string{"get-threat"},
+			},
+			{
+				"name":        "threats.whitening-options",
+				"description": "Manage whitening options",
+				"endpoints":   []string{"exclusion-options"},
 			},
 			{
 				"name":        "update",
@@ -935,11 +1416,13 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"delete-packages", "download-agent-package", "download-package", "get-latest-packages", "latest-packages-by-os", "package"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
 			},
 			{
 				"name":        "upload",
 				"description": "upload operations",
 				"endpoints":   []string{"agent-package", "deploy-system-package", "system-package"},
+				"writable":    true,
 			},
 			{
 				"name":        "user",
@@ -953,34 +1436,41 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 				"endpoints":   []string{"auth-app", "auth-by-sso", "auth-recovery-code", "bulk-delete", "change-password", "check-global", "check-remote-shell-permissions", "check-viewer", "create", "delete", "disable-2-fa", "email-verification", "enable-2-fa", "enable-2-fa-app", "generate-api-token", "generate-i-frame-token", "generate-recovery-code", "get", "list", "login", "login-by-api-token", "login-by-token", "logout", "redirect-to-sso", "request-2-fa-app", "revoke-api-token", "send-verification-email", "sign-eula", "token-details", "update", "validate-verification-token"},
 				"syncable":    true,
 				"searchable":  true,
+				"writable":    true,
+			},
+			{
+				"name":        "users.api-token-details",
+				"description": "Manage api token details",
+				"endpoints":   []string{"token-by-user-id"},
 			},
 		},
 		"query_tips": []string{
 			"Pagination uses cursor-based paging. Pass cursor parameter for subsequent pages.",
 			"Control page size with the limit parameter (default 100).",
+			"Use createdAt__lt for incremental fetches (filter by modification time).",
 			"Use the sql tool for ad-hoc analysis on synced data. Run sync first to populate the local database.",
 			"Use the search tool for full-text search across all synced resources. Faster than iterating list endpoints.",
 			"Prefer sql/search over repeated API calls when the data is already synced.",
 		},
 		// Command-mirror capabilities are exposed through MCP by shelling out
 		// to the companion CLI binary.
-		"command_mirror_capabilities": []map[string]string{
-			{"name": "Overnight Drift", "command": "whatchanged", "description": "One answer to 'what changed across all my tenants since I logged off?' — new threats, newly-offline or newly-unhealthy agents, version regressions, and protection-mode flips. Needs at least 2 syncs of local history.", "rationale": "Diffs two historical store snapshots of agents, threats, and activities across every site; the API returns current state only, with no cross-entity 'delta since T' endpoint.", "via": "mcp-command-mirror"},
-			{"name": "Threat Recurrence Hunter", "command": "threats recurrence", "description": "Surfaces threats whose same hash or name re-appears across endpoints — or returns on an endpoint after a prior mitigation — the signal of an unkilled root cause. Needs at least 2 syncs of local history.", "rationale": "Joins threats by sha1/threatName across the full history table, correlating mitigationStatus over time and grouping by agent; no Get_Threats call says '4th hit of this hash, twice mitigated'.", "via": "mcp-command-mirror"},
-			{"name": "Stale & Decaying Fleet", "command": "fleet-health stale", "description": "Ranks endpoints by a composite decay score — last-seen age, last-scan age, out-of-date agent version, and reduced or disabled protection — so the riskiest agents triage first.", "rationale": "Fuses lastActiveDate, scanFinishedAt, agentVersion vs the fleet's modal version, and networkStatus/infected/isUpToDate into one weighted rank the API exposes only as separate filterable fields.", "via": "mcp-command-mirror"},
-			{"name": "Protection Coverage Gaps", "command": "coverage gaps", "description": "Lists endpoints in detect-only mode, with self-protection off, or with Ranger/firewall/device-control disabled — the 'are we actually protecting everyone?' compliance view per tenant.", "rationale": "Cross-joins agent policy/mode fields with site and group membership to compute coverage holes and a coverage percentage; no API call returns 'all agents NOT in protect mode grouped by site'.", "via": "mcp-command-mirror"},
-			{"name": "Version Rollout Tracker", "command": "versions rollout", "description": "Shows agent-version distribution per site over time and flags sites stuck on EOL/old versions or stalled mid-upgrade-wave. Needs at least 2 syncs of local history.", "rationale": "Builds a time series of per-site version histograms from historical snapshots; the API gives a current-version filter but no week-over-week rollout progress or stall detection.", "via": "mcp-command-mirror"},
-			{"name": "MTTR & Triage SLA", "command": "threats mttr", "description": "Computes mean time from threat detection to mitigation per site, and flags SLA breaches and the longest-unresolved threats. Needs at least 2 syncs of local history.", "rationale": "Subtracts mitigation-event timestamps from detection timestamps across the activities and threats history and aggregates by tenant/analyst — a derived duration no single endpoint computes.", "via": "mcp-command-mirror"},
-			{"name": "Unmanaged Exposure Map", "command": "ranger exposure", "description": "Surfaces unmanaged/rogue endpoints on each subnet by cross-referencing Ranger-discovered devices against managed agents, ranked by managed-peer density.", "rationale": "Joins Ranger device-discovery inventory to the agent inventory on network identity (IP/subnet) and counts managed-vs-unmanaged per network — two API surfaces the console never joins.", "via": "mcp-command-mirror"},
-			{"name": "Blast Radius", "command": "threats blast-radius", "description": "For one threat, instantly shows every endpoint it touched, which are mitigated vs still active, the affected sites/groups, and the spread timeline.", "rationale": "Joins one threat identity across all agents plus site/group membership plus per-endpoint mitigation status plus first/last-seen into a spread timeline; the API returns threat rows, not an endpoint-joined containment view.", "via": "mcp-command-mirror"},
-			{"name": "Tenant Posture Scorecard", "command": "posture", "description": "A one-page per-tenant rollup — agent health %, coverage %, open-threat count, oldest unresolved, version compliance — for the morning MSSP review or a client QBR.", "rationale": "Rolls up every other derived metric per site into a single cross-entity composite; the API has no tenant-level posture object.", "via": "mcp-command-mirror"},
-			{"name": "Verdict Reconciliation", "command": "threats verdicts", "description": "Flags threats whose analyst verdict, confidence level, or incident status changed since the last sync — suspicious to malicious, or an auto-mitigated threat re-opened — so nothing flips silently. Needs at least 2 syncs of local history.", "rationale": "Diffs the analystVerdict/confidenceLevel/incidentStatus fields against each threat's prior stored value; the API returns the current verdict only, never a before/after.", "via": "mcp-command-mirror"},
-			{"name": "Triage Queue", "command": "threats triage", "description": "One ranked, cross-site worklist of every open threat — scored by confidence × severity × age — so the morning triage order needs zero console scope flips.", "rationale": "Ranks all unresolved threats across every site by a composite the API exposes only as separate filter fields; the console shows one tenant's threat blade at a time.", "via": "mcp-command-mirror"},
-			{"name": "Fleet Snapshot", "command": "fleet-health summary", "description": "At-a-glance fleet counts — online/offline/decommissioned, infected, out-of-date, under-protected — across all sites in one call.", "rationale": "Multi-dimension rollup over the synced agents table; the raw API needs one filtered count query per dimension per site.", "via": "mcp-command-mirror"},
-			{"name": "Endpoint Dossier", "command": "agents dossier", "description": "Everything about one endpoint on one card: agent state, full threat history, recent activities, and site/group membership — the IR handoff view.", "rationale": "Fuses four entities (agent × threat history × activities × membership) from the local store; the API requires four separate calls and manual correlation.", "via": "mcp-command-mirror"},
-			{"name": "Exclusion Hygiene", "command": "exclusions audit", "description": "Flags risky exclusions — never matched by any threat, wildcard paths, and entries older than a threshold — the 'are we hiding real threats?' review.", "rationale": "Joins exclusions against the local threat history to compute matched/never-matched; the API lists exclusions but can't say whether one ever fired.", "via": "mcp-command-mirror"},
-			{"name": "Site Risk Ranking", "command": "sites risk", "description": "Ranks sites/clients against each other by composite risk — open-threat density, coverage gaps, stale agents, MTTR — so you know which tenant to call first.", "rationale": "Composes per-site derived metrics across the whole local store into one cross-tenant ranking; no API object compares tenants.", "via": "mcp-command-mirror"},
-		},
+		"command_mirror_capabilities": registeredCommandMirrorCapabilities(s, []map[string]string{
+			{"name": "Overnight Drift", "command": "whatchanged", "cli_command": "whatchanged", "description": "One answer to 'what changed across all my tenants since I logged off?", "rationale": "Diffs two historical store snapshots of agents, threats, and activities across every site", "via": "mcp-command-mirror"},
+			{"name": "Threat Recurrence Hunter", "command": "threats recurrence", "cli_command": "threats recurrence", "description": "Surfaces threats whose same hash or name re-appears across endpoints — or returns on an endpoint after a prior", "rationale": "Joins threats by sha1/threatName across the full history table", "via": "mcp-command-mirror"},
+			{"name": "Stale & Decaying Fleet", "command": "fleet-health stale", "cli_command": "fleet-health stale", "description": "Ranks endpoints by a composite decay score — last-seen age, last-scan age, out-of-date agent version", "rationale": "Fuses lastActiveDate, scanFinishedAt, agentVersion vs the fleet's modal version", "via": "mcp-command-mirror"},
+			{"name": "Protection Coverage Gaps", "command": "coverage gaps", "cli_command": "coverage gaps", "description": "Lists endpoints in detect-only mode, with self-protection off", "rationale": "Cross-joins agent policy/mode fields with site and group membership to compute coverage holes and a coverage percentage", "via": "mcp-command-mirror"},
+			{"name": "Version Rollout Tracker", "command": "versions rollout", "cli_command": "versions rollout", "description": "Shows agent-version distribution per site over time and flags sites stuck on EOL/old versions or stalled", "rationale": "Builds a time series of per-site version histograms from historical snapshots", "via": "mcp-command-mirror"},
+			{"name": "MTTR & Triage SLA", "command": "threats mttr", "cli_command": "threats mttr", "description": "Computes mean time from threat detection to mitigation per site", "rationale": "Subtracts mitigation-event timestamps from detection timestamps across the activities and threats history and", "via": "mcp-command-mirror"},
+			{"name": "Unmanaged Exposure Map", "command": "ranger exposure", "cli_command": "ranger exposure", "description": "Surfaces unmanaged/rogue endpoints on each subnet by cross-referencing Ranger-discovered devices against managed agents", "rationale": "Joins Ranger device-discovery inventory to the agent inventory on network identity (IP/subnet)", "via": "mcp-command-mirror"},
+			{"name": "Blast Radius", "command": "threats blast-radius", "cli_command": "threats blast-radius", "description": "For one threat, instantly shows every endpoint it touched, which are mitigated vs still active", "rationale": "Joins one threat identity across all agents plus site/group membership plus per-endpoint mitigation status plus", "via": "mcp-command-mirror"},
+			{"name": "Tenant Posture Scorecard", "command": "posture", "cli_command": "posture", "description": "A one-page per-tenant rollup — agent health %, coverage %, open-threat count, oldest unresolved", "rationale": "Rolls up every other derived metric per site into a single cross-entity composite", "via": "mcp-command-mirror"},
+			{"name": "Verdict Reconciliation", "command": "threats verdicts", "cli_command": "threats verdicts", "description": "Flags threats whose analyst verdict, confidence level", "rationale": "Diffs the analystVerdict/confidenceLevel/incidentStatus fields against each threat's prior stored value", "via": "mcp-command-mirror"},
+			{"name": "Triage Queue", "command": "threats triage", "cli_command": "threats triage", "description": "One ranked", "rationale": "Ranks all unresolved threats across every site by a composite the API exposes only as separate filter fields", "via": "mcp-command-mirror"},
+			{"name": "Fleet Snapshot", "command": "fleet-health summary", "cli_command": "fleet-health summary", "description": "At-a-glance fleet counts — online/offline/decommissioned, infected, out-of-date", "rationale": "Multi-dimension rollup over the synced agents table; the raw API needs one filtered count query per dimension per site.", "via": "mcp-command-mirror"},
+			{"name": "Endpoint Dossier", "command": "agents dossier", "cli_command": "agents dossier", "description": "Everything about one endpoint on one card: agent state, full threat history, recent activities", "rationale": "Fuses four entities (agent × threat history × activities × membership) from the local store", "via": "mcp-command-mirror"},
+			{"name": "Exclusion Hygiene", "command": "exclusions audit", "cli_command": "exclusions audit", "description": "Flags risky exclusions — never matched by any threat, wildcard paths", "rationale": "Joins exclusions against the local threat history to compute matched/never-matched", "via": "mcp-command-mirror"},
+			{"name": "Site Risk Ranking", "command": "sites risk", "cli_command": "sites risk", "description": "Ranks sites/clients against each other by composite risk — open-threat density, coverage gaps, stale agents", "rationale": "Composes per-site derived metrics across the whole local store into one cross-tenant ranking", "via": "mcp-command-mirror"},
+		}),
 		"playbook": []map[string]string{
 			{"topic": "Overnight Drift", "insight": "Diffs two historical store snapshots of agents, threats, and activities across every site; the API returns current state only, with no cross-entity 'delta since T' endpoint."},
 			{"topic": "Threat Recurrence Hunter", "insight": "Joins threats by sha1/threatName across the full history table, correlating mitigationStatus over time and grouping by agent; no Get_Threats call says '4th hit of this hash, twice mitigated'."},

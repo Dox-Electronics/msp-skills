@@ -1,7 +1,9 @@
 .PHONY: build test lint install clean
 
+BIN_EXT := $(if $(filter windows,$(shell go env GOOS)),.exe,)
+
 build:
-	go build -o bin/sentinelone-cli ./cmd/sentinelone-cli
+	go build -trimpath -o bin/sentinelone-cli$(BIN_EXT) ./cmd/sentinelone-cli
 
 test:
 	go test ./...
@@ -16,7 +18,7 @@ clean:
 	rm -rf bin/
 
 build-mcp:
-	go build -o bin/sentinelone-mcp ./cmd/sentinelone-mcp
+	go build -trimpath -o bin/sentinelone-mcp$(BIN_EXT) ./cmd/sentinelone-mcp
 
 install-mcp:
 	go install ./cmd/sentinelone-mcp

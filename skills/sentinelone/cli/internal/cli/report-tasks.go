@@ -11,8 +11,7 @@ func newReportTasksCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "report-tasks",
 		Short:       "Get, create, and update report tasks",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 

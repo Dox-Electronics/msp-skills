@@ -37,13 +37,12 @@ func newSingularityMarketplaceGetMarketplaceApplicationsCmd(flags *rootFlags) *c
 		Example:     "  sentinelone-cli singularity-marketplace get-marketplace-applications",
 		Annotations: map[string]string{"pp:endpoint": "singularity-marketplace.get-marketplace-applications", "pp:method": "GET", "pp:path": "/singularity-marketplace/applications", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/singularity-marketplace/applications"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/singularity-marketplace/applications"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "singularity-marketplace", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "singularity-marketplace", path, retainCLIQueryParams(cmd, map[string]string{
 				"skip":                   formatCLIParamValue(flagSkip),
 				"skipCount":              formatCLIParamValue(flagSkipCount),
 				"accountIds":             formatCLIParamValue(flagAccountIds),
@@ -61,10 +60,11 @@ func newSingularityMarketplaceGetMarketplaceApplicationsCmd(flags *rootFlags) *c
 				"countOnly":              formatCLIParamValue(flagCountOnly),
 				"name__contains":         formatCLIParamValue(flagNameContains),
 				"scopes":                 formatCLIParamValue(flagScopes),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"skip": {"skip"}, "skipCount": {"skip-count"}, "accountIds": {"account-ids"}, "siteIds": {"site-ids"}, "limit": {"limit"}, "groupIds": {"group-ids"}, "cursor": {"cursor"}, "creator__contains": {"creator-contains"}, "disablePagination": {"disable-pagination"}, "id": {"id"}, "application_catalog_id": {"application-catalog-id"}, "sortOrder": {"sort-order"}, "query": {"query"}, "sortBy": {"sort-by"}, "countOnly": {"count-only"}, "name__contains": {"name-contains"}, "scopes": {"scopes"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -72,7 +72,7 @@ func newSingularityMarketplaceGetMarketplaceApplicationsCmd(flags *rootFlags) *c
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -81,22 +81,31 @@ func newSingularityMarketplaceGetMarketplaceApplicationsCmd(flags *rootFlags) *c
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -106,7 +115,11 @@ func newSingularityMarketplaceGetMarketplaceApplicationsCmd(flags *rootFlags) *c
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagSkip, "skip", "", "Skip first number of items (0-1000). For iterating over more than a 1000 items please use 'cursor' instead.")

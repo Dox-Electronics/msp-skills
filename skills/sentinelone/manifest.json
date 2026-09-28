@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "sentinelone-mcp",
   "display_name": "SentinelOne",
-  "version": "0.1.5",
+  "version": "0.2.1",
   "description": "Every SentinelOne v2.1 management endpoint, plus an offline SQLite store and cross-entity analytics \u2014 fleet health, threat triage, blast radius, drift \u2014 that no console view offers.",
   "author": {
     "name": "Servosity Inc."
@@ -16,7 +16,10 @@
       "args": [],
       "env": {
         "SENTINELONE_API_TOKEN": "${user_config.sentinelone_api_token}",
-        "SENTINELONE_BASE_URL": "${user_config.sentinelone_base_url}"
+        "SENTINELONE_BASE_URL": "${user_config.sentinelone_base_url}",
+        "SENTINELONE_USER_AGENT": "${user_config.sentinelone_user_agent}",
+        "SENTINELONE_MCP_HTTP_TOKEN": "${user_config.sentinelone_mcp_http_token}",
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
       }
     }
   },
@@ -33,6 +36,25 @@
       "title": "SentinelOne console API base URL",
       "description": "Base URL of your SentinelOne management console API, including the version path, e.g. https://usea1-partners.sentinelone.net/web/api/v2.1. The shipped default points at an example host.",
       "required": true
+    },
+    "sentinelone_user_agent": {
+      "type": "string",
+      "title": "User-Agent header",
+      "description": "Overrides the User-Agent the CLI sends on SentinelOne requests. Leave blank to use the CLI's own built-in User-Agent.",
+      "required": false
+    },
+    "sentinelone_mcp_http_token": {
+      "type": "string",
+      "title": "MCP HTTP transport bearer token",
+      "description": "Required only when running the MCP server with --transport http (a remote/hosted deployment). Callers must send a matching Authorization: Bearer header. Not needed for the default local stdio transport that Claude Desktop uses.",
+      "required": false,
+      "sensitive": true
+    },
+    "printing_press_client_profile": {
+      "type": "string",
+      "title": "Client profile",
+      "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
+      "required": false
     }
   },
   "compatibility": {
@@ -43,10 +65,10 @@
       "win32"
     ]
   },
-  "printing_press_version": "4.24.0",
+  "printing_press_version": "4.32.5",
   "press_provenance": {
-    "printing_press_version": "4.24.0",
-    "generated_at": "2026-06-13T04:20:00.889095Z",
+    "printing_press_version": "4.32.5",
+    "generated_at": "2026-09-28T17:40:58.961846Z",
     "spec_checksum": "sha256:efb703ab3ff3087a4f789f948ebb2a9a20f36c530b8fd9679863b4ea58a9829e",
     "spec_format": "openapi3"
   }

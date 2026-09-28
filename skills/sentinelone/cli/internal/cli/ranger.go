@@ -11,8 +11,7 @@ func newRangerCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "ranger",
 		Short:       "Get, create, add, update, and delete ranger",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -36,6 +35,6 @@ func newRangerCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newRangerUpdateGatewaysCmd(flags))
 	cmd.AddCommand(newRangerUpdateSettingsCmd(flags))
 	cmd.AddCommand(newRangerJsonCmd(flags))
-	cmd.AddCommand(newNovelRangerExposureCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelRangerExposureCmd(flags))
 	return cmd
 }

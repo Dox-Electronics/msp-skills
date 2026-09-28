@@ -180,13 +180,12 @@ func newAgentsGetPassphraseCmd(flags *rootFlags) *cobra.Command {
 					return fmt.Errorf("--ranger-status must be valid JSON: %w", err)
 				}
 			}
+			path := "/agents/passphrases"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/agents/passphrases"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "agents", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "agents", path, retainCLIQueryParams(cmd, map[string]string{
 				"K8SNodeName__contains":          formatCLIParamValue(flagK8SNodeNameContains),
 				"coreCount__lt":                  formatCLIParamValue(flagCoreCountLt),
 				"rangerStatuses":                 formatCLIParamValue(flagRangerStatuses),
@@ -341,10 +340,11 @@ func newAgentsGetPassphraseCmd(flags *rootFlags) *cobra.Command {
 				"awsRole__contains":                  formatCLIParamValue(flagAwsRoleContains),
 				"countOnly":                          formatCLIParamValue(flagCountOnly),
 				"K8SVersion__contains":               formatCLIParamValue(flagK8SVersionContains),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"K8SNodeName__contains": {"k8-s-node-name-contains"}, "coreCount__lt": {"core-count-lt"}, "rangerStatuses": {"ranger-statuses"}, "adUserQuery__contains": {"ad-user-query-contains"}, "rangerVersionsNin": {"ranger-versions-nin"}, "rangerStatusesNin": {"ranger-statuses-nin"}, "coreCount__gte": {"core-count-gte"}, "threatCreatedAt__gte": {"threat-created-at-gte"}, "decommissionedAt__lte": {"decommissioned-at-lte"}, "operationalStatesNin": {"operational-states-nin"}, "appsVulnerabilityStatusesNin": {"apps-vulnerability-statuses-nin"}, "mitigationMode": {"mitigation-mode"}, "createdAt__gte": {"created-at-gte"}, "gatewayIp": {"gateway-ip"}, "cloudImage__contains": {"cloud-image-contains"}, "registeredAt__between": {"registered-at-between"}, "threatMitigationStatus": {"threat-mitigation-status"}, "installerTypesNin": {"installer-types-nin"}, "appsVulnerabilityStatuses": {"apps-vulnerability-statuses"}, "threatResolved": {"threat-resolved"}, "mitigationModeSuspicious": {"mitigation-mode-suspicious"}, "isUpToDate": {"is-up-to-date"}, "adComputerQuery__contains": {"ad-computer-query-contains"}, "updatedAt__gte": {"updated-at-gte"}, "azureResourceGroup__contains": {"azure-resource-group-contains"}, "scanStatus": {"scan-status"}, "threatContentHash": {"threat-content-hash"}, "osTypesNin": {"os-types-nin"}, "threatRebootRequired": {"threat-reboot-required"}, "totalMemory__between": {"total-memory-between"}, "firewallEnabled": {"firewall-enabled"}, "gcpServiceAccount__contains": {"gcp-service-account-contains"}, "updatedAt__gt": {"updated-at-gt"}, "remoteProfilingStates": {"remote-profiling-states"}, "filteredGroupIds": {"filtered-group-ids"}, "agentVersions": {"agent-versions"}, "activeThreats": {"active-threats"}, "machineTypesNin": {"machine-types-nin"}, "lastActiveDate__gt": {"last-active-date-gt"}, "awsSubnetIds__contains": {"aws-subnet-ids-contains"}, "installerTypes": {"installer-types"}, "registeredAt__gte": {"registered-at-gte"}, "migrationStatus": {"migration-status"}, "cloudTags__contains": {"cloud-tags-contains"}, "totalMemory__gte": {"total-memory-gte"}, "decommissionedAt__lt": {"decommissioned-at-lt"}, "threatCreatedAt__lt": {"threat-created-at-lt"}, "updatedAt__lte": {"updated-at-lte"}, "osArch": {"os-arch"}, "registeredAt__gt": {"registered-at-gt"}, "registeredAt__lt": {"registered-at-lt"}, "siteIds": {"site-ids"}, "networkInterfaceInet__contains": {"network-interface-inet-contains"}, "groupIds": {"group-ids"}, "limit": {"limit"}, "uuids": {"uuids"}, "accountIds": {"account-ids"}, "scanStatusesNin": {"scan-statuses-nin"}, "cpuCount__lte": {"cpu-count-lte"}, "locationIds": {"location-ids"}, "awsSecurityGroups__contains": {"aws-security-groups-contains"}, "networkStatusesNin": {"network-statuses-nin"}, "activeThreats__gt": {"active-threats-gt"}, "skipCount": {"skip-count"}, "infected": {"infected"}, "osVersion__contains": {"os-version-contains"}, "machineTypes": {"machine-types"}, "agentPodName__contains": {"agent-pod-name-contains"}, "computerName__like": {"computer-name-like"}, "threatCreatedAt__gt": {"threat-created-at-gt"}, "consoleMigrationStatusesNin": {"console-migration-statuses-nin"}, "computerName": {"computer-name"}, "decommissionedAt__between": {"decommissioned-at-between"}, "cloudInstanceId__contains": {"cloud-instance-id-contains"}, "skip": {"skip"}, "createdAt__lte": {"created-at-lte"}, "coreCount__between": {"core-count-between"}, "totalMemory__lte": {"total-memory-lte"}, "remoteProfilingStatesNin": {"remote-profiling-states-nin"}, "adComputerMember__contains": {"ad-computer-member-contains"}, "threatCreatedAt__between": {"threat-created-at-between"}, "totalMemory__gt": {"total-memory-gt"}, "ids": {"ids"}, "agentVersionsNin": {"agent-versions-nin"}, "updatedAt__between": {"updated-at-between"}, "locationEnabled": {"location-enabled"}, "locationIdsNin": {"location-ids-nin"}, "osTypes": {"os-types"}, "encryptedApplications": {"encrypted-applications"}, "filterId": {"filter-id"}, "decommissionedAt__gt": {"decommissioned-at-gt"}, "adUserMember__contains": {"ad-user-member-contains"}, "uuid": {"uuid"}, "coreCount__lte": {"core-count-lte"}, "coreCount__gt": {"core-count-gt"}, "cloudNetwork__contains": {"cloud-network-contains"}, "clusterName__contains": {"cluster-name-contains"}, "cpuCount__gte": {"cpu-count-gte"}, "query": {"query"}, "lastActiveDate__between": {"last-active-date-between"}, "cursor": {"cursor"}, "rangerStatus": {"ranger-status"}, "domains": {"domains"}, "cloudProvider": {"cloud-provider"}, "lastActiveDate__lt": {"last-active-date-lt"}, "scanStatuses": {"scan-statuses"}, "hasLocalConfiguration": {"has-local-configuration"}, "networkStatuses": {"network-statuses"}, "isPendingUninstall": {"is-pending-uninstall"}, "createdAt__gt": {"created-at-gt"}, "cpuCount__lt": {"cpu-count-lt"}, "consoleMigrationStatuses": {"console-migration-statuses"}, "adQuery": {"ad-query"}, "updatedAt__lt": {"updated-at-lt"}, "createdAt__lt": {"created-at-lt"}, "adComputerName__contains": {"ad-computer-name-contains"}, "cloudInstanceSize__contains": {"cloud-instance-size-contains"}, "registeredAt__lte": {"registered-at-lte"}, "networkQuarantineEnabled": {"network-quarantine-enabled"}, "cloudAccount__contains": {"cloud-account-contains"}, "cloudLocation__contains": {"cloud-location-contains"}, "rangerVersions": {"ranger-versions"}, "networkInterfaceGatewayMacAddress__contains": {"network-interface-gateway-mac-address-contains"}, "uuid__contains": {"uuid-contains"}, "agentNamespace__contains": {"agent-namespace-contains"}, "K8SNodeLabels__contains": {"k8-s-node-labels-contains"}, "adQuery__contains": {"ad-query-contains"}, "K8SType__contains": {"k8-s-type-contains"}, "countsFor": {"counts-for"}, "totalMemory__lt": {"total-memory-lt"}, "externalId__contains": {"external-id-contains"}, "filteredSiteIds": {"filtered-site-ids"}, "decommissionedAt__gte": {"decommissioned-at-gte"}, "cpuCount__gt": {"cpu-count-gt"}, "threatHidden": {"threat-hidden"}, "isUninstalled": {"is-uninstalled"}, "computerName__contains": {"computer-name-contains"}, "lastActiveDate__lte": {"last-active-date-lte"}, "adUserName__contains": {"ad-user-name-contains"}, "isActive": {"is-active"}, "userActionsNeeded": {"user-actions-needed"}, "threatCreatedAt__lte": {"threat-created-at-lte"}, "domainsNin": {"domains-nin"}, "operationalStates": {"operational-states"}, "externalIp__contains": {"external-ip-contains"}, "isDecommissioned": {"is-decommissioned"}, "networkInterfacePhysical__contains": {"network-interface-physical-contains"}, "lastActiveDate__gte": {"last-active-date-gte"}, "createdAt__between": {"created-at-between"}, "cpuCount__between": {"cpu-count-between"}, "lastLoggedInUserName__contains": {"last-logged-in-user-name-contains"}, "awsRole__contains": {"aws-role-contains"}, "countOnly": {"count-only"}, "K8SVersion__contains": {"k8-s-version-contains"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -352,7 +352,7 @@ func newAgentsGetPassphraseCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -361,22 +361,31 @@ func newAgentsGetPassphraseCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -386,7 +395,11 @@ func newAgentsGetPassphraseCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagK8SNodeNameContains, "k8-s-node-name-contains", "", "Free-text filter by K8S node name(supports multiple values)")

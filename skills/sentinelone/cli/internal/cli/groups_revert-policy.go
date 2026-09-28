@@ -11,7 +11,7 @@ func newGroupsRevertPolicyCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "revert-policy",
 		Short:       "Update revert policy for groups",
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 

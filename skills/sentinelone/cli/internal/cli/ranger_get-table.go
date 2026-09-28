@@ -78,13 +78,12 @@ func newRangerGetTableCmd(flags *rootFlags) *cobra.Command {
 		Example:     "  sentinelone-cli ranger get-table",
 		Annotations: map[string]string{"pp:endpoint": "ranger.get-table", "pp:method": "GET", "pp:path": "/ranger/table-view", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/ranger/table-view"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/ranger/table-view"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "ranger", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "ranger", path, retainCLIQueryParams(cmd, map[string]string{
 				"firstSeen__gte":              formatCLIParamValue(flagFirstSeenGte),
 				"lastSeen__gte":               formatCLIParamValue(flagLastSeenGte),
 				"networkName__contains":       formatCLIParamValue(flagNetworkNameContains),
@@ -143,10 +142,11 @@ func newRangerGetTableCmd(flags *rootFlags) *cobra.Command {
 				"countOnly":                   formatCLIParamValue(flagCountOnly),
 				"firstSeen__gt":               formatCLIParamValue(flagFirstSeenGt),
 				"networkName":                 formatCLIParamValue(flagNetworkName),
-			}, nil, flagAll, "cursor", "cursor", "limit", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"firstSeen__gte": {"first-seen-gte"}, "lastSeen__gte": {"last-seen-gte"}, "networkName__contains": {"network-name-contains"}, "skip": {"skip"}, "sortOrder": {"sort-order"}, "localIp": {"local-ip"}, "deviceTypes": {"device-types"}, "lastSeen__lt": {"last-seen-lt"}, "managedState": {"managed-state"}, "discoveryMethods": {"discovery-methods"}, "deviceFunction__contains": {"device-function-contains"}, "knownFingerprintingData": {"known-fingerprinting-data"}, "udpPorts__contains": {"udp-ports-contains"}, "macAddress__contains": {"mac-address-contains"}, "agentIds": {"agent-ids"}, "deviceReviews": {"device-reviews"}, "ids": {"ids"}, "hostnames__contains": {"hostnames-contains"}, "deviceType": {"device-type"}, "managedStates": {"managed-states"}, "lastSeen__gt": {"last-seen-gt"}, "osType": {"os-type"}, "osTypes": {"os-types"}, "subnetAddress__contains": {"subnet-address-contains"}, "manufacturer": {"manufacturer"}, "osName": {"os-name"}, "siteIds": {"site-ids"}, "sortBy": {"sort-by"}, "groupIds": {"group-ids"}, "firstSeen__lt": {"first-seen-lt"}, "limit": {"limit"}, "macAddress": {"mac-address"}, "hostnames": {"hostnames"}, "tcpPorts__contains": {"tcp-ports-contains"}, "query": {"query"}, "lastSeen__between": {"last-seen-between"}, "accountIds": {"account-ids"}, "cursor": {"cursor"}, "domains": {"domains"}, "period": {"period"}, "gatewayMacAddress": {"gateway-mac-address"}, "externalIp__contains": {"external-ip-contains"}, "osVersion": {"os-version"}, "externalIp": {"external-ip"}, "lastSeen__lte": {"last-seen-lte"}, "tenant": {"tenant"}, "localIp__contains": {"local-ip-contains"}, "skipCount": {"skip-count"}, "osVersion__contains": {"os-version-contains"}, "manufacturer__contains": {"manufacturer-contains"}, "gatewayMacAddress__contains": {"gateway-mac-address-contains"}, "tagName__contains": {"tag-name-contains"}, "siteNames": {"site-names"}, "firstSeen__lte": {"first-seen-lte"}, "firstSeen__between": {"first-seen-between"}, "countOnly": {"count-only"}, "firstSeen__gt": {"first-seen-gt"}, "networkName": {"network-name"}}, "cursor", "cursor"), nil, flagAll, "cursor", "cursor", "limit", 0, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -154,7 +154,7 @@ func newRangerGetTableCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -163,22 +163,31 @@ func newRangerGetTableCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -188,7 +197,11 @@ func newRangerGetTableCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&flagFirstSeenGte, "first-seen-gte", "", "Devices first seen after or at this timestamp. Example: '2018-02-27T04:49:26.257525Z'.")

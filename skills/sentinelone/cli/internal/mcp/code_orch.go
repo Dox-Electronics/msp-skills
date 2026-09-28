@@ -3,14 +3,15 @@
 
 // Package mcp — code-orchestration thin surface.
 //
-// Two tools cover the entire API: <api>_search to discover endpoints, and
-// <api>_execute to invoke one. This collapses a large API (50+ endpoints)
+// Three tools cover the entire API: <api>_search to discover endpoints,
+// <api>_get to inspect one GET endpoint, and <api>_execute to invoke one.
+// This collapses a large API (50+ endpoints)
 // to ~1K tokens of tool definitions while preserving full coverage — the
 // agent writes the composition logic in its own sandbox.
 //
 // Pattern source: Anthropic 2026-04-22 "Building agents that reach
 // production systems with MCP" — Cloudflare's MCP server covers ~2,500
-// endpoints in roughly 1K tokens via the same search+execute shape.
+// endpoints in roughly 1K tokens via the same search, get, and execute shape.
 
 package mcp
 
@@ -24,19 +25,35 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"sentinelone-pp-cli/internal/cli"
+	"sentinelone-pp-cli/internal/mcp/bound"
 )
 
-// RegisterCodeOrchestrationTools registers the two agent-facing tools that
-// cover the whole API surface. Called from RegisterTools in place of the
-// per-endpoint registrations when MCP.Orchestration is "code".
+// RegisterCodeOrchestrationTools registers the agent-facing tools that cover
+// the whole API surface. Called from RegisterTools in place of the per-endpoint
+// registrations when MCP.Orchestration is "code".
 func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("sentinelone_search",
 			mcplib.WithDescription("Search the sentinelone API for endpoints matching a natural-language query. Returns a ranked list of {endpoint_id, method, path, summary} entries. Call this first to find the endpoint to execute."),
 			mcplib.WithString("query", mcplib.Required(), mcplib.Description("Natural-language description of what you want to do.")),
-			mcplib.WithNumber("limit", mcplib.Description("Max endpoints to return (default 10).")),
+			mcplib.WithNumber("limit", mcplib.Description("Max endpoints to return (default 10, max 100).")),
+			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithDestructiveHintAnnotation(false),
+			mcplib.WithOpenWorldHintAnnotation(false),
 		),
 		handleCodeOrchSearch,
+	)
+
+	s.AddTool(
+		mcplib.NewTool("sentinelone_get",
+			mcplib.WithDescription("Get metadata for one GET endpoint by its endpoint_id (from sentinelone_search). This registry-only lookup never calls the API."),
+			mcplib.WithString("endpoint_id", mcplib.Required(), mcplib.Description("GET endpoint identifier returned by sentinelone_search (e.g., \"users.list\").")),
+			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithDestructiveHintAnnotation(false),
+			mcplib.WithOpenWorldHintAnnotation(false),
+		),
+		handleCodeOrchGet,
 	)
 
 	s.AddTool(
@@ -50,7 +67,7 @@ func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 }
 
 // codeOrchEndpoint captures the small slice of endpoint metadata the
-// search+execute pair needs at runtime. `keywords` is a precomputed
+// registry tools need at runtime. `keywords` is a precomputed
 // lowercase stream of description + path tokens used for naive ranking;
 // anything more sophisticated belongs on the agent side.
 type codeOrchEndpoint struct {
@@ -69,6 +86,9 @@ type codeOrchEndpoint struct {
 	// string instead of dumping them into the JSON body. Derived from the
 	// same mcpParamBindings location data the per-endpoint tools use.
 	QueryParams []codeOrchParamBinding
+	// Keep declared headers out of query/body routing so execution sends them
+	// through the request-header map.
+	HeaderParams []codeOrchParamBinding
 	// HeaderOverrides carries per-endpoint request headers (e.g. an
 	// Accept override for binary-only response endpoints). Without
 	// threading these through, the code-orchestration execute path
@@ -80,12 +100,14 @@ type codeOrchEndpoint struct {
 	// params object; a strict-mapping API rejects an object at the body
 	// root with HTTP 422 "Invalid json".
 	BodyIsArray bool
+	Mutating    bool
 	keywords    []string
 }
 
 type codeOrchParamBinding struct {
 	PublicName string
 	WireName   string
+	Default    string
 }
 
 // codeOrchEndpoints is the generator-populated registry covering every
@@ -100,6 +122,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "create", "Create a new Account. This command requires Global permissions and an MSSP deployment.", "/accounts"),
 	},
 	{
@@ -109,7 +133,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Accounts, and their data, that match the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "states", WireName: "states"}, {PublicName: "features", WireName: "features"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "activeLicenses", WireName: "activeLicenses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "totalLicenses", WireName: "totalLicenses"}, {PublicName: "updatedAt", WireName: "updatedAt"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "isDefault", WireName: "isDefault"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "expiration", WireName: "expiration"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "accountType", WireName: "accountType"}, {PublicName: "createdAt", WireName: "createdAt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "states", WireName: "states"}, {PublicName: "features", WireName: "features"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "activeLicenses", WireName: "activeLicenses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "totalLicenses", WireName: "totalLicenses"}, {PublicName: "updatedAt", WireName: "updatedAt"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "isDefault", WireName: "isDefault"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "expiration", WireName: "expiration"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "accountType", WireName: "accountType"}, {PublicName: "createdAt", WireName: "createdAt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get", "Get the Accounts, and their data, that match the filter.", "/accounts"),
 	},
 	{
@@ -120,6 +146,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-by-id", "Get Account data from a given Account ID. To get an Account ID, run 'accounts'.", "/accounts/{account_id}"),
 	},
 	{
@@ -130,6 +158,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "update", "Change the data of an Account. This command requires a Global user or an Account user and Admin role.", "/accounts/{account_id}"),
 	},
 	{
@@ -140,6 +170,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "expire-an-account", "Expire an Account immediately. The user must have Global access or Account acces with permissions for the Account.", "/accounts/{account_id}/expire-now"),
 	},
 	{
@@ -150,6 +182,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "account", "Get the policy for the Account given by ID. To get the ID of an Account, run 'accounts'. See also: Get Policy.", "/accounts/{account_id}/policy"),
 	},
 	{
@@ -160,6 +194,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "update-account", "Change the policy for the Account given by ID.", "/accounts/{account_id}/policy"),
 	},
 	{
@@ -170,6 +206,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "account", "Reactivate an expired Account. This command requires a Global user or Support. Consult with your SentinelOne SE.", "/accounts/{account_id}/reactivate"),
 	},
 	{
@@ -180,6 +218,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "revert_policy", "The policy of the Account is based on the default Global policy and is enforced by all endpoints in the Sites and", "/accounts/{account_id}/revert-policy"),
 	},
 	{
@@ -190,6 +230,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "generate-regenerate", "You can uninstall several Agents of one Account with one command that requires a password.", "/accounts/{account_id}/uninstall-password/generate"),
 	},
 	{
@@ -200,6 +242,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get", "Get the uninstall password to uninstall several Agents of one Account with one command.", "/accounts/{account_id}/uninstall-password/view"),
 	},
 	{
@@ -210,6 +254,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "get-metadata", "Get the uninstall password metadata, such as which user created and revoked it and when.", "/accounts/{account_id}/uninstall-password/metadata"),
 	},
 	{
@@ -220,6 +266,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"account_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("accounts", "revoke", "Delete the account-level uninstall password.", "/accounts/{account_id}/uninstall-password/revoke"),
 	},
 	{
@@ -229,7 +277,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the activities, and their data, that match the filters. We recommend that you set some values for the filters.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "includeHidden", WireName: "includeHidden"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "ruleIds", WireName: "ruleIds"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "userEmails", WireName: "userEmails"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "alertIds", WireName: "alertIds"}, {PublicName: "threatIds", WireName: "threatIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "includeHidden", WireName: "includeHidden"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "ruleIds", WireName: "ruleIds"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "userEmails", WireName: "userEmails"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "alertIds", WireName: "alertIds"}, {PublicName: "threatIds", WireName: "threatIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("activities", "get", "Get the activities, and their data, that match the filters. We recommend that you set some values for the filters.", "/activities"),
 	},
 	{
@@ -240,6 +290,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("activities", "get-activity-types", "Get a list of activity types. This is useful to see valid values to filter activities in other commands.", "/activities/types"),
 	},
 	{
@@ -250,6 +302,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "abort-scan", "Immediately stop a Full Disk Scan on all Agents that match the filter.", "/agents/actions/abort-scan"),
 	},
 	{
@@ -260,6 +314,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "approve-uninstall", "If a user tries to uninstall the SentinelOne Agent from an endpoint, an uninstall request is sent to the Management.", "/agents/actions/approve-uninstall"),
 	},
 	{
@@ -270,6 +326,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "broadcast-message", "You can send a message through the Agents that users can see. <BR>This is useful for endpoints that have human users.", "/agents/actions/broadcast"),
 	},
 	{
@@ -280,6 +338,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "can-run-remote-shell", "Who can run Remote Shell? Remote Shell is a powerful way to respond remotely to events on endpoints.", "/agents/actions/can-start-remote-shell"),
 	},
 	{
@@ -290,6 +350,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "clear-remote-shell", "Remote Shell is a powerful way to respond remotely to events on endpoints.", "/agents/actions/clear-remote-shell-session"),
 	},
 	{
@@ -300,6 +362,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "connect-to-network", "After you run 'disconnect from network' on endpoints, analyze the issue, and mitigate threats.", "/agents/actions/connect"),
 	},
 	{
@@ -310,6 +374,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "K8SNodeName__contains", WireName: "K8SNodeName__contains"}, {PublicName: "coreCount__lt", WireName: "coreCount__lt"}, {PublicName: "rangerStatuses", WireName: "rangerStatuses"}, {PublicName: "adUserQuery__contains", WireName: "adUserQuery__contains"}, {PublicName: "rangerVersionsNin", WireName: "rangerVersionsNin"}, {PublicName: "rangerStatusesNin", WireName: "rangerStatusesNin"}, {PublicName: "coreCount__gte", WireName: "coreCount__gte"}, {PublicName: "threatCreatedAt__gte", WireName: "threatCreatedAt__gte"}, {PublicName: "decommissionedAt__lte", WireName: "decommissionedAt__lte"}, {PublicName: "operationalStatesNin", WireName: "operationalStatesNin"}, {PublicName: "appsVulnerabilityStatusesNin", WireName: "appsVulnerabilityStatusesNin"}, {PublicName: "mitigationMode", WireName: "mitigationMode"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "gatewayIp", WireName: "gatewayIp"}, {PublicName: "cloudImage__contains", WireName: "cloudImage__contains"}, {PublicName: "registeredAt__between", WireName: "registeredAt__between"}, {PublicName: "threatMitigationStatus", WireName: "threatMitigationStatus"}, {PublicName: "installerTypesNin", WireName: "installerTypesNin"}, {PublicName: "appsVulnerabilityStatuses", WireName: "appsVulnerabilityStatuses"}, {PublicName: "threatResolved", WireName: "threatResolved"}, {PublicName: "mitigationModeSuspicious", WireName: "mitigationModeSuspicious"}, {PublicName: "isUpToDate", WireName: "isUpToDate"}, {PublicName: "adComputerQuery__contains", WireName: "adComputerQuery__contains"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "azureResourceGroup__contains", WireName: "azureResourceGroup__contains"}, {PublicName: "scanStatus", WireName: "scanStatus"}, {PublicName: "threatContentHash", WireName: "threatContentHash"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "threatRebootRequired", WireName: "threatRebootRequired"}, {PublicName: "totalMemory__between", WireName: "totalMemory__between"}, {PublicName: "firewallEnabled", WireName: "firewallEnabled"}, {PublicName: "gcpServiceAccount__contains", WireName: "gcpServiceAccount__contains"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "remoteProfilingStates", WireName: "remoteProfilingStates"}, {PublicName: "filteredGroupIds", WireName: "filteredGroupIds"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "activeThreats", WireName: "activeThreats"}, {PublicName: "machineTypesNin", WireName: "machineTypesNin"}, {PublicName: "lastActiveDate__gt", WireName: "lastActiveDate__gt"}, {PublicName: "awsSubnetIds__contains", WireName: "awsSubnetIds__contains"}, {PublicName: "installerTypes", WireName: "installerTypes"}, {PublicName: "registeredAt__gte", WireName: "registeredAt__gte"}, {PublicName: "migrationStatus", WireName: "migrationStatus"}, {PublicName: "cloudTags__contains", WireName: "cloudTags__contains"}, {PublicName: "totalMemory__gte", WireName: "totalMemory__gte"}, {PublicName: "decommissionedAt__lt", WireName: "decommissionedAt__lt"}, {PublicName: "threatCreatedAt__lt", WireName: "threatCreatedAt__lt"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "osArch", WireName: "osArch"}, {PublicName: "registeredAt__gt", WireName: "registeredAt__gt"}, {PublicName: "registeredAt__lt", WireName: "registeredAt__lt"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "networkInterfaceInet__contains", WireName: "networkInterfaceInet__contains"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "uuids", WireName: "uuids"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "scanStatusesNin", WireName: "scanStatusesNin"}, {PublicName: "cpuCount__lte", WireName: "cpuCount__lte"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "awsSecurityGroups__contains", WireName: "awsSecurityGroups__contains"}, {PublicName: "networkStatusesNin", WireName: "networkStatusesNin"}, {PublicName: "activeThreats__gt", WireName: "activeThreats__gt"}, {PublicName: "infected", WireName: "infected"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "machineTypes", WireName: "machineTypes"}, {PublicName: "agentPodName__contains", WireName: "agentPodName__contains"}, {PublicName: "computerName__like", WireName: "computerName__like"}, {PublicName: "threatCreatedAt__gt", WireName: "threatCreatedAt__gt"}, {PublicName: "consoleMigrationStatusesNin", WireName: "consoleMigrationStatusesNin"}, {PublicName: "computerName", WireName: "computerName"}, {PublicName: "decommissionedAt__between", WireName: "decommissionedAt__between"}, {PublicName: "cloudInstanceId__contains", WireName: "cloudInstanceId__contains"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "coreCount__between", WireName: "coreCount__between"}, {PublicName: "totalMemory__lte", WireName: "totalMemory__lte"}, {PublicName: "remoteProfilingStatesNin", WireName: "remoteProfilingStatesNin"}, {PublicName: "adComputerMember__contains", WireName: "adComputerMember__contains"}, {PublicName: "threatCreatedAt__between", WireName: "threatCreatedAt__between"}, {PublicName: "totalMemory__gt", WireName: "totalMemory__gt"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "locationEnabled", WireName: "locationEnabled"}, {PublicName: "locationIdsNin", WireName: "locationIdsNin"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "encryptedApplications", WireName: "encryptedApplications"}, {PublicName: "filterId", WireName: "filterId"}, {PublicName: "decommissionedAt__gt", WireName: "decommissionedAt__gt"}, {PublicName: "adUserMember__contains", WireName: "adUserMember__contains"}, {PublicName: "uuid", WireName: "uuid"}, {PublicName: "coreCount__lte", WireName: "coreCount__lte"}, {PublicName: "coreCount__gt", WireName: "coreCount__gt"}, {PublicName: "cloudNetwork__contains", WireName: "cloudNetwork__contains"}, {PublicName: "clusterName__contains", WireName: "clusterName__contains"}, {PublicName: "cpuCount__gte", WireName: "cpuCount__gte"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastActiveDate__between", WireName: "lastActiveDate__between"}, {PublicName: "rangerStatus", WireName: "rangerStatus"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "cloudProvider", WireName: "cloudProvider"}, {PublicName: "lastActiveDate__lt", WireName: "lastActiveDate__lt"}, {PublicName: "scanStatuses", WireName: "scanStatuses"}, {PublicName: "hasLocalConfiguration", WireName: "hasLocalConfiguration"}, {PublicName: "networkStatuses", WireName: "networkStatuses"}, {PublicName: "isPendingUninstall", WireName: "isPendingUninstall"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "cpuCount__lt", WireName: "cpuCount__lt"}, {PublicName: "consoleMigrationStatuses", WireName: "consoleMigrationStatuses"}, {PublicName: "adQuery", WireName: "adQuery"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "adComputerName__contains", WireName: "adComputerName__contains"}, {PublicName: "cloudInstanceSize__contains", WireName: "cloudInstanceSize__contains"}, {PublicName: "registeredAt__lte", WireName: "registeredAt__lte"}, {PublicName: "networkQuarantineEnabled", WireName: "networkQuarantineEnabled"}, {PublicName: "cloudAccount__contains", WireName: "cloudAccount__contains"}, {PublicName: "cloudLocation__contains", WireName: "cloudLocation__contains"}, {PublicName: "rangerVersions", WireName: "rangerVersions"}, {PublicName: "networkInterfaceGatewayMacAddress__contains", WireName: "networkInterfaceGatewayMacAddress__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "agentNamespace__contains", WireName: "agentNamespace__contains"}, {PublicName: "K8SNodeLabels__contains", WireName: "K8SNodeLabels__contains"}, {PublicName: "adQuery__contains", WireName: "adQuery__contains"}, {PublicName: "K8SType__contains", WireName: "K8SType__contains"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "totalMemory__lt", WireName: "totalMemory__lt"}, {PublicName: "externalId__contains", WireName: "externalId__contains"}, {PublicName: "filteredSiteIds", WireName: "filteredSiteIds"}, {PublicName: "decommissionedAt__gte", WireName: "decommissionedAt__gte"}, {PublicName: "cpuCount__gt", WireName: "cpuCount__gt"}, {PublicName: "threatHidden", WireName: "threatHidden"}, {PublicName: "isUninstalled", WireName: "isUninstalled"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "lastActiveDate__lte", WireName: "lastActiveDate__lte"}, {PublicName: "adUserName__contains", WireName: "adUserName__contains"}, {PublicName: "isActive", WireName: "isActive"}, {PublicName: "userActionsNeeded", WireName: "userActionsNeeded"}, {PublicName: "threatCreatedAt__lte", WireName: "threatCreatedAt__lte"}, {PublicName: "domainsNin", WireName: "domainsNin"}, {PublicName: "operationalStates", WireName: "operationalStates"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "isDecommissioned", WireName: "isDecommissioned"}, {PublicName: "networkInterfacePhysical__contains", WireName: "networkInterfacePhysical__contains"}, {PublicName: "lastActiveDate__gte", WireName: "lastActiveDate__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "cpuCount__between", WireName: "cpuCount__between"}, {PublicName: "lastLoggedInUserName__contains", WireName: "lastLoggedInUserName__contains"}, {PublicName: "awsRole__contains", WireName: "awsRole__contains"}, {PublicName: "K8SVersion__contains", WireName: "K8SVersion__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "count", "Get the count of Agents that match a filter. This command is useful to run before you run other commands.", "/agents/count"),
 	},
 	{
@@ -320,6 +386,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "decommission", "If a user is scheduled for time off, or a device is scheduled for maintenance, you can decommission the Agent.", "/agents/actions/decommission"),
 	},
 	{
@@ -330,6 +398,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "disable", "Use this command to disable Agents that match the filter.", "/agents/actions/disable-agent"),
 	},
 	{
@@ -340,6 +410,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "disable-ranger", "Disable Ranger from the Agents that match the filter.", "/agents/actions/ranger-disable"),
 	},
 	{
@@ -350,6 +422,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "disconnect-from-network", "Use this command to isolate (quarantine) endpoints from the network, if the endpoints match the filter.", "/agents/actions/disconnect"),
 	},
 	{
@@ -360,6 +434,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "enable", "Use this command to enable disabled Agents that match the filter.", "/agents/actions/enable-agent"),
 	},
 	{
@@ -370,6 +446,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "enable-ranger", "SentinelOne Ranger gives full visibility of all devices connected to your network.", "/agents/actions/ranger-enable"),
 	},
 	{
@@ -380,6 +458,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "fetch-firewall-logs", "Get Firewall Control events in the local log file, written in clear text", "/agents/actions/firewall-logging"),
 	},
 	{
@@ -390,6 +470,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "fetch-firewall-rules", "Firewall Control is disabled at the Global level.", "/agents/actions/fetch-firewall-rules"),
 	},
 	{
@@ -400,6 +482,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "fetch-logs", "Get the Agent and Endpoint logs from Agents that match the filter.", "/agents/actions/fetch-logs"),
 	},
 	{
@@ -409,7 +493,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Agents, and their data, that match the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "K8SNodeName__contains", WireName: "K8SNodeName__contains"}, {PublicName: "coreCount__lt", WireName: "coreCount__lt"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "rangerStatuses", WireName: "rangerStatuses"}, {PublicName: "adUserQuery__contains", WireName: "adUserQuery__contains"}, {PublicName: "rangerVersionsNin", WireName: "rangerVersionsNin"}, {PublicName: "rangerStatusesNin", WireName: "rangerStatusesNin"}, {PublicName: "coreCount__gte", WireName: "coreCount__gte"}, {PublicName: "threatCreatedAt__gte", WireName: "threatCreatedAt__gte"}, {PublicName: "decommissionedAt__lte", WireName: "decommissionedAt__lte"}, {PublicName: "operationalStatesNin", WireName: "operationalStatesNin"}, {PublicName: "appsVulnerabilityStatusesNin", WireName: "appsVulnerabilityStatusesNin"}, {PublicName: "mitigationMode", WireName: "mitigationMode"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "gatewayIp", WireName: "gatewayIp"}, {PublicName: "cloudImage__contains", WireName: "cloudImage__contains"}, {PublicName: "registeredAt__between", WireName: "registeredAt__between"}, {PublicName: "threatMitigationStatus", WireName: "threatMitigationStatus"}, {PublicName: "installerTypesNin", WireName: "installerTypesNin"}, {PublicName: "appsVulnerabilityStatuses", WireName: "appsVulnerabilityStatuses"}, {PublicName: "threatResolved", WireName: "threatResolved"}, {PublicName: "mitigationModeSuspicious", WireName: "mitigationModeSuspicious"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "isUpToDate", WireName: "isUpToDate"}, {PublicName: "adComputerQuery__contains", WireName: "adComputerQuery__contains"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "azureResourceGroup__contains", WireName: "azureResourceGroup__contains"}, {PublicName: "scanStatus", WireName: "scanStatus"}, {PublicName: "threatContentHash", WireName: "threatContentHash"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "threatRebootRequired", WireName: "threatRebootRequired"}, {PublicName: "totalMemory__between", WireName: "totalMemory__between"}, {PublicName: "firewallEnabled", WireName: "firewallEnabled"}, {PublicName: "gcpServiceAccount__contains", WireName: "gcpServiceAccount__contains"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "remoteProfilingStates", WireName: "remoteProfilingStates"}, {PublicName: "filteredGroupIds", WireName: "filteredGroupIds"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "activeThreats", WireName: "activeThreats"}, {PublicName: "machineTypesNin", WireName: "machineTypesNin"}, {PublicName: "lastActiveDate__gt", WireName: "lastActiveDate__gt"}, {PublicName: "awsSubnetIds__contains", WireName: "awsSubnetIds__contains"}, {PublicName: "installerTypes", WireName: "installerTypes"}, {PublicName: "registeredAt__gte", WireName: "registeredAt__gte"}, {PublicName: "migrationStatus", WireName: "migrationStatus"}, {PublicName: "cloudTags__contains", WireName: "cloudTags__contains"}, {PublicName: "totalMemory__gte", WireName: "totalMemory__gte"}, {PublicName: "decommissionedAt__lt", WireName: "decommissionedAt__lt"}, {PublicName: "threatCreatedAt__lt", WireName: "threatCreatedAt__lt"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "osArch", WireName: "osArch"}, {PublicName: "registeredAt__gt", WireName: "registeredAt__gt"}, {PublicName: "registeredAt__lt", WireName: "registeredAt__lt"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "networkInterfaceInet__contains", WireName: "networkInterfaceInet__contains"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "uuids", WireName: "uuids"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "scanStatusesNin", WireName: "scanStatusesNin"}, {PublicName: "cpuCount__lte", WireName: "cpuCount__lte"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "awsSecurityGroups__contains", WireName: "awsSecurityGroups__contains"}, {PublicName: "networkStatusesNin", WireName: "networkStatusesNin"}, {PublicName: "activeThreats__gt", WireName: "activeThreats__gt"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "infected", WireName: "infected"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "machineTypes", WireName: "machineTypes"}, {PublicName: "agentPodName__contains", WireName: "agentPodName__contains"}, {PublicName: "computerName__like", WireName: "computerName__like"}, {PublicName: "threatCreatedAt__gt", WireName: "threatCreatedAt__gt"}, {PublicName: "consoleMigrationStatusesNin", WireName: "consoleMigrationStatusesNin"}, {PublicName: "computerName", WireName: "computerName"}, {PublicName: "decommissionedAt__between", WireName: "decommissionedAt__between"}, {PublicName: "cloudInstanceId__contains", WireName: "cloudInstanceId__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "coreCount__between", WireName: "coreCount__between"}, {PublicName: "totalMemory__lte", WireName: "totalMemory__lte"}, {PublicName: "remoteProfilingStatesNin", WireName: "remoteProfilingStatesNin"}, {PublicName: "adComputerMember__contains", WireName: "adComputerMember__contains"}, {PublicName: "threatCreatedAt__between", WireName: "threatCreatedAt__between"}, {PublicName: "totalMemory__gt", WireName: "totalMemory__gt"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "locationEnabled", WireName: "locationEnabled"}, {PublicName: "locationIdsNin", WireName: "locationIdsNin"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "encryptedApplications", WireName: "encryptedApplications"}, {PublicName: "filterId", WireName: "filterId"}, {PublicName: "decommissionedAt__gt", WireName: "decommissionedAt__gt"}, {PublicName: "adUserMember__contains", WireName: "adUserMember__contains"}, {PublicName: "uuid", WireName: "uuid"}, {PublicName: "coreCount__lte", WireName: "coreCount__lte"}, {PublicName: "coreCount__gt", WireName: "coreCount__gt"}, {PublicName: "cloudNetwork__contains", WireName: "cloudNetwork__contains"}, {PublicName: "clusterName__contains", WireName: "clusterName__contains"}, {PublicName: "cpuCount__gte", WireName: "cpuCount__gte"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastActiveDate__between", WireName: "lastActiveDate__between"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "rangerStatus", WireName: "rangerStatus"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "cloudProvider", WireName: "cloudProvider"}, {PublicName: "lastActiveDate__lt", WireName: "lastActiveDate__lt"}, {PublicName: "scanStatuses", WireName: "scanStatuses"}, {PublicName: "hasLocalConfiguration", WireName: "hasLocalConfiguration"}, {PublicName: "networkStatuses", WireName: "networkStatuses"}, {PublicName: "isPendingUninstall", WireName: "isPendingUninstall"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "cpuCount__lt", WireName: "cpuCount__lt"}, {PublicName: "consoleMigrationStatuses", WireName: "consoleMigrationStatuses"}, {PublicName: "adQuery", WireName: "adQuery"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "adComputerName__contains", WireName: "adComputerName__contains"}, {PublicName: "cloudInstanceSize__contains", WireName: "cloudInstanceSize__contains"}, {PublicName: "registeredAt__lte", WireName: "registeredAt__lte"}, {PublicName: "networkQuarantineEnabled", WireName: "networkQuarantineEnabled"}, {PublicName: "cloudAccount__contains", WireName: "cloudAccount__contains"}, {PublicName: "cloudLocation__contains", WireName: "cloudLocation__contains"}, {PublicName: "rangerVersions", WireName: "rangerVersions"}, {PublicName: "networkInterfaceGatewayMacAddress__contains", WireName: "networkInterfaceGatewayMacAddress__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "agentNamespace__contains", WireName: "agentNamespace__contains"}, {PublicName: "K8SNodeLabels__contains", WireName: "K8SNodeLabels__contains"}, {PublicName: "adQuery__contains", WireName: "adQuery__contains"}, {PublicName: "K8SType__contains", WireName: "K8SType__contains"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "totalMemory__lt", WireName: "totalMemory__lt"}, {PublicName: "externalId__contains", WireName: "externalId__contains"}, {PublicName: "filteredSiteIds", WireName: "filteredSiteIds"}, {PublicName: "decommissionedAt__gte", WireName: "decommissionedAt__gte"}, {PublicName: "cpuCount__gt", WireName: "cpuCount__gt"}, {PublicName: "threatHidden", WireName: "threatHidden"}, {PublicName: "isUninstalled", WireName: "isUninstalled"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "lastActiveDate__lte", WireName: "lastActiveDate__lte"}, {PublicName: "adUserName__contains", WireName: "adUserName__contains"}, {PublicName: "isActive", WireName: "isActive"}, {PublicName: "userActionsNeeded", WireName: "userActionsNeeded"}, {PublicName: "threatCreatedAt__lte", WireName: "threatCreatedAt__lte"}, {PublicName: "domainsNin", WireName: "domainsNin"}, {PublicName: "operationalStates", WireName: "operationalStates"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "isDecommissioned", WireName: "isDecommissioned"}, {PublicName: "networkInterfacePhysical__contains", WireName: "networkInterfacePhysical__contains"}, {PublicName: "lastActiveDate__gte", WireName: "lastActiveDate__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "cpuCount__between", WireName: "cpuCount__between"}, {PublicName: "lastLoggedInUserName__contains", WireName: "lastLoggedInUserName__contains"}, {PublicName: "awsRole__contains", WireName: "awsRole__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "K8SVersion__contains", WireName: "K8SVersion__contains"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "K8SNodeName__contains", WireName: "K8SNodeName__contains"}, {PublicName: "coreCount__lt", WireName: "coreCount__lt"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "rangerStatuses", WireName: "rangerStatuses"}, {PublicName: "adUserQuery__contains", WireName: "adUserQuery__contains"}, {PublicName: "rangerVersionsNin", WireName: "rangerVersionsNin"}, {PublicName: "rangerStatusesNin", WireName: "rangerStatusesNin"}, {PublicName: "coreCount__gte", WireName: "coreCount__gte"}, {PublicName: "threatCreatedAt__gte", WireName: "threatCreatedAt__gte"}, {PublicName: "decommissionedAt__lte", WireName: "decommissionedAt__lte"}, {PublicName: "operationalStatesNin", WireName: "operationalStatesNin"}, {PublicName: "appsVulnerabilityStatusesNin", WireName: "appsVulnerabilityStatusesNin"}, {PublicName: "mitigationMode", WireName: "mitigationMode"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "gatewayIp", WireName: "gatewayIp"}, {PublicName: "cloudImage__contains", WireName: "cloudImage__contains"}, {PublicName: "registeredAt__between", WireName: "registeredAt__between"}, {PublicName: "threatMitigationStatus", WireName: "threatMitigationStatus"}, {PublicName: "installerTypesNin", WireName: "installerTypesNin"}, {PublicName: "appsVulnerabilityStatuses", WireName: "appsVulnerabilityStatuses"}, {PublicName: "threatResolved", WireName: "threatResolved"}, {PublicName: "mitigationModeSuspicious", WireName: "mitigationModeSuspicious"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "isUpToDate", WireName: "isUpToDate"}, {PublicName: "adComputerQuery__contains", WireName: "adComputerQuery__contains"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "azureResourceGroup__contains", WireName: "azureResourceGroup__contains"}, {PublicName: "scanStatus", WireName: "scanStatus"}, {PublicName: "threatContentHash", WireName: "threatContentHash"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "threatRebootRequired", WireName: "threatRebootRequired"}, {PublicName: "totalMemory__between", WireName: "totalMemory__between"}, {PublicName: "firewallEnabled", WireName: "firewallEnabled"}, {PublicName: "gcpServiceAccount__contains", WireName: "gcpServiceAccount__contains"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "remoteProfilingStates", WireName: "remoteProfilingStates"}, {PublicName: "filteredGroupIds", WireName: "filteredGroupIds"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "activeThreats", WireName: "activeThreats"}, {PublicName: "machineTypesNin", WireName: "machineTypesNin"}, {PublicName: "lastActiveDate__gt", WireName: "lastActiveDate__gt"}, {PublicName: "awsSubnetIds__contains", WireName: "awsSubnetIds__contains"}, {PublicName: "installerTypes", WireName: "installerTypes"}, {PublicName: "registeredAt__gte", WireName: "registeredAt__gte"}, {PublicName: "migrationStatus", WireName: "migrationStatus"}, {PublicName: "cloudTags__contains", WireName: "cloudTags__contains"}, {PublicName: "totalMemory__gte", WireName: "totalMemory__gte"}, {PublicName: "decommissionedAt__lt", WireName: "decommissionedAt__lt"}, {PublicName: "threatCreatedAt__lt", WireName: "threatCreatedAt__lt"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "osArch", WireName: "osArch"}, {PublicName: "registeredAt__gt", WireName: "registeredAt__gt"}, {PublicName: "registeredAt__lt", WireName: "registeredAt__lt"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "networkInterfaceInet__contains", WireName: "networkInterfaceInet__contains"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "uuids", WireName: "uuids"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "scanStatusesNin", WireName: "scanStatusesNin"}, {PublicName: "cpuCount__lte", WireName: "cpuCount__lte"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "awsSecurityGroups__contains", WireName: "awsSecurityGroups__contains"}, {PublicName: "networkStatusesNin", WireName: "networkStatusesNin"}, {PublicName: "activeThreats__gt", WireName: "activeThreats__gt"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "infected", WireName: "infected"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "machineTypes", WireName: "machineTypes"}, {PublicName: "agentPodName__contains", WireName: "agentPodName__contains"}, {PublicName: "computerName__like", WireName: "computerName__like"}, {PublicName: "threatCreatedAt__gt", WireName: "threatCreatedAt__gt"}, {PublicName: "consoleMigrationStatusesNin", WireName: "consoleMigrationStatusesNin"}, {PublicName: "computerName", WireName: "computerName"}, {PublicName: "decommissionedAt__between", WireName: "decommissionedAt__between"}, {PublicName: "cloudInstanceId__contains", WireName: "cloudInstanceId__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "coreCount__between", WireName: "coreCount__between"}, {PublicName: "totalMemory__lte", WireName: "totalMemory__lte"}, {PublicName: "remoteProfilingStatesNin", WireName: "remoteProfilingStatesNin"}, {PublicName: "adComputerMember__contains", WireName: "adComputerMember__contains"}, {PublicName: "threatCreatedAt__between", WireName: "threatCreatedAt__between"}, {PublicName: "totalMemory__gt", WireName: "totalMemory__gt"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "locationEnabled", WireName: "locationEnabled"}, {PublicName: "locationIdsNin", WireName: "locationIdsNin"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "encryptedApplications", WireName: "encryptedApplications"}, {PublicName: "filterId", WireName: "filterId"}, {PublicName: "decommissionedAt__gt", WireName: "decommissionedAt__gt"}, {PublicName: "adUserMember__contains", WireName: "adUserMember__contains"}, {PublicName: "uuid", WireName: "uuid"}, {PublicName: "coreCount__lte", WireName: "coreCount__lte"}, {PublicName: "coreCount__gt", WireName: "coreCount__gt"}, {PublicName: "cloudNetwork__contains", WireName: "cloudNetwork__contains"}, {PublicName: "clusterName__contains", WireName: "clusterName__contains"}, {PublicName: "cpuCount__gte", WireName: "cpuCount__gte"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastActiveDate__between", WireName: "lastActiveDate__between"}, {PublicName: "rangerStatus", WireName: "rangerStatus"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "cloudProvider", WireName: "cloudProvider"}, {PublicName: "lastActiveDate__lt", WireName: "lastActiveDate__lt"}, {PublicName: "scanStatuses", WireName: "scanStatuses"}, {PublicName: "hasLocalConfiguration", WireName: "hasLocalConfiguration"}, {PublicName: "networkStatuses", WireName: "networkStatuses"}, {PublicName: "isPendingUninstall", WireName: "isPendingUninstall"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "cpuCount__lt", WireName: "cpuCount__lt"}, {PublicName: "consoleMigrationStatuses", WireName: "consoleMigrationStatuses"}, {PublicName: "adQuery", WireName: "adQuery"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "adComputerName__contains", WireName: "adComputerName__contains"}, {PublicName: "cloudInstanceSize__contains", WireName: "cloudInstanceSize__contains"}, {PublicName: "registeredAt__lte", WireName: "registeredAt__lte"}, {PublicName: "networkQuarantineEnabled", WireName: "networkQuarantineEnabled"}, {PublicName: "cloudAccount__contains", WireName: "cloudAccount__contains"}, {PublicName: "cloudLocation__contains", WireName: "cloudLocation__contains"}, {PublicName: "rangerVersions", WireName: "rangerVersions"}, {PublicName: "networkInterfaceGatewayMacAddress__contains", WireName: "networkInterfaceGatewayMacAddress__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "agentNamespace__contains", WireName: "agentNamespace__contains"}, {PublicName: "K8SNodeLabels__contains", WireName: "K8SNodeLabels__contains"}, {PublicName: "adQuery__contains", WireName: "adQuery__contains"}, {PublicName: "K8SType__contains", WireName: "K8SType__contains"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "totalMemory__lt", WireName: "totalMemory__lt"}, {PublicName: "externalId__contains", WireName: "externalId__contains"}, {PublicName: "filteredSiteIds", WireName: "filteredSiteIds"}, {PublicName: "decommissionedAt__gte", WireName: "decommissionedAt__gte"}, {PublicName: "cpuCount__gt", WireName: "cpuCount__gt"}, {PublicName: "threatHidden", WireName: "threatHidden"}, {PublicName: "isUninstalled", WireName: "isUninstalled"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "lastActiveDate__lte", WireName: "lastActiveDate__lte"}, {PublicName: "adUserName__contains", WireName: "adUserName__contains"}, {PublicName: "isActive", WireName: "isActive"}, {PublicName: "userActionsNeeded", WireName: "userActionsNeeded"}, {PublicName: "threatCreatedAt__lte", WireName: "threatCreatedAt__lte"}, {PublicName: "domainsNin", WireName: "domainsNin"}, {PublicName: "operationalStates", WireName: "operationalStates"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "isDecommissioned", WireName: "isDecommissioned"}, {PublicName: "networkInterfacePhysical__contains", WireName: "networkInterfacePhysical__contains"}, {PublicName: "lastActiveDate__gte", WireName: "lastActiveDate__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "cpuCount__between", WireName: "cpuCount__between"}, {PublicName: "lastLoggedInUserName__contains", WireName: "lastLoggedInUserName__contains"}, {PublicName: "awsRole__contains", WireName: "awsRole__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "K8SVersion__contains", WireName: "K8SVersion__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "get", "Get the Agents, and their data, that match the filter.", "/agents"),
 	},
 	{
@@ -420,6 +506,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "ids", WireName: "ids"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "get-application", "Get the installed applications for a specific Agent. <BR>To get the Agent ID, run 'agents'.", "/agents/applications"),
 	},
 	{
@@ -430,6 +518,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "get-installed-apps-for", "Application Risk Management is an EA feature.", "/agents/actions/fetch-installed-apps"),
 	},
 	{
@@ -439,7 +529,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Show the passphrase for the Agents that match the filter. This is an important command.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "K8SNodeName__contains", WireName: "K8SNodeName__contains"}, {PublicName: "coreCount__lt", WireName: "coreCount__lt"}, {PublicName: "rangerStatuses", WireName: "rangerStatuses"}, {PublicName: "adUserQuery__contains", WireName: "adUserQuery__contains"}, {PublicName: "rangerVersionsNin", WireName: "rangerVersionsNin"}, {PublicName: "rangerStatusesNin", WireName: "rangerStatusesNin"}, {PublicName: "coreCount__gte", WireName: "coreCount__gte"}, {PublicName: "threatCreatedAt__gte", WireName: "threatCreatedAt__gte"}, {PublicName: "decommissionedAt__lte", WireName: "decommissionedAt__lte"}, {PublicName: "operationalStatesNin", WireName: "operationalStatesNin"}, {PublicName: "appsVulnerabilityStatusesNin", WireName: "appsVulnerabilityStatusesNin"}, {PublicName: "mitigationMode", WireName: "mitigationMode"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "gatewayIp", WireName: "gatewayIp"}, {PublicName: "cloudImage__contains", WireName: "cloudImage__contains"}, {PublicName: "registeredAt__between", WireName: "registeredAt__between"}, {PublicName: "threatMitigationStatus", WireName: "threatMitigationStatus"}, {PublicName: "installerTypesNin", WireName: "installerTypesNin"}, {PublicName: "appsVulnerabilityStatuses", WireName: "appsVulnerabilityStatuses"}, {PublicName: "threatResolved", WireName: "threatResolved"}, {PublicName: "mitigationModeSuspicious", WireName: "mitigationModeSuspicious"}, {PublicName: "isUpToDate", WireName: "isUpToDate"}, {PublicName: "adComputerQuery__contains", WireName: "adComputerQuery__contains"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "azureResourceGroup__contains", WireName: "azureResourceGroup__contains"}, {PublicName: "scanStatus", WireName: "scanStatus"}, {PublicName: "threatContentHash", WireName: "threatContentHash"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "threatRebootRequired", WireName: "threatRebootRequired"}, {PublicName: "totalMemory__between", WireName: "totalMemory__between"}, {PublicName: "firewallEnabled", WireName: "firewallEnabled"}, {PublicName: "gcpServiceAccount__contains", WireName: "gcpServiceAccount__contains"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "remoteProfilingStates", WireName: "remoteProfilingStates"}, {PublicName: "filteredGroupIds", WireName: "filteredGroupIds"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "activeThreats", WireName: "activeThreats"}, {PublicName: "machineTypesNin", WireName: "machineTypesNin"}, {PublicName: "lastActiveDate__gt", WireName: "lastActiveDate__gt"}, {PublicName: "awsSubnetIds__contains", WireName: "awsSubnetIds__contains"}, {PublicName: "installerTypes", WireName: "installerTypes"}, {PublicName: "registeredAt__gte", WireName: "registeredAt__gte"}, {PublicName: "migrationStatus", WireName: "migrationStatus"}, {PublicName: "cloudTags__contains", WireName: "cloudTags__contains"}, {PublicName: "totalMemory__gte", WireName: "totalMemory__gte"}, {PublicName: "decommissionedAt__lt", WireName: "decommissionedAt__lt"}, {PublicName: "threatCreatedAt__lt", WireName: "threatCreatedAt__lt"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "osArch", WireName: "osArch"}, {PublicName: "registeredAt__gt", WireName: "registeredAt__gt"}, {PublicName: "registeredAt__lt", WireName: "registeredAt__lt"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "networkInterfaceInet__contains", WireName: "networkInterfaceInet__contains"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "uuids", WireName: "uuids"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "scanStatusesNin", WireName: "scanStatusesNin"}, {PublicName: "cpuCount__lte", WireName: "cpuCount__lte"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "awsSecurityGroups__contains", WireName: "awsSecurityGroups__contains"}, {PublicName: "networkStatusesNin", WireName: "networkStatusesNin"}, {PublicName: "activeThreats__gt", WireName: "activeThreats__gt"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "infected", WireName: "infected"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "machineTypes", WireName: "machineTypes"}, {PublicName: "agentPodName__contains", WireName: "agentPodName__contains"}, {PublicName: "computerName__like", WireName: "computerName__like"}, {PublicName: "threatCreatedAt__gt", WireName: "threatCreatedAt__gt"}, {PublicName: "consoleMigrationStatusesNin", WireName: "consoleMigrationStatusesNin"}, {PublicName: "computerName", WireName: "computerName"}, {PublicName: "decommissionedAt__between", WireName: "decommissionedAt__between"}, {PublicName: "cloudInstanceId__contains", WireName: "cloudInstanceId__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "coreCount__between", WireName: "coreCount__between"}, {PublicName: "totalMemory__lte", WireName: "totalMemory__lte"}, {PublicName: "remoteProfilingStatesNin", WireName: "remoteProfilingStatesNin"}, {PublicName: "adComputerMember__contains", WireName: "adComputerMember__contains"}, {PublicName: "threatCreatedAt__between", WireName: "threatCreatedAt__between"}, {PublicName: "totalMemory__gt", WireName: "totalMemory__gt"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "locationEnabled", WireName: "locationEnabled"}, {PublicName: "locationIdsNin", WireName: "locationIdsNin"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "encryptedApplications", WireName: "encryptedApplications"}, {PublicName: "filterId", WireName: "filterId"}, {PublicName: "decommissionedAt__gt", WireName: "decommissionedAt__gt"}, {PublicName: "adUserMember__contains", WireName: "adUserMember__contains"}, {PublicName: "uuid", WireName: "uuid"}, {PublicName: "coreCount__lte", WireName: "coreCount__lte"}, {PublicName: "coreCount__gt", WireName: "coreCount__gt"}, {PublicName: "cloudNetwork__contains", WireName: "cloudNetwork__contains"}, {PublicName: "clusterName__contains", WireName: "clusterName__contains"}, {PublicName: "cpuCount__gte", WireName: "cpuCount__gte"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastActiveDate__between", WireName: "lastActiveDate__between"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "rangerStatus", WireName: "rangerStatus"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "cloudProvider", WireName: "cloudProvider"}, {PublicName: "lastActiveDate__lt", WireName: "lastActiveDate__lt"}, {PublicName: "scanStatuses", WireName: "scanStatuses"}, {PublicName: "hasLocalConfiguration", WireName: "hasLocalConfiguration"}, {PublicName: "networkStatuses", WireName: "networkStatuses"}, {PublicName: "isPendingUninstall", WireName: "isPendingUninstall"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "cpuCount__lt", WireName: "cpuCount__lt"}, {PublicName: "consoleMigrationStatuses", WireName: "consoleMigrationStatuses"}, {PublicName: "adQuery", WireName: "adQuery"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "adComputerName__contains", WireName: "adComputerName__contains"}, {PublicName: "cloudInstanceSize__contains", WireName: "cloudInstanceSize__contains"}, {PublicName: "registeredAt__lte", WireName: "registeredAt__lte"}, {PublicName: "networkQuarantineEnabled", WireName: "networkQuarantineEnabled"}, {PublicName: "cloudAccount__contains", WireName: "cloudAccount__contains"}, {PublicName: "cloudLocation__contains", WireName: "cloudLocation__contains"}, {PublicName: "rangerVersions", WireName: "rangerVersions"}, {PublicName: "networkInterfaceGatewayMacAddress__contains", WireName: "networkInterfaceGatewayMacAddress__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "agentNamespace__contains", WireName: "agentNamespace__contains"}, {PublicName: "K8SNodeLabels__contains", WireName: "K8SNodeLabels__contains"}, {PublicName: "adQuery__contains", WireName: "adQuery__contains"}, {PublicName: "K8SType__contains", WireName: "K8SType__contains"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "totalMemory__lt", WireName: "totalMemory__lt"}, {PublicName: "externalId__contains", WireName: "externalId__contains"}, {PublicName: "filteredSiteIds", WireName: "filteredSiteIds"}, {PublicName: "decommissionedAt__gte", WireName: "decommissionedAt__gte"}, {PublicName: "cpuCount__gt", WireName: "cpuCount__gt"}, {PublicName: "threatHidden", WireName: "threatHidden"}, {PublicName: "isUninstalled", WireName: "isUninstalled"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "lastActiveDate__lte", WireName: "lastActiveDate__lte"}, {PublicName: "adUserName__contains", WireName: "adUserName__contains"}, {PublicName: "isActive", WireName: "isActive"}, {PublicName: "userActionsNeeded", WireName: "userActionsNeeded"}, {PublicName: "threatCreatedAt__lte", WireName: "threatCreatedAt__lte"}, {PublicName: "domainsNin", WireName: "domainsNin"}, {PublicName: "operationalStates", WireName: "operationalStates"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "isDecommissioned", WireName: "isDecommissioned"}, {PublicName: "networkInterfacePhysical__contains", WireName: "networkInterfacePhysical__contains"}, {PublicName: "lastActiveDate__gte", WireName: "lastActiveDate__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "cpuCount__between", WireName: "cpuCount__between"}, {PublicName: "lastLoggedInUserName__contains", WireName: "lastLoggedInUserName__contains"}, {PublicName: "awsRole__contains", WireName: "awsRole__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "K8SVersion__contains", WireName: "K8SVersion__contains"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "K8SNodeName__contains", WireName: "K8SNodeName__contains"}, {PublicName: "coreCount__lt", WireName: "coreCount__lt"}, {PublicName: "rangerStatuses", WireName: "rangerStatuses"}, {PublicName: "adUserQuery__contains", WireName: "adUserQuery__contains"}, {PublicName: "rangerVersionsNin", WireName: "rangerVersionsNin"}, {PublicName: "rangerStatusesNin", WireName: "rangerStatusesNin"}, {PublicName: "coreCount__gte", WireName: "coreCount__gte"}, {PublicName: "threatCreatedAt__gte", WireName: "threatCreatedAt__gte"}, {PublicName: "decommissionedAt__lte", WireName: "decommissionedAt__lte"}, {PublicName: "operationalStatesNin", WireName: "operationalStatesNin"}, {PublicName: "appsVulnerabilityStatusesNin", WireName: "appsVulnerabilityStatusesNin"}, {PublicName: "mitigationMode", WireName: "mitigationMode"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "gatewayIp", WireName: "gatewayIp"}, {PublicName: "cloudImage__contains", WireName: "cloudImage__contains"}, {PublicName: "registeredAt__between", WireName: "registeredAt__between"}, {PublicName: "threatMitigationStatus", WireName: "threatMitigationStatus"}, {PublicName: "installerTypesNin", WireName: "installerTypesNin"}, {PublicName: "appsVulnerabilityStatuses", WireName: "appsVulnerabilityStatuses"}, {PublicName: "threatResolved", WireName: "threatResolved"}, {PublicName: "mitigationModeSuspicious", WireName: "mitigationModeSuspicious"}, {PublicName: "isUpToDate", WireName: "isUpToDate"}, {PublicName: "adComputerQuery__contains", WireName: "adComputerQuery__contains"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "azureResourceGroup__contains", WireName: "azureResourceGroup__contains"}, {PublicName: "scanStatus", WireName: "scanStatus"}, {PublicName: "threatContentHash", WireName: "threatContentHash"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "threatRebootRequired", WireName: "threatRebootRequired"}, {PublicName: "totalMemory__between", WireName: "totalMemory__between"}, {PublicName: "firewallEnabled", WireName: "firewallEnabled"}, {PublicName: "gcpServiceAccount__contains", WireName: "gcpServiceAccount__contains"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "remoteProfilingStates", WireName: "remoteProfilingStates"}, {PublicName: "filteredGroupIds", WireName: "filteredGroupIds"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "activeThreats", WireName: "activeThreats"}, {PublicName: "machineTypesNin", WireName: "machineTypesNin"}, {PublicName: "lastActiveDate__gt", WireName: "lastActiveDate__gt"}, {PublicName: "awsSubnetIds__contains", WireName: "awsSubnetIds__contains"}, {PublicName: "installerTypes", WireName: "installerTypes"}, {PublicName: "registeredAt__gte", WireName: "registeredAt__gte"}, {PublicName: "migrationStatus", WireName: "migrationStatus"}, {PublicName: "cloudTags__contains", WireName: "cloudTags__contains"}, {PublicName: "totalMemory__gte", WireName: "totalMemory__gte"}, {PublicName: "decommissionedAt__lt", WireName: "decommissionedAt__lt"}, {PublicName: "threatCreatedAt__lt", WireName: "threatCreatedAt__lt"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "osArch", WireName: "osArch"}, {PublicName: "registeredAt__gt", WireName: "registeredAt__gt"}, {PublicName: "registeredAt__lt", WireName: "registeredAt__lt"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "networkInterfaceInet__contains", WireName: "networkInterfaceInet__contains"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "uuids", WireName: "uuids"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "scanStatusesNin", WireName: "scanStatusesNin"}, {PublicName: "cpuCount__lte", WireName: "cpuCount__lte"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "awsSecurityGroups__contains", WireName: "awsSecurityGroups__contains"}, {PublicName: "networkStatusesNin", WireName: "networkStatusesNin"}, {PublicName: "activeThreats__gt", WireName: "activeThreats__gt"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "infected", WireName: "infected"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "machineTypes", WireName: "machineTypes"}, {PublicName: "agentPodName__contains", WireName: "agentPodName__contains"}, {PublicName: "computerName__like", WireName: "computerName__like"}, {PublicName: "threatCreatedAt__gt", WireName: "threatCreatedAt__gt"}, {PublicName: "consoleMigrationStatusesNin", WireName: "consoleMigrationStatusesNin"}, {PublicName: "computerName", WireName: "computerName"}, {PublicName: "decommissionedAt__between", WireName: "decommissionedAt__between"}, {PublicName: "cloudInstanceId__contains", WireName: "cloudInstanceId__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "coreCount__between", WireName: "coreCount__between"}, {PublicName: "totalMemory__lte", WireName: "totalMemory__lte"}, {PublicName: "remoteProfilingStatesNin", WireName: "remoteProfilingStatesNin"}, {PublicName: "adComputerMember__contains", WireName: "adComputerMember__contains"}, {PublicName: "threatCreatedAt__between", WireName: "threatCreatedAt__between"}, {PublicName: "totalMemory__gt", WireName: "totalMemory__gt"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "locationEnabled", WireName: "locationEnabled"}, {PublicName: "locationIdsNin", WireName: "locationIdsNin"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "encryptedApplications", WireName: "encryptedApplications"}, {PublicName: "filterId", WireName: "filterId"}, {PublicName: "decommissionedAt__gt", WireName: "decommissionedAt__gt"}, {PublicName: "adUserMember__contains", WireName: "adUserMember__contains"}, {PublicName: "uuid", WireName: "uuid"}, {PublicName: "coreCount__lte", WireName: "coreCount__lte"}, {PublicName: "coreCount__gt", WireName: "coreCount__gt"}, {PublicName: "cloudNetwork__contains", WireName: "cloudNetwork__contains"}, {PublicName: "clusterName__contains", WireName: "clusterName__contains"}, {PublicName: "cpuCount__gte", WireName: "cpuCount__gte"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastActiveDate__between", WireName: "lastActiveDate__between"}, {PublicName: "rangerStatus", WireName: "rangerStatus"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "cloudProvider", WireName: "cloudProvider"}, {PublicName: "lastActiveDate__lt", WireName: "lastActiveDate__lt"}, {PublicName: "scanStatuses", WireName: "scanStatuses"}, {PublicName: "hasLocalConfiguration", WireName: "hasLocalConfiguration"}, {PublicName: "networkStatuses", WireName: "networkStatuses"}, {PublicName: "isPendingUninstall", WireName: "isPendingUninstall"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "cpuCount__lt", WireName: "cpuCount__lt"}, {PublicName: "consoleMigrationStatuses", WireName: "consoleMigrationStatuses"}, {PublicName: "adQuery", WireName: "adQuery"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "adComputerName__contains", WireName: "adComputerName__contains"}, {PublicName: "cloudInstanceSize__contains", WireName: "cloudInstanceSize__contains"}, {PublicName: "registeredAt__lte", WireName: "registeredAt__lte"}, {PublicName: "networkQuarantineEnabled", WireName: "networkQuarantineEnabled"}, {PublicName: "cloudAccount__contains", WireName: "cloudAccount__contains"}, {PublicName: "cloudLocation__contains", WireName: "cloudLocation__contains"}, {PublicName: "rangerVersions", WireName: "rangerVersions"}, {PublicName: "networkInterfaceGatewayMacAddress__contains", WireName: "networkInterfaceGatewayMacAddress__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "agentNamespace__contains", WireName: "agentNamespace__contains"}, {PublicName: "K8SNodeLabels__contains", WireName: "K8SNodeLabels__contains"}, {PublicName: "adQuery__contains", WireName: "adQuery__contains"}, {PublicName: "K8SType__contains", WireName: "K8SType__contains"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "totalMemory__lt", WireName: "totalMemory__lt"}, {PublicName: "externalId__contains", WireName: "externalId__contains"}, {PublicName: "filteredSiteIds", WireName: "filteredSiteIds"}, {PublicName: "decommissionedAt__gte", WireName: "decommissionedAt__gte"}, {PublicName: "cpuCount__gt", WireName: "cpuCount__gt"}, {PublicName: "threatHidden", WireName: "threatHidden"}, {PublicName: "isUninstalled", WireName: "isUninstalled"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "lastActiveDate__lte", WireName: "lastActiveDate__lte"}, {PublicName: "adUserName__contains", WireName: "adUserName__contains"}, {PublicName: "isActive", WireName: "isActive"}, {PublicName: "userActionsNeeded", WireName: "userActionsNeeded"}, {PublicName: "threatCreatedAt__lte", WireName: "threatCreatedAt__lte"}, {PublicName: "domainsNin", WireName: "domainsNin"}, {PublicName: "operationalStates", WireName: "operationalStates"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "isDecommissioned", WireName: "isDecommissioned"}, {PublicName: "networkInterfacePhysical__contains", WireName: "networkInterfacePhysical__contains"}, {PublicName: "lastActiveDate__gte", WireName: "lastActiveDate__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "cpuCount__between", WireName: "cpuCount__between"}, {PublicName: "lastLoggedInUserName__contains", WireName: "lastLoggedInUserName__contains"}, {PublicName: "awsRole__contains", WireName: "awsRole__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "K8SVersion__contains", WireName: "K8SVersion__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "get-passphrase", "Show the passphrase for the Agents that match the filter. This is an important command.", "/agents/passphrases"),
 	},
 	{
@@ -450,6 +542,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "initiate-scan", "Use this command to run a Full Disk Scan on Agents that match the filter.", "/agents/actions/initiate-scan"),
 	},
 	{
@@ -460,6 +554,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "mark-as-uptodate", "The value of the Agent version as 'up-to-date' is a useful filter for many actions.", "/agents/actions/mark-up-to-date"),
 	},
 	{
@@ -470,6 +566,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "move-between-sites", "This command requires Account or Global level access.", "/agents/actions/move-to-site"),
 	},
 	{
@@ -480,6 +578,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "move-to-console", "You can move Agents between Management Consoles.", "/agents/actions/move-to-console"),
 	},
 	{
@@ -490,6 +590,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "ids", WireName: "ids"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "processes", "[OBSOLETE] Returns empty array. To get processes of an Agent, see Applications.", "/agents/processes"),
 	},
 	{
@@ -500,6 +602,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "randomize-uuid", "IMPORTANT: This action will assign a new UUID to Agents that match the filter.", "/agents/actions/randomize-uuid"),
 	},
 	{
@@ -510,6 +614,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "reject-uninstall", "Reject uninstall requests for all Agents that match the filter.", "/agents/actions/reject-uninstall"),
 	},
 	{
@@ -520,6 +626,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "reset-local-config", "SentinelCtl is the CLI for Agents. It runs commands directly on one Agent at a time.", "/agents/actions/reset-local-config"),
 	},
 	{
@@ -530,6 +638,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "restart", "Use this command to restart endpoints that have an Agent installed and that fit the filter.", "/agents/actions/restart-machine"),
 	},
 	{
@@ -540,6 +650,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "set-external-id", "You can add a Customer Identifier (a string) to identify each endpoint or to tag sets of endpoints.", "/agents/actions/set-external-id"),
 	},
 	{
@@ -550,6 +662,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "set-persistent-configuration-overrides", "This command requires Global permissions or Support.", "/agents/actions/set-config"),
 	},
 	{
@@ -560,6 +674,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "shutdown", "You can shut down endpoints remotely for performance, maintenance, or security.", "/agents/actions/shutdown"),
 	},
 	{
@@ -570,6 +686,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "start-remote-profiling", "Use this command to start remote profiling on Agents that match the filter.", "/agents/actions/start-profiling"),
 	},
 	{
@@ -580,6 +698,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "start-remote-shell", "Remote shell is an opened websocket between the browser and the Agent", "/agents/actions/start-remote-shell"),
 	},
 	{
@@ -590,6 +710,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "stop-remote-profiling", "Use this command to stop remote profiling on Agents that match the filter.", "/agents/actions/stop-profiling"),
 	},
 	{
@@ -600,6 +722,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "terminate-remote-shell", "Remote Shell is a powerful, full shell for Windows, macOS, and Linux.", "/agents/actions/terminate-remote-shell"),
 	},
 	{
@@ -610,6 +734,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "uninstall", "Use this command to uninstall Agents that match the filter.", "/agents/actions/uninstall"),
 	},
 	{
@@ -620,6 +746,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "update-software", "Use this command to update the Agent version on endpoints that have the Agent installed and that match the filter.", "/agents/actions/update-software"),
 	},
 	{
@@ -630,6 +758,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"agent_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "fetch-files", "Fetch files from endpoints (up to 10 MB for each command)", "/agents/{agent_id}/actions/fetch-files"),
 	},
 	{
@@ -640,6 +770,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"agent_id", "activity_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("agents", "export-agent-logs", "Get Agent logs from Agents that match the filter.", "/agents/{agent_id}/uploads/{activity_id}"),
 	},
 	{
@@ -650,6 +782,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("application-inventory", "grouped-app-inventory", "[DEPRECATED] Retrieve application inventory grouped by Name, Publisher.", "/application-inventory"),
 	},
 	{
@@ -660,6 +794,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("application-inventory-counts", "counters", "[DEPRECATED] Application inventory counters.", "/application-inventory-counts"),
 	},
 	{
@@ -670,6 +806,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"application_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("applications", "application", "Application Forensics", "/applications/{application_id}/forensics"),
 	},
 	{
@@ -680,6 +818,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"application_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "country_code", WireName: "country_code"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("applications", "application-connections", "[DEPRECATED] Returns an empty array", "/applications/{application_id}/forensics/connections"),
 	},
 	{
@@ -690,6 +830,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"application_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("applications", "application-detailed", "[DEPRECATED] Returns an empty array", "/applications/{application_id}/forensics/details"),
 	},
 	{
@@ -700,6 +842,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"application_id", "export_format"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("applications", "export-application", "[DEPRECATED] Returns an empty array", "/applications/{application_id}/forensics/export/{export_format}"),
 	},
 	{
@@ -710,6 +854,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "activate-rules", "Activate Custom Detection Rules based on a filter.", "/cloud-detection/rules/enable"),
 	},
 	{
@@ -720,6 +866,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "create-rule", "Create a Custom Detection Rule for a scope specified by ID.", "/cloud-detection/rules"),
 	},
 	{
@@ -730,6 +878,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "delete-rules", "Deletes Custom Detection Rules that match a filter.", "/cloud-detection/rules"),
 	},
 	{
@@ -740,6 +890,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "disable-rules", "Disable Custom Detection Rules based on a filter.", "/cloud-detection/rules/disable"),
 	},
 	{
@@ -749,7 +901,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of alerts for a given scope",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "scopes", WireName: "scopes"}, {PublicName: "ruleName__like_any", WireName: "ruleName__like_any"}, {PublicName: "incidentStatus__in", WireName: "incidentStatus__in"}, {PublicName: "sourceProcessFileHashSha256__like_any", WireName: "sourceProcessFileHashSha256__like_any"}, {PublicName: "osType__in", WireName: "osType__in"}, {PublicName: "origAgentUuid__like_any", WireName: "origAgentUuid__like_any"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "k8sNamespaceName__like_any", WireName: "k8sNamespaceName__like_any"}, {PublicName: "sourceProcessFilePath__like_any", WireName: "sourceProcessFilePath__like_any"}, {PublicName: "machineType__in", WireName: "machineType__in"}, {PublicName: "reportedAt__gt", WireName: "reportedAt__gt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "reportedAt__lt", WireName: "reportedAt__lt"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "k8sControllerLabels__like_any", WireName: "k8sControllerLabels__like_any"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "reportedAt__gte", WireName: "reportedAt__gte"}, {PublicName: "k8sCluster__like_any", WireName: "k8sCluster__like_any"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "query", WireName: "query"}, {PublicName: "k8sControllerName__like_any", WireName: "k8sControllerName__like_any"}, {PublicName: "severity__in", WireName: "severity__in"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "k8sNamespaceLabels__like_any", WireName: "k8sNamespaceLabels__like_any"}, {PublicName: "reportedAt__lte", WireName: "reportedAt__lte"}, {PublicName: "k8sNode__like_any", WireName: "k8sNode__like_any"}, {PublicName: "sourceProcessFileHashSha1__like_any", WireName: "sourceProcessFileHashSha1__like_any"}, {PublicName: "origAgentOsRevision__contains", WireName: "origAgentOsRevision__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "k8sPodLabels__like_any", WireName: "k8sPodLabels__like_any"}, {PublicName: "containerName__like_any", WireName: "containerName__like_any"}, {PublicName: "containerImageName__like_any", WireName: "containerImageName__like_any"}, {PublicName: "sourceProcessFileHashMd5__like_any", WireName: "sourceProcessFileHashMd5__like_any"}, {PublicName: "containerLabels__like_any", WireName: "containerLabels__like_any"}, {PublicName: "k8sPod__like_any", WireName: "k8sPod__like_any"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "sourceProcessName__like_any", WireName: "sourceProcessName__like_any"}, {PublicName: "origAgentVersion__like_any", WireName: "origAgentVersion__like_any"}, {PublicName: "sourceProcessCommandline__like_any", WireName: "sourceProcessCommandline__like_any"}, {PublicName: "sourceProcessStoryline__like_any", WireName: "sourceProcessStoryline__like_any"}, {PublicName: "origAgentName__like_any", WireName: "origAgentName__like_any"}, {PublicName: "analystVerdict__in", WireName: "analystVerdict__in"}, {PublicName: "skipCount", WireName: "skipCount"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "scopes", WireName: "scopes"}, {PublicName: "ruleName__like_any", WireName: "ruleName__like_any"}, {PublicName: "incidentStatus__in", WireName: "incidentStatus__in"}, {PublicName: "sourceProcessFileHashSha256__like_any", WireName: "sourceProcessFileHashSha256__like_any"}, {PublicName: "osType__in", WireName: "osType__in"}, {PublicName: "origAgentUuid__like_any", WireName: "origAgentUuid__like_any"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "k8sNamespaceName__like_any", WireName: "k8sNamespaceName__like_any"}, {PublicName: "sourceProcessFilePath__like_any", WireName: "sourceProcessFilePath__like_any"}, {PublicName: "machineType__in", WireName: "machineType__in"}, {PublicName: "reportedAt__gt", WireName: "reportedAt__gt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "reportedAt__lt", WireName: "reportedAt__lt"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "k8sControllerLabels__like_any", WireName: "k8sControllerLabels__like_any"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "reportedAt__gte", WireName: "reportedAt__gte"}, {PublicName: "k8sCluster__like_any", WireName: "k8sCluster__like_any"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "query", WireName: "query"}, {PublicName: "k8sControllerName__like_any", WireName: "k8sControllerName__like_any"}, {PublicName: "severity__in", WireName: "severity__in"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "k8sNamespaceLabels__like_any", WireName: "k8sNamespaceLabels__like_any"}, {PublicName: "reportedAt__lte", WireName: "reportedAt__lte"}, {PublicName: "k8sNode__like_any", WireName: "k8sNode__like_any"}, {PublicName: "sourceProcessFileHashSha1__like_any", WireName: "sourceProcessFileHashSha1__like_any"}, {PublicName: "origAgentOsRevision__contains", WireName: "origAgentOsRevision__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "k8sPodLabels__like_any", WireName: "k8sPodLabels__like_any"}, {PublicName: "containerName__like_any", WireName: "containerName__like_any"}, {PublicName: "containerImageName__like_any", WireName: "containerImageName__like_any"}, {PublicName: "sourceProcessFileHashMd5__like_any", WireName: "sourceProcessFileHashMd5__like_any"}, {PublicName: "containerLabels__like_any", WireName: "containerLabels__like_any"}, {PublicName: "k8sPod__like_any", WireName: "k8sPod__like_any"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "sourceProcessName__like_any", WireName: "sourceProcessName__like_any"}, {PublicName: "origAgentVersion__like_any", WireName: "origAgentVersion__like_any"}, {PublicName: "sourceProcessCommandline__like_any", WireName: "sourceProcessCommandline__like_any"}, {PublicName: "sourceProcessStoryline__like_any", WireName: "sourceProcessStoryline__like_any"}, {PublicName: "origAgentName__like_any", WireName: "origAgentName__like_any"}, {PublicName: "analystVerdict__in", WireName: "analystVerdict__in"}, {PublicName: "skipCount", WireName: "skipCount"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "get-alerts", "Get a list of alerts for a given scope", "/cloud-detection/alerts"),
 	},
 	{
@@ -759,7 +913,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of Custom Detection Rules for a given scope.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "scopes", WireName: "scopes"}, {PublicName: "reachedLimit", WireName: "reachedLimit"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "activeResponse", WireName: "activeResponse"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "creator__contains", WireName: "creator__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "query", WireName: "query"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "expirationMode", WireName: "expirationMode"}, {PublicName: "s1ql__contains", WireName: "s1ql__contains"}, {PublicName: "queryType", WireName: "queryType"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "expired", WireName: "expired"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "status", WireName: "status"}, {PublicName: "skipCount", WireName: "skipCount"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "scopes", WireName: "scopes"}, {PublicName: "reachedLimit", WireName: "reachedLimit"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "activeResponse", WireName: "activeResponse"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "creator__contains", WireName: "creator__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "query", WireName: "query"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "expirationMode", WireName: "expirationMode"}, {PublicName: "s1ql__contains", WireName: "s1ql__contains"}, {PublicName: "queryType", WireName: "queryType"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "expired", WireName: "expired"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "status", WireName: "status"}, {PublicName: "skipCount", WireName: "skipCount"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "get-rules", "Get a list of Custom Detection Rules for a given scope.", "/cloud-detection/rules"),
 	},
 	{
@@ -770,6 +926,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "update-alert-analyst-verdict", "Change the verdict of an alert", "/cloud-detection/alerts/analyst-verdict"),
 	},
 	{
@@ -780,6 +938,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"rule_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "update-rule", "Change a Custom Detection rule. This command requires the rule ID. (See Get Rules).", "/cloud-detection/rules/{rule_id}"),
 	},
 	{
@@ -790,6 +950,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("cloud-detection", "updated-threat-incident", "Update the incident details of an alert.", "/cloud-detection/alerts/incident"),
 	},
 	{
@@ -800,6 +962,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("config-override", "create", "Override the configuration of Agents that match the filter.", "/config-override"),
 	},
 	{
@@ -810,6 +974,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("config-override", "delete", "Delete overrides value. To get the required IDs, run 'config-override'.", "/config-override"),
 	},
 	{
@@ -820,6 +986,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"override_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("config-override", "delete-configoverride", "Delete an override value. To get the required ID, run 'config-override'.", "/config-override/{override_id}"),
 	},
 	{
@@ -829,7 +997,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "There are different ways to override the configuration of an Agent",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "description__like", WireName: "description__like"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "versionOption", WireName: "versionOption"}, {PublicName: "name__like", WireName: "name__like"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "description__like", WireName: "description__like"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "versionOption", WireName: "versionOption"}, {PublicName: "name__like", WireName: "name__like"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("config-override", "get", "There are different ways to override the configuration of an Agent", "/config-override"),
 	},
 	{
@@ -840,6 +1010,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"override_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("config-override", "update", "Use this command to change the value of one configuration value. To get the required ID, run 'config-override'.", "/config-override/{override_id}"),
 	},
 	{
@@ -850,6 +1022,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "copy-rules", "You can copy a set of Device Control rules to use in other Accounts, Sites, or Groups.", "/device-control/copy-rules"),
 	},
 	{
@@ -860,6 +1034,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "create-rule", "Use this command to create a new Device Control rule. These rules allow or block devices, based on device identifiers.", "/device-control"),
 	},
 	{
@@ -870,6 +1046,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "delete-rules", "Delete Device Control rules that match the filter.", "/device-control"),
 	},
 	{
@@ -880,6 +1058,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "enable-disable-rules", "It is best practice to disable a rule rather than delete it.", "/device-control/enable"),
 	},
 	{
@@ -890,6 +1070,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "ruleName", WireName: "ruleName"}, {PublicName: "deviceClasses", WireName: "deviceClasses"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "gattServices", WireName: "gattServices"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "deviceNames", WireName: "deviceNames"}, {PublicName: "accessPermissions", WireName: "accessPermissions"}, {PublicName: "vendorIds", WireName: "vendorIds"}, {PublicName: "manufacturerNames", WireName: "manufacturerNames"}, {PublicName: "bluetoothAddresses", WireName: "bluetoothAddresses"}, {PublicName: "interfaces", WireName: "interfaces"}, {PublicName: "uids", WireName: "uids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "minorClasses", WireName: "minorClasses"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "productIds", WireName: "productIds"}, {PublicName: "deviceInformationServiceInfoKeys", WireName: "deviceInformationServiceInfoKeys"}, {PublicName: "serviceClasses", WireName: "serviceClasses"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "versions", WireName: "versions"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "export-rules", "Export Device Control rules to a CSV file.", "/device-control/export"),
 	},
 	{
@@ -900,6 +1082,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tenant", WireName: "tenant"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "get-configuration", "Get Device Control configuration for a given scope. You can enter a Group ID, Site ID, Account ID, or 'tenant = true'.", "/device-control/configuration"),
 	},
 	{
@@ -909,7 +1093,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Device Control rules of a specified Account, Site, Group or Global (tenant) that match the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "ruleName", WireName: "ruleName"}, {PublicName: "deviceClasses", WireName: "deviceClasses"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "gattServices", WireName: "gattServices"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "deviceNames", WireName: "deviceNames"}, {PublicName: "accessPermissions", WireName: "accessPermissions"}, {PublicName: "vendorIds", WireName: "vendorIds"}, {PublicName: "manufacturerNames", WireName: "manufacturerNames"}, {PublicName: "bluetoothAddresses", WireName: "bluetoothAddresses"}, {PublicName: "interfaces", WireName: "interfaces"}, {PublicName: "uids", WireName: "uids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "minorClasses", WireName: "minorClasses"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "productIds", WireName: "productIds"}, {PublicName: "deviceInformationServiceInfoKeys", WireName: "deviceInformationServiceInfoKeys"}, {PublicName: "serviceClasses", WireName: "serviceClasses"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "versions", WireName: "versions"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "ruleName", WireName: "ruleName"}, {PublicName: "deviceClasses", WireName: "deviceClasses"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "gattServices", WireName: "gattServices"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "deviceNames", WireName: "deviceNames"}, {PublicName: "accessPermissions", WireName: "accessPermissions"}, {PublicName: "vendorIds", WireName: "vendorIds"}, {PublicName: "manufacturerNames", WireName: "manufacturerNames"}, {PublicName: "bluetoothAddresses", WireName: "bluetoothAddresses"}, {PublicName: "interfaces", WireName: "interfaces"}, {PublicName: "uids", WireName: "uids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "minorClasses", WireName: "minorClasses"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "productIds", WireName: "productIds"}, {PublicName: "deviceInformationServiceInfoKeys", WireName: "deviceInformationServiceInfoKeys"}, {PublicName: "serviceClasses", WireName: "serviceClasses"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "versions", WireName: "versions"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "get-device-rules", "Get the Device Control rules of a specified Account, Site, Group or Global (tenant) that match the filter.", "/device-control"),
 	},
 	{
@@ -919,7 +1105,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the data of Device Control events on Windows and macOS endpoints with Device Control-enabled Agents that match the",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "deviceClasses", WireName: "deviceClasses"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "eventTime__lt", WireName: "eventTime__lt"}, {PublicName: "eventIds", WireName: "eventIds"}, {PublicName: "eventTime__gt", WireName: "eventTime__gt"}, {PublicName: "eventTime__lte", WireName: "eventTime__lte"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "access_permissions", WireName: "access_permissions"}, {PublicName: "vendorIds", WireName: "vendorIds"}, {PublicName: "interfaces", WireName: "interfaces"}, {PublicName: "uids", WireName: "uids"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "eventTypes", WireName: "eventTypes"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "eventTime__between", WireName: "eventTime__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "productIds", WireName: "productIds"}, {PublicName: "eventTime__gte", WireName: "eventTime__gte"}, {PublicName: "serviceClasses", WireName: "serviceClasses"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "deviceClasses", WireName: "deviceClasses"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "eventTime__lt", WireName: "eventTime__lt"}, {PublicName: "eventIds", WireName: "eventIds"}, {PublicName: "eventTime__gt", WireName: "eventTime__gt"}, {PublicName: "eventTime__lte", WireName: "eventTime__lte"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "access_permissions", WireName: "access_permissions"}, {PublicName: "vendorIds", WireName: "vendorIds"}, {PublicName: "interfaces", WireName: "interfaces"}, {PublicName: "uids", WireName: "uids"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "eventTypes", WireName: "eventTypes"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "eventTime__between", WireName: "eventTime__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "productIds", WireName: "productIds"}, {PublicName: "eventTime__gte", WireName: "eventTime__gte"}, {PublicName: "serviceClasses", WireName: "serviceClasses"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "get-events", "Get the data of Device Control events on Windows and macOS endpoints with Device Control-enabled Agents that match the", "/device-control/events"),
 	},
 	{
@@ -930,6 +1118,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "import-rules", "Import Device Control rules from a CSV file.", "/device-control/import"),
 	},
 	{
@@ -940,6 +1130,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "move-rules", "You can move a set of Device Control rules to other Accounts, Sites, or Groups.", "/device-control/move-rules"),
 	},
 	{
@@ -950,6 +1142,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "reorder-rules", "When an external device connects to an endpoint", "/device-control/reorder"),
 	},
 	{
@@ -960,6 +1154,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "update-configuration", "Use this command to change the Device Control configuration. Enter a Group ID, Site ID, Account ID, or 'tenant = true'.", "/device-control/configuration"),
 	},
 	{
@@ -970,6 +1166,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"rule_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("device-control", "update-device-rule", "Change the Device Control rule that matches the filter. To learn more about the fields, see https://support.sentinelone.", "/device-control/{rule_id}"),
 	},
 	{
@@ -980,6 +1178,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "cancel-running-query", "Stop a Deep Visibility Query by queryId. The body is {'queryID':'string_ID'}. Get the ID of the query from 'init-query'.", "/dv/cancel-query"),
 	},
 	{
@@ -990,6 +1190,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "create-query-and-get-query-id", "Start a Deep Visibility Query and get the queryId.", "/dv/init-query"),
 	},
 	{
@@ -1000,6 +1202,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "downloadToken", WireName: "downloadToken"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "download-source-process-file", "Download the source process file associated with a Deep Visibility event.", "/dv/fetch-file"),
 	},
 	{
@@ -1009,7 +1213,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get all Deep Visibility events from a queryId.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "subQuery", WireName: "subQuery"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "queryId", WireName: "queryId"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "subQuery", WireName: "subQuery"}, {PublicName: "queryId", WireName: "queryId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "get-events", "Get all Deep Visibility events from a queryId.", "/dv/events"),
 	},
 	{
@@ -1019,7 +1225,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get Deep Visibility results from the query that matches the given event type.",
 		Positional:     []string{"event_type"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "subQuery", WireName: "subQuery"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "queryId", WireName: "queryId"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "subQuery", WireName: "subQuery"}, {PublicName: "queryId", WireName: "queryId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "get-events-by-type", "Get Deep Visibility results from the query that matches the given event type.", "/dv/events/{event_type}"),
 	},
 	{
@@ -1029,7 +1237,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get details of all Deep Visibility processes from a queryId.To get the ID from 'init-query'.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "queryId", WireName: "queryId"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "queryId", WireName: "queryId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "get-process-state", "Get details of all Deep Visibility processes from a queryId.To get the ID from 'init-query'.", "/dv/process-state"),
 	},
 	{
@@ -1040,6 +1250,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "queryId", WireName: "queryId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("dv", "get-query-status", "Get that status of a Deep Visibility Query.", "/dv/query-status"),
 	},
 	{
@@ -1050,6 +1262,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("exclusions", "create", "Create Exclusions to make your Agents suppress alerts and mitigation for items that you consider to be benign or which", "/exclusions"),
 	},
 	{
@@ -1060,6 +1274,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("exclusions", "delete", "Every Exclusion opens a possible security hole.", "/exclusions"),
 	},
 	{
@@ -1069,7 +1285,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of all the Exclusions that match the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "pathExclusionTypes", WireName: "pathExclusionTypes"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "modes", WireName: "modes"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "types", WireName: "types"}, {PublicName: "unified", WireName: "unified"}, {PublicName: "source", WireName: "source"}, {PublicName: "value__contains", WireName: "value__contains"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "recommendations", WireName: "recommendations"}, {PublicName: "value", WireName: "value"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "type", WireName: "type"}, {PublicName: "user__contains", WireName: "user__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "pathExclusionTypes", WireName: "pathExclusionTypes"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "modes", WireName: "modes"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "types", WireName: "types"}, {PublicName: "unified", WireName: "unified"}, {PublicName: "source", WireName: "source"}, {PublicName: "value__contains", WireName: "value__contains"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "recommendations", WireName: "recommendations"}, {PublicName: "value", WireName: "value"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "type", WireName: "type"}, {PublicName: "user__contains", WireName: "user__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("exclusions", "get", "Get a list of all the Exclusions that match the filter.", "/exclusions"),
 	},
 	{
@@ -1080,6 +1298,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("exclusions", "update", "Change the properties of an Exclusion through the data fields.", "/exclusions"),
 	},
 	{
@@ -1090,6 +1310,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("exclusions", "validate-item", "Check if an exclusion is on the list of SentinelOne items that are 'Not Allowed' or 'Not Recommended'.", "/exclusions/validate"),
 	},
 	{
@@ -1100,6 +1322,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"filter_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "delete", "Delete a saved filter.", "/filters/{filter_id}"),
 	},
 	{
@@ -1110,6 +1334,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"filter_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "delete-deep-visibility", "Delete a saved Deep Visibility query.", "/filters/dv/{filter_id}"),
 	},
 	{
@@ -1119,7 +1345,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the list of saved filters. See Save Filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "includeGlobal", WireName: "includeGlobal"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "includeGlobal", WireName: "includeGlobal"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "get", "Get the list of saved filters. See Save Filter.", "/filters"),
 	},
 	{
@@ -1129,7 +1357,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get saved Deep Visibility queries with full data. See Save Deep Visibility Filters.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "includeGlobal", WireName: "includeGlobal"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "includeGlobal", WireName: "includeGlobal"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "get-deep-visibility", "Get saved Deep Visibility queries with full data. See Save Deep Visibility Filters.", "/filters/dv"),
 	},
 	{
@@ -1140,6 +1370,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "save", "Save a new filter to get a list of matching endpoints.", "/filters"),
 	},
 	{
@@ -1150,6 +1382,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "save-deep-visibility", "Save a Deep Visibility query with data as a filter", "/filters/dv"),
 	},
 	{
@@ -1160,6 +1394,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"filter_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "update", "Update an existing filter", "/filters/{filter_id}"),
 	},
 	{
@@ -1170,6 +1406,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"filter_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("filters", "update-deep-visibility", "Change a saved Deep Visibility filter. To get the ID and fields to change, run Get Deep Visibility Filters.", "/filters/dv/{filter_id}"),
 	},
 	{
@@ -1180,6 +1418,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "add-rule-tags", "Create a Firewall Rule tag. Create tags to represent Firewall policies - a set of rules in a specific order.", "/firewall-control/add-tags"),
 	},
 	{
@@ -1190,6 +1430,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "copy-rules", "Copy a set of rules to other scopes. In the filter of the body, enter the properties to define the source.", "/firewall-control/copy-rules"),
 	},
 	{
@@ -1200,6 +1442,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "create-firewall-rule", "Create a Firewall Control rule for a scope specified by ID (run 'accounts', 'sites', 'groups'", "/firewall-control"),
 	},
 	{
@@ -1210,6 +1454,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "create-firewall-rule-by-category", "Create a Firewall Control rule for a scope specified by ID (run 'accounts', 'sites', 'groups'", "/firewall-control/{firewall_rule_category}"),
 	},
 	{
@@ -1220,6 +1466,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "delete-rules", "Delete Firewall Control rules that match the filter.", "/firewall-control"),
 	},
 	{
@@ -1230,6 +1478,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "delete-rules-by-category", "Delete Firewall Control rules that match the filter.", "/firewall-control/{firewall_rule_category}"),
 	},
 	{
@@ -1240,6 +1490,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "enable-disable-rules", "Change the status of a set of Firewall Control rules that match the filter to 'Enabled' or 'Disabled'.", "/firewall-control/enable"),
 	},
 	{
@@ -1250,6 +1502,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "export-rules", "Export Firewall Control rules that match the filter to a JSON file from a scope specified by ID (run 'accounts', 'sites'", "/firewall-control/export"),
 	},
 	{
@@ -1260,6 +1514,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tenant", WireName: "tenant"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-configuration", "Get the Firewall Control configuration for a given scope.", "/firewall-control/configuration"),
 	},
 	{
@@ -1269,7 +1525,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Firewall Control rules for a scope specified by ID (run 'accounts', 'sites, 'groups', or set 'tenant' to 'true')",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-firewall-rules", "Get the Firewall Control rules for a scope specified by ID (run 'accounts', 'sites, 'groups', or set 'tenant' to 'true')", "/firewall-control"),
 	},
 	{
@@ -1279,7 +1537,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Firewall Control rules for a scope specified by ID (run 'accounts', 'sites, 'groups', or set 'tenant' to 'true')",
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-firewall-rules-by-category", "Get the Firewall Control rules for a scope specified by ID (run 'accounts', 'sites, 'groups', or set 'tenant' to 'true')", "/firewall-control/{firewall_rule_category}"),
 	},
 	{
@@ -1289,7 +1549,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of protocols that can be used in Firewall Control rules.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-protocols", "Get a list of protocols that can be used in Firewall Control rules.", "/firewall-control/protocols"),
 	},
 	{
@@ -1299,7 +1561,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get all Firewall rules linked to tag, regardless of inheritance mode.",
 		Positional:     []string{"tag_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-tag-firewall-rules", "Get all Firewall rules linked to tag, regardless of inheritance mode.", "/firewall-control/tag-rules/{tag_id}"),
 	},
 	{
@@ -1310,6 +1574,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "import-rules", "Import Firewall Control rules from an exported JSON file to scopes specified by ID (run 'accounts', 'sites', 'groups'", "/firewall-control/import"),
 	},
 	{
@@ -1320,6 +1586,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "move-rules", "Remove Firewall Rules, defined with the ID of the rules (run 'firewall-control')", "/firewall-control/move-rules"),
 	},
 	{
@@ -1330,6 +1598,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "remove-rule-tags", "Remove firewall tags from rules matching the filter.", "/firewall-control/remove-tags"),
 	},
 	{
@@ -1340,6 +1610,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "reorder-rules", "Change the order of rules for a scope specified by ID (run 'accounts', 'sites', or 'groups').", "/firewall-control/reorder"),
 	},
 	{
@@ -1350,6 +1622,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "set-location", "Set location attributes for a Location Aware Firewall Control rule.", "/firewall-control/set-location"),
 	},
 	{
@@ -1360,6 +1634,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "update-configuration", "Change the Firewall Control configuration for a given scope.", "/firewall-control/configuration"),
 	},
 	{
@@ -1370,6 +1646,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "update-firewall-rule-by-category", "Change a Firewall Control rule.", "/firewall-control/{firewall_rule_category}"),
 	},
 	{
@@ -1380,6 +1658,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "add-rule-tags-by-category", "Create a Firewall Rule tag. Create tags to represent Firewall policies - a set of rules in a specific order.", "/firewall-control/{firewall_rule_category}/add-tags"),
 	},
 	{
@@ -1390,6 +1670,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tenant", WireName: "tenant"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-by-category", "Get the Firewall Control configuration for a given scope.", "/firewall-control/{firewall_rule_category}/configuration"),
 	},
 	{
@@ -1400,6 +1682,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "update-by-category", "Change the Firewall Control configuration for a given scope.", "/firewall-control/{firewall_rule_category}/configuration"),
 	},
 	{
@@ -1410,6 +1694,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "by-category", "Copy a set of rules to other scopes. In the filter of the body, enter the properties to define the source.", "/firewall-control/{firewall_rule_category}/copy-rules"),
 	},
 	{
@@ -1420,6 +1706,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "disable-rules-by-category", "Change the status of a set of Firewall Control rules that match the filter to 'Enabled' or 'Disabled'.", "/firewall-control/{firewall_rule_category}/enable"),
 	},
 	{
@@ -1430,6 +1718,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "application__contains", WireName: "application__contains"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "protocol__contains", WireName: "protocol__contains"}, {PublicName: "protocols", WireName: "protocols"}, {PublicName: "statuses", WireName: "statuses"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "applications", WireName: "applications"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tagIds", WireName: "tagIds"}, {PublicName: "directions", WireName: "directions"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "actions", WireName: "actions"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "service__contains", WireName: "service__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "rules-by-category", "Export Firewall Control rules that match the filter to a JSON file from a scope specified by ID (run 'accounts', 'sites'", "/firewall-control/{firewall_rule_category}/export"),
 	},
 	{
@@ -1440,6 +1730,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "rules-by-category", "Import Firewall Control rules from an exported JSON file to scopes specified by ID (run 'accounts', 'sites', 'groups'", "/firewall-control/{firewall_rule_category}/import"),
 	},
 	{
@@ -1450,6 +1742,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "by-category", "Remove Firewall Rules, defined with the ID of the rules (run 'firewall-control')", "/firewall-control/{firewall_rule_category}/move-rules"),
 	},
 	{
@@ -1459,7 +1753,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of protocols that can be used in Firewall Control rules.",
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "get-by-category", "Get a list of protocols that can be used in Firewall Control rules.", "/firewall-control/{firewall_rule_category}/protocols"),
 	},
 	{
@@ -1470,6 +1766,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "remove-rule-tags-by-category", "Remove firewall tags from rules matching the filter.", "/firewall-control/{firewall_rule_category}/remove-tags"),
 	},
 	{
@@ -1480,6 +1778,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "rules-by-category", "Change the order of rules for a scope specified by ID (run 'accounts', 'sites', or 'groups').", "/firewall-control/{firewall_rule_category}/reorder"),
 	},
 	{
@@ -1490,6 +1790,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"firewall_rule_category"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("firewall-control", "by-category", "Set location attributes for a Location Aware Firewall Control rule.", "/firewall-control/{firewall_rule_category}/set-location"),
 	},
 	{
@@ -1500,6 +1802,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "create", "Create a new group. You must create the Group in a Site (run 'sites' to get the Site ID) for which you have permissions.", "/groups"),
 	},
 	{
@@ -1510,6 +1814,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "delete", "Delete a Group given by the required Group ID (run 'groups').", "/groups/{group_id}"),
 	},
 	{
@@ -1519,7 +1825,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get data of groups that match the filter. Best practice: use as narrow a filter as you can.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "registrationToken", WireName: "registrationToken"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "rank", WireName: "rank"}, {PublicName: "query", WireName: "query"}, {PublicName: "isDefault", WireName: "isDefault"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "id", WireName: "id"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "type", WireName: "type"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "registrationToken", WireName: "registrationToken"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "rank", WireName: "rank"}, {PublicName: "query", WireName: "query"}, {PublicName: "isDefault", WireName: "isDefault"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "id", WireName: "id"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "type", WireName: "type"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "get", "Get data of groups that match the filter. Best practice: use as narrow a filter as you can.", "/groups"),
 	},
 	{
@@ -1530,6 +1838,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "get-by-id", "Get data of a given Group. To get a Group ID, run 'groups'.", "/groups/{group_id}"),
 	},
 	{
@@ -1540,6 +1850,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "update", "Change properties of a Group specified by its ID (run 'groups').", "/groups/{group_id}"),
 	},
 	{
@@ -1550,6 +1862,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "update-ranks", "An Agent can belong to only one Group.", "/groups/ranks"),
 	},
 	{
@@ -1560,6 +1874,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "move_agents", "Move Agents that match the filter to a Group. The Group ID (run 'groups') is required and there can be only one.", "/groups/{group_id}/move-agents"),
 	},
 	{
@@ -1570,6 +1886,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "group", "Get the policy of the Group given by ID. To get the ID of a Group, run 'groups'. See also: Get Policy.", "/groups/{group_id}/policy"),
 	},
 	{
@@ -1580,6 +1898,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "update-group", "Change the policy for the Group given by ID. Best practice: Get the policy of the Group before you attempt to change it.", "/groups/{group_id}/policy"),
 	},
 	{
@@ -1590,6 +1910,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "regenerate-group-token", "Get a new Group Token for a static Group.", "/groups/{group_id}/regenerate-key"),
 	},
 	{
@@ -1600,6 +1922,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "revert_policy", "A Group can have a policy that is different from its Site policy.", "/groups/{group_id}/revert-policy"),
 	},
 	{
@@ -1610,6 +1934,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"hash"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hashes", "hash", "[DEPRECATED] Returns hash classification.", "/hashes/{hash}/classification"),
 	},
 	{
@@ -1620,6 +1946,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"hash"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hashes", "hash", "Get the reputation of a hash, given the required SHA1.", "/hashes/{hash}/reputation"),
 	},
 	{
@@ -1629,7 +1957,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the applications, and their data (such as risk level)",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "riskLevels", WireName: "riskLevels"}, {PublicName: "agentIsDecommissioned", WireName: "agentIsDecommissioned"}, {PublicName: "publisher__contains", WireName: "publisher__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "agentComputerName__contains", WireName: "agentComputerName__contains"}, {PublicName: "agentOsVersion__contains", WireName: "agentOsVersion__contains"}, {PublicName: "version__contains", WireName: "version__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "size__between", WireName: "size__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "agentMachineTypesNin", WireName: "agentMachineTypesNin"}, {PublicName: "types", WireName: "types"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "riskLevelsNin", WireName: "riskLevelsNin"}, {PublicName: "typesNin", WireName: "typesNin"}, {PublicName: "agentMachineTypes", WireName: "agentMachineTypes"}, {PublicName: "installedAt__between", WireName: "installedAt__between"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "agentUuid__contains", WireName: "agentUuid__contains"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "riskLevels", WireName: "riskLevels"}, {PublicName: "agentIsDecommissioned", WireName: "agentIsDecommissioned"}, {PublicName: "publisher__contains", WireName: "publisher__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "agentComputerName__contains", WireName: "agentComputerName__contains"}, {PublicName: "agentOsVersion__contains", WireName: "agentOsVersion__contains"}, {PublicName: "version__contains", WireName: "version__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "size__between", WireName: "size__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "agentMachineTypesNin", WireName: "agentMachineTypesNin"}, {PublicName: "types", WireName: "types"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "riskLevelsNin", WireName: "riskLevelsNin"}, {PublicName: "typesNin", WireName: "typesNin"}, {PublicName: "agentMachineTypes", WireName: "agentMachineTypes"}, {PublicName: "installedAt__between", WireName: "installedAt__between"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "agentUuid__contains", WireName: "agentUuid__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("installed-applications", "get", "Get the applications, and their data (such as risk level)", "/installed-applications"),
 	},
 	{
@@ -1639,7 +1969,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get known CVEs for applications that are installed on endpoints with Application Risk-enabled Agents.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "cveIds", WireName: "cveIds"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "applicationIds", WireName: "applicationIds"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "cveIds", WireName: "cveIds"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "applicationIds", WireName: "applicationIds"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("installed-applications", "get-cves", "Get known CVEs for applications that are installed on endpoints with Application Risk-enabled Agents.", "/installed-applications/cves"),
 	},
 	{
@@ -1649,7 +1981,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Syslog message that corresponds to the last activity that matches the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "includeHidden", WireName: "includeHidden"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "ruleIds", WireName: "ruleIds"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "userEmails", WireName: "userEmails"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "alertIds", WireName: "alertIds"}, {PublicName: "threatIds", WireName: "threatIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "includeHidden", WireName: "includeHidden"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "ruleIds", WireName: "ruleIds"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "userEmails", WireName: "userEmails"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "alertIds", WireName: "alertIds"}, {PublicName: "threatIds", WireName: "threatIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("last-activity-as-syslog", "message", "Get the Syslog message that corresponds to the last activity that matches the filter.", "/last-activity-as-syslog"),
 	},
 	{
@@ -1660,6 +1994,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("locations", "create", "Create a location that defines parameters of Agents in a scope filter.", "/locations"),
 	},
 	{
@@ -1670,6 +2006,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("locations", "delete", "Delete location definitions of a given location. To get location IDs, run 'locations'.", "/locations"),
 	},
 	{
@@ -1679,7 +2017,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the locations of Agents in a given scope that match the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "registryKey__contains", WireName: "registryKey__contains"}, {PublicName: "ipAddress__contains", WireName: "ipAddress__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "hasFirewallRules", WireName: "hasFirewallRules"}, {PublicName: "creator__contains", WireName: "creator__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "scopeName__contains", WireName: "scopeName__contains"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "hostname__contains", WireName: "hostname__contains"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "registryKey__contains", WireName: "registryKey__contains"}, {PublicName: "ipAddress__contains", WireName: "ipAddress__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "hasFirewallRules", WireName: "hasFirewallRules"}, {PublicName: "creator__contains", WireName: "creator__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "scopeName__contains", WireName: "scopeName__contains"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "hostname__contains", WireName: "hostname__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "scopes", WireName: "scopes"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("locations", "get", "Get the locations of Agents in a given scope that match the filter.", "/locations"),
 	},
 	{
@@ -1690,6 +2030,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"location_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("locations", "update", "Change the parameter values of a location definition. See Create Location.", "/locations/{location_id}"),
 	},
 	{
@@ -1700,6 +2042,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "add-cred-details", "Add cred details to a cred group.", "/ranger/cred-groups/details"),
 	},
 	{
@@ -1710,6 +2054,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "add-new-deploy-command-for-device-from-agent-from-task-infra", "Creates a new agent deploy command for devices. Used for communication between API service and Task Infra service", "/ranger/auto-deploy/deploy"),
 	},
 	{
@@ -1720,6 +2066,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"inventory_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "change-device-review", "Change the review state of one device.", "/ranger/device-review/{inventory_id}"),
 	},
 	{
@@ -1730,6 +2078,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "change-device-review-in-bulk", "Change the review state of more than one device.", "/ranger/device-review"),
 	},
 	{
@@ -1740,6 +2090,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "change-device-tags", "Change the device tags.", "/ranger/tags"),
 	},
 	{
@@ -1750,6 +2102,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "create-cred-group", "Create a new Cred Group.", "/ranger/cred-groups"),
 	},
 	{
@@ -1760,6 +2114,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"cred_group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "delete-cred-group", "Delete cred group value.", "/ranger/cred-groups/{cred_group_id}"),
 	},
 	{
@@ -1770,6 +2126,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"detail_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "delete-cred-group-detail", "Delete cred group detail value.", "/ranger/cred-groups/details/{detail_id}"),
 	},
 	{
@@ -1780,6 +2138,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "firstSeen__gte", WireName: "firstSeen__gte"}, {PublicName: "lastSeen__gte", WireName: "lastSeen__gte"}, {PublicName: "networkName__contains", WireName: "networkName__contains"}, {PublicName: "deviceTypes", WireName: "deviceTypes"}, {PublicName: "localIp", WireName: "localIp"}, {PublicName: "lastSeen__lt", WireName: "lastSeen__lt"}, {PublicName: "deviceFunction__contains", WireName: "deviceFunction__contains"}, {PublicName: "managedState", WireName: "managedState"}, {PublicName: "discoveryMethods", WireName: "discoveryMethods"}, {PublicName: "knownFingerprintingData", WireName: "knownFingerprintingData"}, {PublicName: "udpPorts__contains", WireName: "udpPorts__contains"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "deviceReviews", WireName: "deviceReviews"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "hostnames__contains", WireName: "hostnames__contains"}, {PublicName: "deviceType", WireName: "deviceType"}, {PublicName: "managedStates", WireName: "managedStates"}, {PublicName: "lastSeen__gt", WireName: "lastSeen__gt"}, {PublicName: "osType", WireName: "osType"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "subnetAddress__contains", WireName: "subnetAddress__contains"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "osName", WireName: "osName"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "firstSeen__lt", WireName: "firstSeen__lt"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "hostnames", WireName: "hostnames"}, {PublicName: "tcpPorts__contains", WireName: "tcpPorts__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastSeen__between", WireName: "lastSeen__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "period", WireName: "period"}, {PublicName: "gatewayMacAddress", WireName: "gatewayMacAddress"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "osVersion", WireName: "osVersion"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "lastSeen__lte", WireName: "lastSeen__lte"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "localIp__contains", WireName: "localIp__contains"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "gatewayMacAddress__contains", WireName: "gatewayMacAddress__contains"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "siteNames", WireName: "siteNames"}, {PublicName: "firstSeen__lte", WireName: "firstSeen__lte"}, {PublicName: "firstSeen__between", WireName: "firstSeen__between"}, {PublicName: "firstSeen__gt", WireName: "firstSeen__gt"}, {PublicName: "networkName", WireName: "networkName"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "export-data", "Export Ranger data to csv. You can set filters to get only relevant data. The response sends the csv data as text.", "/ranger/report/csv"),
 	},
 	{
@@ -1789,7 +2149,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the data for each row in the Cred Groups details table.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "credTypeLike", WireName: "credTypeLike"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "credGroupIds", WireName: "credGroupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "title", WireName: "title"}, {PublicName: "titleLike", WireName: "titleLike"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "credTypeLike", WireName: "credTypeLike"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "credGroupIds", WireName: "credGroupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "title", WireName: "title"}, {PublicName: "titleLike", WireName: "titleLike"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "get-cred-group-details", "Get the data for each row in the Cred Groups details table.", "/ranger/cred-groups/details"),
 	},
 	{
@@ -1799,7 +2161,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the data for each row in the Cred Groups table.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "totalDetails__gt", WireName: "totalDetails__gt"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "groupName", WireName: "groupName"}, {PublicName: "groupNameLike", WireName: "groupNameLike"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "totalDetails__gt", WireName: "totalDetails__gt"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "groupName", WireName: "groupName"}, {PublicName: "groupNameLike", WireName: "groupNameLike"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "get-cred-groups", "Get the data for each row in the Cred Groups table.", "/ranger/cred-groups"),
 	},
 	{
@@ -1809,7 +2173,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the gateways in your deployment that match the filter from a Ranger scan. Ranger requires a Ranger license.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "scanOnlyLocalSubnets", WireName: "scanOnlyLocalSubnets"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "networkName__contains", WireName: "networkName__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "numberOfRangers__between", WireName: "numberOfRangers__between"}, {PublicName: "totalAgents__lt", WireName: "totalAgents__lt"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "icmpScan", WireName: "icmpScan"}, {PublicName: "mdnsScan", WireName: "mdnsScan"}, {PublicName: "new", WireName: "new"}, {PublicName: "numberOfRangers__gte", WireName: "numberOfRangers__gte"}, {PublicName: "connectedRangers__lt", WireName: "connectedRangers__lt"}, {PublicName: "udpPorts__contains", WireName: "udpPorts__contains"}, {PublicName: "smbScan", WireName: "smbScan"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "connectedRangers__between", WireName: "connectedRangers__between"}, {PublicName: "numberOfRangers__lt", WireName: "numberOfRangers__lt"}, {PublicName: "ip", WireName: "ip"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "numberOfAgents__lte", WireName: "numberOfAgents__lte"}, {PublicName: "totalAgents__gte", WireName: "totalAgents__gte"}, {PublicName: "agentPercentage__lt", WireName: "agentPercentage__lt"}, {PublicName: "numberOfAgents__gte", WireName: "numberOfAgents__gte"}, {PublicName: "agentPercentage__between", WireName: "agentPercentage__between"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "rdnsScan", WireName: "rdnsScan"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "totalAgents__lte", WireName: "totalAgents__lte"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "snmpScan", WireName: "snmpScan"}, {PublicName: "agentPercentage__lte", WireName: "agentPercentage__lte"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "numberOfAgents__between", WireName: "numberOfAgents__between"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "connectedRangers__lte", WireName: "connectedRangers__lte"}, {PublicName: "tcpPorts__contains", WireName: "tcpPorts__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "totalAgents__gt", WireName: "totalAgents__gt"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "numberOfRangers__lte", WireName: "numberOfRangers__lte"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "numberOfAgents__lt", WireName: "numberOfAgents__lt"}, {PublicName: "allowScan", WireName: "allowScan"}, {PublicName: "numberOfRangers__gt", WireName: "numberOfRangers__gt"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "totalAgents__between", WireName: "totalAgents__between"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "agentPercentage__gt", WireName: "agentPercentage__gt"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "numberOfAgents__gt", WireName: "numberOfAgents__gt"}, {PublicName: "agentPercentage__gte", WireName: "agentPercentage__gte"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "connectedRangers__gt", WireName: "connectedRangers__gt"}, {PublicName: "connectedRangers__gte", WireName: "connectedRangers__gte"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "ip__contains", WireName: "ip__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "scanOnlyLocalSubnets", WireName: "scanOnlyLocalSubnets"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "networkName__contains", WireName: "networkName__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "numberOfRangers__between", WireName: "numberOfRangers__between"}, {PublicName: "totalAgents__lt", WireName: "totalAgents__lt"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "icmpScan", WireName: "icmpScan"}, {PublicName: "mdnsScan", WireName: "mdnsScan"}, {PublicName: "new", WireName: "new"}, {PublicName: "numberOfRangers__gte", WireName: "numberOfRangers__gte"}, {PublicName: "connectedRangers__lt", WireName: "connectedRangers__lt"}, {PublicName: "udpPorts__contains", WireName: "udpPorts__contains"}, {PublicName: "smbScan", WireName: "smbScan"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "connectedRangers__between", WireName: "connectedRangers__between"}, {PublicName: "numberOfRangers__lt", WireName: "numberOfRangers__lt"}, {PublicName: "ip", WireName: "ip"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "numberOfAgents__lte", WireName: "numberOfAgents__lte"}, {PublicName: "totalAgents__gte", WireName: "totalAgents__gte"}, {PublicName: "agentPercentage__lt", WireName: "agentPercentage__lt"}, {PublicName: "numberOfAgents__gte", WireName: "numberOfAgents__gte"}, {PublicName: "agentPercentage__between", WireName: "agentPercentage__between"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "rdnsScan", WireName: "rdnsScan"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "totalAgents__lte", WireName: "totalAgents__lte"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "snmpScan", WireName: "snmpScan"}, {PublicName: "agentPercentage__lte", WireName: "agentPercentage__lte"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "numberOfAgents__between", WireName: "numberOfAgents__between"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "connectedRangers__lte", WireName: "connectedRangers__lte"}, {PublicName: "tcpPorts__contains", WireName: "tcpPorts__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "totalAgents__gt", WireName: "totalAgents__gt"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "numberOfRangers__lte", WireName: "numberOfRangers__lte"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "numberOfAgents__lt", WireName: "numberOfAgents__lt"}, {PublicName: "allowScan", WireName: "allowScan"}, {PublicName: "numberOfRangers__gt", WireName: "numberOfRangers__gt"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "totalAgents__between", WireName: "totalAgents__between"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "agentPercentage__gt", WireName: "agentPercentage__gt"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "numberOfAgents__gt", WireName: "numberOfAgents__gt"}, {PublicName: "agentPercentage__gte", WireName: "agentPercentage__gte"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "connectedRangers__gt", WireName: "connectedRangers__gt"}, {PublicName: "connectedRangers__gte", WireName: "connectedRangers__gte"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "ip__contains", WireName: "ip__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "get-gateways", "Get the gateways in your deployment that match the filter from a Ranger scan. Ranger requires a Ranger license.", "/ranger/gateways"),
 	},
 	{
@@ -1820,6 +2186,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "get-settings", "Ranger gives full visibility of all devices connected to your network.", "/ranger/settings"),
 	},
 	{
@@ -1829,7 +2197,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the data for each row in the Ranger Device Inventory Table. Best practice: Set filters.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "firstSeen__gte", WireName: "firstSeen__gte"}, {PublicName: "lastSeen__gte", WireName: "lastSeen__gte"}, {PublicName: "networkName__contains", WireName: "networkName__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "localIp", WireName: "localIp"}, {PublicName: "deviceTypes", WireName: "deviceTypes"}, {PublicName: "lastSeen__lt", WireName: "lastSeen__lt"}, {PublicName: "managedState", WireName: "managedState"}, {PublicName: "discoveryMethods", WireName: "discoveryMethods"}, {PublicName: "deviceFunction__contains", WireName: "deviceFunction__contains"}, {PublicName: "knownFingerprintingData", WireName: "knownFingerprintingData"}, {PublicName: "udpPorts__contains", WireName: "udpPorts__contains"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "deviceReviews", WireName: "deviceReviews"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "hostnames__contains", WireName: "hostnames__contains"}, {PublicName: "deviceType", WireName: "deviceType"}, {PublicName: "managedStates", WireName: "managedStates"}, {PublicName: "lastSeen__gt", WireName: "lastSeen__gt"}, {PublicName: "osType", WireName: "osType"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "subnetAddress__contains", WireName: "subnetAddress__contains"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "osName", WireName: "osName"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "firstSeen__lt", WireName: "firstSeen__lt"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "hostnames", WireName: "hostnames"}, {PublicName: "tcpPorts__contains", WireName: "tcpPorts__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastSeen__between", WireName: "lastSeen__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "period", WireName: "period"}, {PublicName: "gatewayMacAddress", WireName: "gatewayMacAddress"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "osVersion", WireName: "osVersion"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "lastSeen__lte", WireName: "lastSeen__lte"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "localIp__contains", WireName: "localIp__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "gatewayMacAddress__contains", WireName: "gatewayMacAddress__contains"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "siteNames", WireName: "siteNames"}, {PublicName: "firstSeen__lte", WireName: "firstSeen__lte"}, {PublicName: "firstSeen__between", WireName: "firstSeen__between"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "firstSeen__gt", WireName: "firstSeen__gt"}, {PublicName: "networkName", WireName: "networkName"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "firstSeen__gte", WireName: "firstSeen__gte"}, {PublicName: "lastSeen__gte", WireName: "lastSeen__gte"}, {PublicName: "networkName__contains", WireName: "networkName__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "localIp", WireName: "localIp"}, {PublicName: "deviceTypes", WireName: "deviceTypes"}, {PublicName: "lastSeen__lt", WireName: "lastSeen__lt"}, {PublicName: "managedState", WireName: "managedState"}, {PublicName: "discoveryMethods", WireName: "discoveryMethods"}, {PublicName: "deviceFunction__contains", WireName: "deviceFunction__contains"}, {PublicName: "knownFingerprintingData", WireName: "knownFingerprintingData"}, {PublicName: "udpPorts__contains", WireName: "udpPorts__contains"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "deviceReviews", WireName: "deviceReviews"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "hostnames__contains", WireName: "hostnames__contains"}, {PublicName: "deviceType", WireName: "deviceType"}, {PublicName: "managedStates", WireName: "managedStates"}, {PublicName: "lastSeen__gt", WireName: "lastSeen__gt"}, {PublicName: "osType", WireName: "osType"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "subnetAddress__contains", WireName: "subnetAddress__contains"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "osName", WireName: "osName"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "firstSeen__lt", WireName: "firstSeen__lt"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "hostnames", WireName: "hostnames"}, {PublicName: "tcpPorts__contains", WireName: "tcpPorts__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastSeen__between", WireName: "lastSeen__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "period", WireName: "period"}, {PublicName: "gatewayMacAddress", WireName: "gatewayMacAddress"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "osVersion", WireName: "osVersion"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "lastSeen__lte", WireName: "lastSeen__lte"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "localIp__contains", WireName: "localIp__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "gatewayMacAddress__contains", WireName: "gatewayMacAddress__contains"}, {PublicName: "tagName__contains", WireName: "tagName__contains"}, {PublicName: "siteNames", WireName: "siteNames"}, {PublicName: "firstSeen__lte", WireName: "firstSeen__lte"}, {PublicName: "firstSeen__between", WireName: "firstSeen__between"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "firstSeen__gt", WireName: "firstSeen__gt"}, {PublicName: "networkName", WireName: "networkName"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "get-table", "Get the data for each row in the Ranger Device Inventory Table. Best practice: Set filters.", "/ranger/table-view"),
 	},
 	{
@@ -1840,6 +2210,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"cred_group_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "update-cred-group", "Update cred group values.", "/ranger/cred-groups/{cred_group_id}"),
 	},
 	{
@@ -1850,6 +2222,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"detail_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "update-cred-group-details", "Update cred group values.", "/ranger/cred-groups/details/{detail_id}"),
 	},
 	{
@@ -1860,6 +2234,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"gateway_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "update-gateway", "Change the Ranger scan configuration for a gateway that Ranger discovered", "/ranger/gateways/{gateway_id}"),
 	},
 	{
@@ -1870,6 +2246,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "update-gateways", "Change the status of filtered gateways discovered by Ranger.", "/ranger/gateways/update"),
 	},
 	{
@@ -1880,6 +2258,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "update-settings", "Change the Ranger Settings. Best Practice: Get the current settings before you change them. See: Get Ranger Settings.", "/ranger/settings"),
 	},
 	{
@@ -1890,6 +2270,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"inventory_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "export-raw-data", "Export the raw data for one device, by its ID in the Device Inventory Data.", "/ranger/{inventory_id}/json/export"),
 	},
 	{
@@ -1900,6 +2282,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"inventory_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("ranger", "raw-data", "Get a json string with the Ranger data for one device, by ID in the Device Inventory Data.", "/ranger/{inventory_id}/json"),
 	},
 	{
@@ -1910,6 +2294,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rbac", "create-new-role", "Create a new role for Role-Based Access Control (RBAC).", "/rbac/role"),
 	},
 	{
@@ -1920,6 +2306,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"role_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rbac", "delete-role", "With the ID of a role (see Get All Roles), you can delete a role.", "/rbac/role/{role_id}"),
 	},
 	{
@@ -1929,7 +2317,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "See roles assigned to users that match the filter, a basic description of the roles",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "accountName", WireName: "accountName"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "usersInRoles", WireName: "usersInRoles"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "created_by_name", WireName: "created_by_name"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "siteName", WireName: "siteName"}, {PublicName: "updatedAt", WireName: "updatedAt"}, {PublicName: "updatedById", WireName: "updatedById"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "description", WireName: "description"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "updatedBy", WireName: "updatedBy"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt", WireName: "createdAt"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "created_by_id", WireName: "created_by_id"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "accountName", WireName: "accountName"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "usersInRoles", WireName: "usersInRoles"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "created_by_name", WireName: "created_by_name"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "siteName", WireName: "siteName"}, {PublicName: "updatedAt", WireName: "updatedAt"}, {PublicName: "updatedById", WireName: "updatedById"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "description", WireName: "description"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "updatedBy", WireName: "updatedBy"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt", WireName: "createdAt"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "created_by_id", WireName: "created_by_id"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rbac", "get-all-roles", "See roles assigned to users that match the filter, a basic description of the roles", "/rbac/roles"),
 	},
 	{
@@ -1940,6 +2330,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"role_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "name", WireName: "name"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "query", WireName: "query"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rbac", "get-specific-role-definition", "With the ID of a role (see Get All Roles) you can see the permissions of that role.", "/rbac/role/{role_id}"),
 	},
 	{
@@ -1950,6 +2342,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tenant", WireName: "tenant"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rbac", "get-template-for-new-role", "Get the template for a new role.", "/rbac/role"),
 	},
 	{
@@ -1960,6 +2354,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"role_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rbac", "update-role", "With the ID of a role (see Get All Roles), you can update the permissions of users with this role.", "/rbac/role/{role_id}"),
 	},
 	{
@@ -1969,7 +2365,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the SentinelOne scripts from the Script Library.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "cursor", WireName: "cursor"}, {PublicName: "scriptType", WireName: "scriptType"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "scriptType", WireName: "scriptType"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("remote-scripts", "get-scripts", "Get the SentinelOne scripts from the Script Library.", "/remote-scripts"),
 	},
 	{
@@ -1980,6 +2378,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("remote-scripts", "run", "Run remote script", "/remote-scripts/execute"),
 	},
 	{
@@ -1990,6 +2390,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("remote-scripts", "upload-a-new-script", "Upload a new script", "/remote-scripts"),
 	},
 	{
@@ -2000,6 +2402,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("report-tasks", "create", "Create a task to generate a report immediately, one time in the future, or on a schedule.", "/report-tasks"),
 	},
 	{
@@ -2009,7 +2413,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the tasks that were done to generate reports and to schedule future reports. Best Practice: Use a filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "creatorName", WireName: "creatorName"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "id", WireName: "id"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "frequency", WireName: "frequency"}, {PublicName: "scheduleType", WireName: "scheduleType"}, {PublicName: "day", WireName: "day"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "creatorId", WireName: "creatorId"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "creatorName", WireName: "creatorName"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "id", WireName: "id"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "frequency", WireName: "frequency"}, {PublicName: "scheduleType", WireName: "scheduleType"}, {PublicName: "day", WireName: "day"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "creatorId", WireName: "creatorId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("report-tasks", "get", "Get the tasks that were done to generate reports and to schedule future reports. Best Practice: Use a filter.", "/report-tasks"),
 	},
 	{
@@ -2020,6 +2426,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"task_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("report-tasks", "update", "Update the report task of the given ID. To get the task ID, and the data to change, run Get Report Tasks.", "/report-tasks/{task_id}"),
 	},
 	{
@@ -2030,6 +2438,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "delete", "Delete the reports that match the filter. To delete a specific report, use its ID (see Get Reports).", "/reports/delete-reports"),
 	},
 	{
@@ -2040,6 +2450,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "delete-tasks", "You can schedule a report to be generated on a routine.", "/reports/delete-tasks"),
 	},
 	{
@@ -2050,6 +2462,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"report_format", "report_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "download", "When the Management generates a report, it is uploaded to the Management Console.", "/reports/{report_id}/{report_format}"),
 	},
 	{
@@ -2059,7 +2473,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the reports that match the filter and the data of the reports.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "toDate", WireName: "toDate"}, {PublicName: "interval", WireName: "interval"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "fromDate", WireName: "fromDate"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "taskId", WireName: "taskId"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "id", WireName: "id"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "frequency", WireName: "frequency"}, {PublicName: "scheduleType", WireName: "scheduleType"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "toDate", WireName: "toDate"}, {PublicName: "interval", WireName: "interval"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "fromDate", WireName: "fromDate"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "taskId", WireName: "taskId"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "id", WireName: "id"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "frequency", WireName: "frequency"}, {PublicName: "scheduleType", WireName: "scheduleType"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "get", "Get the reports that match the filter and the data of the reports.", "/reports"),
 	},
 	{
@@ -2070,6 +2486,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "forceUpdate", WireName: "forceUpdate"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("reports", "get-insight", "Get the Insight Report types.", "/reports/insights/types"),
 	},
 	{
@@ -2080,6 +2498,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("restrictions", "create-blacklist-item", "Create a blacklist item for a SHA1 hash, for the scopes you enter in the filter fields.", "/restrictions"),
 	},
 	{
@@ -2090,6 +2510,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("restrictions", "delete-blacklist-item", "Agents immediately identify files on the blacklist and block them from executing.", "/restrictions"),
 	},
 	{
@@ -2099,7 +2521,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of all the items in the Blacklist that match the filter.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "modes", WireName: "modes"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "types", WireName: "types"}, {PublicName: "unified", WireName: "unified"}, {PublicName: "source", WireName: "source"}, {PublicName: "value__contains", WireName: "value__contains"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "recommendations", WireName: "recommendations"}, {PublicName: "value", WireName: "value"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "type", WireName: "type"}, {PublicName: "user__contains", WireName: "user__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "includeParents", WireName: "includeParents"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "modes", WireName: "modes"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "includeChildren", WireName: "includeChildren"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "types", WireName: "types"}, {PublicName: "unified", WireName: "unified"}, {PublicName: "source", WireName: "source"}, {PublicName: "value__contains", WireName: "value__contains"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "recommendations", WireName: "recommendations"}, {PublicName: "value", WireName: "value"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "type", WireName: "type"}, {PublicName: "user__contains", WireName: "user__contains"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("restrictions", "get-blacklist", "Get a list of all the items in the Blacklist that match the filter.", "/restrictions"),
 	},
 	{
@@ -2110,6 +2534,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("restrictions", "update-blacklist-item", "Change the properties of a Blacklist item through the data fields.", "/restrictions"),
 	},
 	{
@@ -2120,6 +2546,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("restrictions", "validate-blacklist-item", "Check if a hash is on the list of SentinelOne items that are 'Not Allowed' or 'Not Recommended'.", "/restrictions/validate"),
 	},
 	{
@@ -2130,6 +2558,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "firstSeen__gte", WireName: "firstSeen__gte"}, {PublicName: "lastSeen__gte", WireName: "lastSeen__gte"}, {PublicName: "deviceTypes", WireName: "deviceTypes"}, {PublicName: "localIp", WireName: "localIp"}, {PublicName: "lastSeen__lt", WireName: "lastSeen__lt"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "hostnames__contains", WireName: "hostnames__contains"}, {PublicName: "deviceType", WireName: "deviceType"}, {PublicName: "lastSeen__gt", WireName: "lastSeen__gt"}, {PublicName: "osType", WireName: "osType"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "osName", WireName: "osName"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "firstSeen__lt", WireName: "firstSeen__lt"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "hostnames", WireName: "hostnames"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastSeen__between", WireName: "lastSeen__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "osVersion", WireName: "osVersion"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "lastSeen__lte", WireName: "lastSeen__lte"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "localIp__contains", WireName: "localIp__contains"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "firstSeen__lte", WireName: "firstSeen__lte"}, {PublicName: "firstSeen__gt", WireName: "firstSeen__gt"}, {PublicName: "firstSeen__between", WireName: "firstSeen__between"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rogues", "export-data", "Export Rogues data to CSV. You can set filters to get only relevant data. The response sends the CSV data as text.", "/rogues/report/csv"),
 	},
 	{
@@ -2140,6 +2570,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rogues", "get-settings", "Rogues gives full visibility of all unsecured devices connected to your network.", "/rogues/settings"),
 	},
 	{
@@ -2149,7 +2581,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the data for each row in the Rogues Device Inventory Table. <BR>Best practice: Set filters.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "firstSeen__gte", WireName: "firstSeen__gte"}, {PublicName: "lastSeen__gte", WireName: "lastSeen__gte"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "localIp", WireName: "localIp"}, {PublicName: "deviceTypes", WireName: "deviceTypes"}, {PublicName: "lastSeen__lt", WireName: "lastSeen__lt"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "hostnames__contains", WireName: "hostnames__contains"}, {PublicName: "deviceType", WireName: "deviceType"}, {PublicName: "lastSeen__gt", WireName: "lastSeen__gt"}, {PublicName: "osType", WireName: "osType"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "osName", WireName: "osName"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "firstSeen__lt", WireName: "firstSeen__lt"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "hostnames", WireName: "hostnames"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastSeen__between", WireName: "lastSeen__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "osVersion", WireName: "osVersion"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "lastSeen__lte", WireName: "lastSeen__lte"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "localIp__contains", WireName: "localIp__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "firstSeen__lte", WireName: "firstSeen__lte"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "firstSeen__gt", WireName: "firstSeen__gt"}, {PublicName: "firstSeen__between", WireName: "firstSeen__between"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "firstSeen__gte", WireName: "firstSeen__gte"}, {PublicName: "lastSeen__gte", WireName: "lastSeen__gte"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "localIp", WireName: "localIp"}, {PublicName: "deviceTypes", WireName: "deviceTypes"}, {PublicName: "lastSeen__lt", WireName: "lastSeen__lt"}, {PublicName: "macAddress__contains", WireName: "macAddress__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "hostnames__contains", WireName: "hostnames__contains"}, {PublicName: "deviceType", WireName: "deviceType"}, {PublicName: "lastSeen__gt", WireName: "lastSeen__gt"}, {PublicName: "osType", WireName: "osType"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "manufacturer", WireName: "manufacturer"}, {PublicName: "osName", WireName: "osName"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "firstSeen__lt", WireName: "firstSeen__lt"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "macAddress", WireName: "macAddress"}, {PublicName: "hostnames", WireName: "hostnames"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastSeen__between", WireName: "lastSeen__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "osVersion", WireName: "osVersion"}, {PublicName: "externalIp", WireName: "externalIp"}, {PublicName: "lastSeen__lte", WireName: "lastSeen__lte"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "localIp__contains", WireName: "localIp__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "manufacturer__contains", WireName: "manufacturer__contains"}, {PublicName: "firstSeen__lte", WireName: "firstSeen__lte"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "firstSeen__gt", WireName: "firstSeen__gt"}, {PublicName: "firstSeen__between", WireName: "firstSeen__between"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rogues", "get-table", "Get the data for each row in the Rogues Device Inventory Table. <BR>Best practice: Set filters.", "/rogues/table-view"),
 	},
 	{
@@ -2160,6 +2594,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("rogues", "update-settings", "Change the Rogues Settings. Best Practice: Get the current settings before you change them. See: Get Rogues Settings.", "/rogues/settings"),
 	},
 	{
@@ -2170,6 +2606,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "threatIds", WireName: "threatIds"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "userIds", WireName: "userIds"}, {PublicName: "ruleIds", WireName: "ruleIds"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "rowsLimit", WireName: "rowsLimit"}, {PublicName: "userEmails", WireName: "userEmails"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "alertIds", WireName: "alertIds"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "includeHidden", WireName: "includeHidden"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sentinelone-export", "activities", "Export the list of activities.", "/export/activities"),
 	},
 	{
@@ -2180,6 +2618,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "K8SNodeName__contains", WireName: "K8SNodeName__contains"}, {PublicName: "coreCount__lt", WireName: "coreCount__lt"}, {PublicName: "rangerStatuses", WireName: "rangerStatuses"}, {PublicName: "adUserQuery__contains", WireName: "adUserQuery__contains"}, {PublicName: "rangerVersionsNin", WireName: "rangerVersionsNin"}, {PublicName: "rangerStatusesNin", WireName: "rangerStatusesNin"}, {PublicName: "coreCount__gte", WireName: "coreCount__gte"}, {PublicName: "threatCreatedAt__gte", WireName: "threatCreatedAt__gte"}, {PublicName: "decommissionedAt__lte", WireName: "decommissionedAt__lte"}, {PublicName: "operationalStatesNin", WireName: "operationalStatesNin"}, {PublicName: "appsVulnerabilityStatusesNin", WireName: "appsVulnerabilityStatusesNin"}, {PublicName: "mitigationMode", WireName: "mitigationMode"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "gatewayIp", WireName: "gatewayIp"}, {PublicName: "cloudImage__contains", WireName: "cloudImage__contains"}, {PublicName: "registeredAt__between", WireName: "registeredAt__between"}, {PublicName: "threatMitigationStatus", WireName: "threatMitigationStatus"}, {PublicName: "installerTypesNin", WireName: "installerTypesNin"}, {PublicName: "appsVulnerabilityStatuses", WireName: "appsVulnerabilityStatuses"}, {PublicName: "threatResolved", WireName: "threatResolved"}, {PublicName: "mitigationModeSuspicious", WireName: "mitigationModeSuspicious"}, {PublicName: "isUpToDate", WireName: "isUpToDate"}, {PublicName: "adComputerQuery__contains", WireName: "adComputerQuery__contains"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "azureResourceGroup__contains", WireName: "azureResourceGroup__contains"}, {PublicName: "scanStatus", WireName: "scanStatus"}, {PublicName: "threatContentHash", WireName: "threatContentHash"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "threatRebootRequired", WireName: "threatRebootRequired"}, {PublicName: "totalMemory__between", WireName: "totalMemory__between"}, {PublicName: "firewallEnabled", WireName: "firewallEnabled"}, {PublicName: "gcpServiceAccount__contains", WireName: "gcpServiceAccount__contains"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "remoteProfilingStates", WireName: "remoteProfilingStates"}, {PublicName: "filteredGroupIds", WireName: "filteredGroupIds"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "activeThreats", WireName: "activeThreats"}, {PublicName: "machineTypesNin", WireName: "machineTypesNin"}, {PublicName: "lastActiveDate__gt", WireName: "lastActiveDate__gt"}, {PublicName: "awsSubnetIds__contains", WireName: "awsSubnetIds__contains"}, {PublicName: "installerTypes", WireName: "installerTypes"}, {PublicName: "registeredAt__gte", WireName: "registeredAt__gte"}, {PublicName: "migrationStatus", WireName: "migrationStatus"}, {PublicName: "cloudTags__contains", WireName: "cloudTags__contains"}, {PublicName: "totalMemory__gte", WireName: "totalMemory__gte"}, {PublicName: "decommissionedAt__lt", WireName: "decommissionedAt__lt"}, {PublicName: "threatCreatedAt__lt", WireName: "threatCreatedAt__lt"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "osArch", WireName: "osArch"}, {PublicName: "registeredAt__gt", WireName: "registeredAt__gt"}, {PublicName: "registeredAt__lt", WireName: "registeredAt__lt"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "networkInterfaceInet__contains", WireName: "networkInterfaceInet__contains"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "uuids", WireName: "uuids"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "scanStatusesNin", WireName: "scanStatusesNin"}, {PublicName: "cpuCount__lte", WireName: "cpuCount__lte"}, {PublicName: "locationIds", WireName: "locationIds"}, {PublicName: "awsSecurityGroups__contains", WireName: "awsSecurityGroups__contains"}, {PublicName: "networkStatusesNin", WireName: "networkStatusesNin"}, {PublicName: "activeThreats__gt", WireName: "activeThreats__gt"}, {PublicName: "infected", WireName: "infected"}, {PublicName: "osVersion__contains", WireName: "osVersion__contains"}, {PublicName: "machineTypes", WireName: "machineTypes"}, {PublicName: "agentPodName__contains", WireName: "agentPodName__contains"}, {PublicName: "computerName__like", WireName: "computerName__like"}, {PublicName: "threatCreatedAt__gt", WireName: "threatCreatedAt__gt"}, {PublicName: "consoleMigrationStatusesNin", WireName: "consoleMigrationStatusesNin"}, {PublicName: "computerName", WireName: "computerName"}, {PublicName: "decommissionedAt__between", WireName: "decommissionedAt__between"}, {PublicName: "cloudInstanceId__contains", WireName: "cloudInstanceId__contains"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "coreCount__between", WireName: "coreCount__between"}, {PublicName: "totalMemory__lte", WireName: "totalMemory__lte"}, {PublicName: "remoteProfilingStatesNin", WireName: "remoteProfilingStatesNin"}, {PublicName: "adComputerMember__contains", WireName: "adComputerMember__contains"}, {PublicName: "threatCreatedAt__between", WireName: "threatCreatedAt__between"}, {PublicName: "totalMemory__gt", WireName: "totalMemory__gt"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "updatedAt__between", WireName: "updatedAt__between"}, {PublicName: "locationEnabled", WireName: "locationEnabled"}, {PublicName: "locationIdsNin", WireName: "locationIdsNin"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "encryptedApplications", WireName: "encryptedApplications"}, {PublicName: "filterId", WireName: "filterId"}, {PublicName: "decommissionedAt__gt", WireName: "decommissionedAt__gt"}, {PublicName: "adUserMember__contains", WireName: "adUserMember__contains"}, {PublicName: "uuid", WireName: "uuid"}, {PublicName: "coreCount__lte", WireName: "coreCount__lte"}, {PublicName: "coreCount__gt", WireName: "coreCount__gt"}, {PublicName: "cloudNetwork__contains", WireName: "cloudNetwork__contains"}, {PublicName: "clusterName__contains", WireName: "clusterName__contains"}, {PublicName: "cpuCount__gte", WireName: "cpuCount__gte"}, {PublicName: "query", WireName: "query"}, {PublicName: "lastActiveDate__between", WireName: "lastActiveDate__between"}, {PublicName: "rangerStatus", WireName: "rangerStatus"}, {PublicName: "domains", WireName: "domains"}, {PublicName: "cloudProvider", WireName: "cloudProvider"}, {PublicName: "lastActiveDate__lt", WireName: "lastActiveDate__lt"}, {PublicName: "scanStatuses", WireName: "scanStatuses"}, {PublicName: "hasLocalConfiguration", WireName: "hasLocalConfiguration"}, {PublicName: "networkStatuses", WireName: "networkStatuses"}, {PublicName: "isPendingUninstall", WireName: "isPendingUninstall"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "cpuCount__lt", WireName: "cpuCount__lt"}, {PublicName: "consoleMigrationStatuses", WireName: "consoleMigrationStatuses"}, {PublicName: "adQuery", WireName: "adQuery"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "adComputerName__contains", WireName: "adComputerName__contains"}, {PublicName: "cloudInstanceSize__contains", WireName: "cloudInstanceSize__contains"}, {PublicName: "registeredAt__lte", WireName: "registeredAt__lte"}, {PublicName: "networkQuarantineEnabled", WireName: "networkQuarantineEnabled"}, {PublicName: "cloudAccount__contains", WireName: "cloudAccount__contains"}, {PublicName: "cloudLocation__contains", WireName: "cloudLocation__contains"}, {PublicName: "rangerVersions", WireName: "rangerVersions"}, {PublicName: "networkInterfaceGatewayMacAddress__contains", WireName: "networkInterfaceGatewayMacAddress__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "agentNamespace__contains", WireName: "agentNamespace__contains"}, {PublicName: "K8SNodeLabels__contains", WireName: "K8SNodeLabels__contains"}, {PublicName: "adQuery__contains", WireName: "adQuery__contains"}, {PublicName: "K8SType__contains", WireName: "K8SType__contains"}, {PublicName: "totalMemory__lt", WireName: "totalMemory__lt"}, {PublicName: "externalId__contains", WireName: "externalId__contains"}, {PublicName: "filteredSiteIds", WireName: "filteredSiteIds"}, {PublicName: "decommissionedAt__gte", WireName: "decommissionedAt__gte"}, {PublicName: "cpuCount__gt", WireName: "cpuCount__gt"}, {PublicName: "threatHidden", WireName: "threatHidden"}, {PublicName: "isUninstalled", WireName: "isUninstalled"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "lastActiveDate__lte", WireName: "lastActiveDate__lte"}, {PublicName: "adUserName__contains", WireName: "adUserName__contains"}, {PublicName: "isActive", WireName: "isActive"}, {PublicName: "userActionsNeeded", WireName: "userActionsNeeded"}, {PublicName: "threatCreatedAt__lte", WireName: "threatCreatedAt__lte"}, {PublicName: "domainsNin", WireName: "domainsNin"}, {PublicName: "operationalStates", WireName: "operationalStates"}, {PublicName: "externalIp__contains", WireName: "externalIp__contains"}, {PublicName: "isDecommissioned", WireName: "isDecommissioned"}, {PublicName: "networkInterfacePhysical__contains", WireName: "networkInterfacePhysical__contains"}, {PublicName: "lastActiveDate__gte", WireName: "lastActiveDate__gte"}, {PublicName: "createdAt__between", WireName: "createdAt__between"}, {PublicName: "cpuCount__between", WireName: "cpuCount__between"}, {PublicName: "lastLoggedInUserName__contains", WireName: "lastLoggedInUserName__contains"}, {PublicName: "awsRole__contains", WireName: "awsRole__contains"}, {PublicName: "K8SVersion__contains", WireName: "K8SVersion__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sentinelone-export", "agents", "Export Agent data to a CSV, for Agents that match the filter.", "/export/agents"),
 	},
 	{
@@ -2190,6 +2630,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "eventId", WireName: "eventId"}, {PublicName: "eventSubTypes", WireName: "eventSubTypes"}, {PublicName: "format", WireName: "format"}, {PublicName: "processName__like", WireName: "processName__like"}, {PublicName: "eventTypes", WireName: "eventTypes"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sentinelone-export", "events", "Export threat events in CSV or JSON format.", "/export/threats/{threat_id}/explore/events"),
 	},
 	{
@@ -2200,6 +2642,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "riskLevels", WireName: "riskLevels"}, {PublicName: "agentIsDecommissioned", WireName: "agentIsDecommissioned"}, {PublicName: "publisher__contains", WireName: "publisher__contains"}, {PublicName: "agentComputerName__contains", WireName: "agentComputerName__contains"}, {PublicName: "agentOsVersion__contains", WireName: "agentOsVersion__contains"}, {PublicName: "version__contains", WireName: "version__contains"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "size__between", WireName: "size__between"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "agentMachineTypesNin", WireName: "agentMachineTypesNin"}, {PublicName: "types", WireName: "types"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "riskLevelsNin", WireName: "riskLevelsNin"}, {PublicName: "typesNin", WireName: "typesNin"}, {PublicName: "agentMachineTypes", WireName: "agentMachineTypes"}, {PublicName: "installedAt__between", WireName: "installedAt__between"}, {PublicName: "agentUuid__contains", WireName: "agentUuid__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sentinelone-export", "list-installed-applications", "Export the list of applications installed on endpoints with Application Risk-enabled Agents and their properties", "/export/installed-applications"),
 	},
 	{
@@ -2210,6 +2654,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sentinelone-export", "threat-timeline", "Export a threat's timeline.", "/export/threats/{threat_id}/timeline"),
 	},
 	{
@@ -2220,6 +2666,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sentinelonerss", "s1-rss-feed", "Get the SentinelOne RSS feed. In the SentinelOne Management Console, we show the feed contents in the Dashboard.", "/sentinelonerss"),
 	},
 	{
@@ -2230,6 +2678,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "clear-pending-emails", "Clear (discard without sending) pending email notifications for the given Sites (to get the IDs, run 'sites')", "/settings/notifications/cancel-pending-emails"),
 	},
 	{
@@ -2240,6 +2690,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"recipient_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "delete-notification-recipient", "Delete a notification recipient by ID. To get the IDs of recipients, run 'recipients' (see Get Notification Recipients).", "/settings/recipients/{recipient_id}"),
 	},
 	{
@@ -2250,6 +2702,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-ad", "Get the Global Active Directory settings.", "/settings/active-directory"),
 	},
 	{
@@ -2260,6 +2714,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-ad-fqdns", "Get the map of Active Directory FQDNs to user roles of the given Sites (use 'sites' to get IDs) or Accounts ('accounts')", "/settings/active-directory/scope-mapping"),
 	},
 	{
@@ -2270,6 +2726,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-microsoft", "[DEPRECATED] Gets the Microsoft settings of the Sites or Accounts.", "/settings/microsoft"),
 	},
 	{
@@ -2280,6 +2738,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-notification", "Get the notification settings for the given Sites (to get the IDs, run 'settings') or Accounts ('accounts').", "/settings/notifications"),
 	},
 	{
@@ -2290,6 +2750,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "name", WireName: "name"}, {PublicName: "sms", WireName: "sms"}, {PublicName: "email", WireName: "email"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-notification-recipients", "Get the emails that are configured to receive notifications.", "/settings/recipients"),
 	},
 	{
@@ -2300,6 +2762,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-sms", "[DEPRECATED] Gets the site's SMS settings.", "/settings/sms"),
 	},
 	{
@@ -2310,6 +2774,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-smtp", "Get the SMTP server configuration of the given Sites (to get the IDs, run 'sites') or Accounts ('accounts').", "/settings/smtp"),
 	},
 	{
@@ -2320,6 +2786,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-sso", "Get the Single Sign-On configuration for the given Sites (to get the IDs, run 'sites') or Accounts ('accounts').", "/settings/sso"),
 	},
 	{
@@ -2330,6 +2798,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "get-syslog", "Get the configuration of the syslog server integrated with the given Sites (to get the IDs, run 'sites')", "/settings/syslog"),
 	},
 	{
@@ -2340,6 +2810,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-ad", "Update the Global Active Directory settings.", "/settings/active-directory"),
 	},
 	{
@@ -2350,6 +2822,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-ad-fqdns", "Update the Active Directory FQDNs of a Site or Account.", "/settings/active-directory/scope-mapping"),
 	},
 	{
@@ -2360,6 +2834,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-microsoft", "[DEPRECATED] Update Microsoft settings for the given Sites or Accounts.", "/settings/microsoft"),
 	},
 	{
@@ -2370,6 +2846,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-notification", "Change the notifications for the given Sites (to get the IDs, run 'settings') or Accounts ('accounts').", "/settings/notifications"),
 	},
 	{
@@ -2380,6 +2858,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-notification-recipients", "Set the emails of recipients to get notifications.", "/settings/recipients"),
 	},
 	{
@@ -2390,6 +2870,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-sms", "[DEPRECATED] Set SMS settings.", "/settings/sms"),
 	},
 	{
@@ -2400,6 +2882,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-smtp", "Change the SMTP server configuration for the given Sites or Accounts.", "/settings/smtp"),
 	},
 	{
@@ -2410,6 +2894,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-sso", "Change the Single Sign-On configuration for the given Sites (to get the IDs, run 'sites') or Accounts ('accounts').", "/settings/sso"),
 	},
 	{
@@ -2420,6 +2906,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "set-syslog", "Change the configuration of the syslog server of the given Sites (to get the IDs, run 'sites') or Accounts ('accounts').", "/settings/syslog"),
 	},
 	{
@@ -2430,6 +2918,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "test-ad", "Test Active Directory settings.", "/settings/active-directory/test"),
 	},
 	{
@@ -2440,6 +2930,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "test-microsoft", "[DEPRECATED] Test Microsoft settings.", "/settings/microsoft/test"),
 	},
 	{
@@ -2450,6 +2942,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "test-smtp", "Test SMTP settings between the Management and the SMTP server.", "/settings/smtp/test"),
 	},
 	{
@@ -2460,6 +2954,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "test-sso", "Test Single Sign-On settings.", "/settings/sso/test"),
 	},
 	{
@@ -2470,6 +2966,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("settings", "test-syslog", "Test Syslog settings. The Management tests the connection to the Syslog server.", "/settings/syslog/test"),
 	},
 	{
@@ -2480,6 +2978,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "delete-marketplace-application", "Delete application integration from your Marketplace.", "/singularity-marketplace/applications"),
 	},
 	{
@@ -2490,6 +2990,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"mode"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "enable-or-disable-application", "Use this command to enable or disable application integrations that match the filter.", "/singularity-marketplace/applications/{mode}"),
 	},
 	{
@@ -2500,6 +3002,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "description__contains", WireName: "description__contains"}, {PublicName: "id", WireName: "id"}, {PublicName: "category__contains", WireName: "category__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "name__contains", WireName: "name__contains"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "get-applications-catalog", "Get the Marketplace Application Catalog.", "/singularity-marketplace/applications-catalog"),
 	},
 	{
@@ -2510,6 +3014,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"application_catalog_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "get-configuration-fields", "Get the Catalog Application Configuration Fields.", "/singularity-marketplace/applications-catalog/{application_catalog_id}/config"),
 	},
 	{
@@ -2520,6 +3026,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"application_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "get-configuration-fields-for-catalog-application", "Returns The configuration schema for a requested Application Catalog.", "/singularity-marketplace/applications/{application_id}/config"),
 	},
 	{
@@ -2529,7 +3037,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the installed Marketplace applications for a scope specified.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "skip", WireName: "skip"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "creator__contains", WireName: "creator__contains"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "id", WireName: "id"}, {PublicName: "application_catalog_id", WireName: "application_catalog_id"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "scopes", WireName: "scopes"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "skip", WireName: "skip"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "creator__contains", WireName: "creator__contains"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "id", WireName: "id"}, {PublicName: "application_catalog_id", WireName: "application_catalog_id"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "scopes", WireName: "scopes"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "get-marketplace-applications", "Get the installed Marketplace applications for a scope specified.", "/singularity-marketplace/applications"),
 	},
 	{
@@ -2540,6 +3050,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "install-applications", "Install application from the Application Catalog.", "/singularity-marketplace/applications"),
 	},
 	{
@@ -2550,6 +3062,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("singularity-marketplace", "update-application-configuration", "Update installed application configuration.", "/singularity-marketplace/applications"),
 	},
 	{
@@ -2560,6 +3074,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("site-with-admin", "create-site-and-user", "Create a Site and an Admin role user.", "/site-with-admin"),
 	},
 	{
@@ -2570,6 +3086,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "create", "Create a Site.", "/sites"),
 	},
 	{
@@ -2580,6 +3098,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "create-duplicate", "[DEPRECATED] Create duplicate site.", "/sites/duplicate-site"),
 	},
 	{
@@ -2590,6 +3110,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "delete", "Delete the Site of the given ID. To get the ID, run 'sites'.", "/sites/{site_id}"),
 	},
 	{
@@ -2599,7 +3121,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Sites that match the filters. The response includes the IDs of Sites, which you can use in other commands.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "states", WireName: "states"}, {PublicName: "features", WireName: "features"}, {PublicName: "registrationToken", WireName: "registrationToken"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "siteType", WireName: "siteType"}, {PublicName: "healthStatus", WireName: "healthStatus"}, {PublicName: "activeLicenses", WireName: "activeLicenses"}, {PublicName: "externalId", WireName: "externalId"}, {PublicName: "adminOnly", WireName: "adminOnly"}, {PublicName: "totalLicenses", WireName: "totalLicenses"}, {PublicName: "updatedAt", WireName: "updatedAt"}, {PublicName: "accountId", WireName: "accountId"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "availableMoveSites", WireName: "availableMoveSites"}, {PublicName: "query", WireName: "query"}, {PublicName: "isDefault", WireName: "isDefault"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "expiration", WireName: "expiration"}, {PublicName: "state", WireName: "state"}, {PublicName: "suite", WireName: "suite"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt", WireName: "createdAt"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "name", WireName: "name"}, {PublicName: "states", WireName: "states"}, {PublicName: "features", WireName: "features"}, {PublicName: "registrationToken", WireName: "registrationToken"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "siteType", WireName: "siteType"}, {PublicName: "healthStatus", WireName: "healthStatus"}, {PublicName: "activeLicenses", WireName: "activeLicenses"}, {PublicName: "externalId", WireName: "externalId"}, {PublicName: "adminOnly", WireName: "adminOnly"}, {PublicName: "totalLicenses", WireName: "totalLicenses"}, {PublicName: "updatedAt", WireName: "updatedAt"}, {PublicName: "accountId", WireName: "accountId"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "availableMoveSites", WireName: "availableMoveSites"}, {PublicName: "query", WireName: "query"}, {PublicName: "isDefault", WireName: "isDefault"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "expiration", WireName: "expiration"}, {PublicName: "state", WireName: "state"}, {PublicName: "suite", WireName: "suite"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "createdAt", WireName: "createdAt"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "get", "Get the Sites that match the filters. The response includes the IDs of Sites, which you can use in other commands.", "/sites"),
 	},
 	{
@@ -2610,6 +3134,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "get-by-id", "Get the data of the Site of the ID. To get the ID, run 'sites'.", "/sites/{site_id}"),
 	},
 	{
@@ -2620,6 +3146,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "update", "Change the policy and properties of the Site given by ID. To get the ID, run 'sites'.", "/sites/{site_id}"),
 	},
 	{
@@ -2630,6 +3158,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "expire-site", "Expire the Site of the given ID (run 'sites' to get the ID).", "/sites/{site_id}/expire-now"),
 	},
 	{
@@ -2640,6 +3170,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "site", "Get the policy of the Site given by ID. To get the ID of a Site, run 'sites'. See also: Get Policy.", "/sites/{site_id}/policy"),
 	},
 	{
@@ -2650,6 +3182,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "update-site", "Change the policy for the Site given by ID. Best practice: Get the policy of the Site before you attempt to change it.", "/sites/{site_id}/policy"),
 	},
 	{
@@ -2660,6 +3194,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "site", "Reactivate an expired Site.", "/sites/{site_id}/reactivate"),
 	},
 	{
@@ -2670,6 +3206,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "regenerate-site-key", "Regenerate the key for the given Site. To get the site_id, use 'sites'.", "/sites/{site_id}/regenerate-key"),
 	},
 	{
@@ -2680,6 +3218,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("sites", "revert_policy", "When a Site is created through the Console, it gets the Global policy.", "/sites/{site_id}/revert-policy"),
 	},
 	{
@@ -2690,6 +3230,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("system", "cache-status", "Get an indication of the system's cache health status.", "/system/status/cache"),
 	},
 	{
@@ -2700,6 +3242,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("system", "database-status", "Get an indication of the system's database health status.", "/system/status/db"),
 	},
 	{
@@ -2710,6 +3254,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("system", "get-config", "Get the configuration of your SentinelOne system.", "/system/configuration"),
 	},
 	{
@@ -2720,6 +3266,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("system", "info", "Get the Console build, version, patch, and release information.", "/system/info"),
 	},
 	{
@@ -2730,6 +3278,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("system", "set-config", "Change the system configuration. Before you run this, see Get System Config.", "/system/configuration"),
 	},
 	{
@@ -2740,6 +3290,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("system", "status", "Get an indication of the system's health status.", "/system/status"),
 	},
 	{
@@ -2750,6 +3302,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tags", "create", "Add tags to create user-defined logical groups.", "/tags"),
 	},
 	{
@@ -2760,6 +3314,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tags", "delete", "Delete tags by given filter.", "/tags"),
 	},
 	{
@@ -2770,6 +3326,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"tag_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tags", "delete-by-id", "Delete tag by ID.", "/tags/{tag_id}"),
 	},
 	{
@@ -2780,6 +3338,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"tag_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tags", "edit", "Edit tag", "/tags/{tag_id}"),
 	},
 	{
@@ -2789,7 +3349,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get tags.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "kind", WireName: "kind"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "onlyParents", WireName: "onlyParents"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "type", WireName: "type"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "kind", WireName: "kind"}, {PublicName: "disablePagination", WireName: "disablePagination"}, {PublicName: "scope", WireName: "scope"}, {PublicName: "name__contains", WireName: "name__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "onlyParents", WireName: "onlyParents"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "type", WireName: "type"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tags", "get", "Get tags.", "/tags"),
 	},
 	{
@@ -2800,6 +3362,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tasks-configuration", "create-task", "Create a task configuration.", "/tasks-configuration"),
 	},
 	{
@@ -2809,7 +3373,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the task configuration of child scopes of the given scope, if the tasks are not inherited.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "taskType", WireName: "taskType"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "taskType", WireName: "taskType"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tasks-configuration", "get-child-scope-task-configuration", "Get the task configuration of child scopes of the given scope, if the tasks are not inherited.", "/tasks-configuration/explicit-subscopes"),
 	},
 	{
@@ -2819,7 +3385,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the task configuration of a scope.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "taskType", WireName: "taskType"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "taskType", WireName: "taskType"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tasks-configuration", "get-task-configuration", "Get the task configuration of a scope.", "/tasks-configuration"),
 	},
 	{
@@ -2829,7 +3397,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "From a given scope, see if there are scopes under it that have local, explicit tasks.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "taskType", WireName: "taskType"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "taskType", WireName: "taskType"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tasks-configuration", "has-child-scopes", "From a given scope, see if there are scopes under it that have local, explicit tasks.", "/tasks-configuration/has-explicit-subscope"),
 	},
 	{
@@ -2840,6 +3410,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tenant", "global-policy", "Get the Global policy. This is the default policy for your deployment. See also: Get Policy.", "/tenant/policy"),
 	},
 	{
@@ -2850,6 +3422,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tenant", "update-global-policy", "Change the policy of your deployment. Best practice: Get the Global policy before you attempt to change it.", "/tenant/policy"),
 	},
 	{
@@ -2860,6 +3434,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("tests", "free-text-filters", "Returns a metadata list of the available free-text filters", "/tests/hello"),
 	},
 	{
@@ -2870,6 +3446,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threat-intelligence", "create-io-cs", "Add an IoC to the Threat Intelligence database.", "/threat-intelligence/iocs"),
 	},
 	{
@@ -2880,6 +3458,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threat-intelligence", "delete-io-cs", "Delete an IoC from the Threat Intelligence database that matches a filter using the accountID and one other field.", "/threat-intelligence/iocs"),
 	},
 	{
@@ -2890,6 +3470,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "add-note-to-multiple", "Add a threat note to multiple threats.", "/threats/notes"),
 	},
 	{
@@ -2900,6 +3482,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "add-to-blacklist", "Add threats that have a SHA1 hash and that match the filter to the Blacklist of the target scope: Global, Account, Site", "/threats/add-to-blacklist"),
 	},
 	{
@@ -2910,6 +3494,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "add-to-exclusions", "Add a threat to exclusions. The 'whitening option' is required.", "/threats/add-to-exclusions"),
 	},
 	{
@@ -2920,6 +3506,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "disable-engines", "If your list of threats shows too many False Positives", "/threats/engines/disable"),
 	},
 	{
@@ -2930,6 +3518,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "k8sNodeName__contains", WireName: "k8sNodeName__contains"}, {PublicName: "filePath__contains", WireName: "filePath__contains"}, {PublicName: "analystVerdictsNin", WireName: "analystVerdictsNin"}, {PublicName: "confidenceLevelsNin", WireName: "confidenceLevelsNin"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "incidentStatusesNin", WireName: "incidentStatusesNin"}, {PublicName: "initiatedByUsername__contains", WireName: "initiatedByUsername__contains"}, {PublicName: "classificationsNin", WireName: "classificationsNin"}, {PublicName: "k8sPodName__contains", WireName: "k8sPodName__contains"}, {PublicName: "k8sNamespaceLabels__contains", WireName: "k8sNamespaceLabels__contains"}, {PublicName: "agentIsActive", WireName: "agentIsActive"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "detectionEnginesNin", WireName: "detectionEnginesNin"}, {PublicName: "k8sNamespaceName__contains", WireName: "k8sNamespaceName__contains"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "noteExists", WireName: "noteExists"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "resolved", WireName: "resolved"}, {PublicName: "rebootRequired", WireName: "rebootRequired"}, {PublicName: "detectionAgentDomain__contains", WireName: "detectionAgentDomain__contains"}, {PublicName: "engines", WireName: "engines"}, {PublicName: "externalTicketExists", WireName: "externalTicketExists"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "contentHash__contains", WireName: "contentHash__contains"}, {PublicName: "k8sControllerName__contains", WireName: "k8sControllerName__contains"}, {PublicName: "collectionIds", WireName: "collectionIds"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "k8sPodLabels__contains", WireName: "k8sPodLabels__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "threatDetails__contains", WireName: "threatDetails__contains"}, {PublicName: "detectionAgentVersion__contains", WireName: "detectionAgentVersion__contains"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "mitigationStatuses", WireName: "mitigationStatuses"}, {PublicName: "containerImageName__contains", WireName: "containerImageName__contains"}, {PublicName: "agentMachineTypesNin", WireName: "agentMachineTypesNin"}, {PublicName: "contentHashes", WireName: "contentHashes"}, {PublicName: "originatedProcess__contains", WireName: "originatedProcess__contains"}, {PublicName: "publisherName__contains", WireName: "publisherName__contains"}, {PublicName: "containerLabels__contains", WireName: "containerLabels__contains"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "classifications", WireName: "classifications"}, {PublicName: "confidenceLevels", WireName: "confidenceLevels"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "initiatedBy", WireName: "initiatedBy"}, {PublicName: "externalTicketId__contains", WireName: "externalTicketId__contains"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "externalTicketIds", WireName: "externalTicketIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "displayName", WireName: "displayName"}, {PublicName: "storylines", WireName: "storylines"}, {PublicName: "storyline__contains", WireName: "storyline__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "pendingActions", WireName: "pendingActions"}, {PublicName: "k8sClusterName__contains", WireName: "k8sClusterName__contains"}, {PublicName: "initiatedByNin", WireName: "initiatedByNin"}, {PublicName: "detectionEngines", WireName: "detectionEngines"}, {PublicName: "enginesNin", WireName: "enginesNin"}, {PublicName: "osNamesNin", WireName: "osNamesNin"}, {PublicName: "incidentStatuses", WireName: "incidentStatuses"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "mitigatedPreemptively", WireName: "mitigatedPreemptively"}, {PublicName: "failedActions", WireName: "failedActions"}, {PublicName: "realtimeAgentVersion__contains", WireName: "realtimeAgentVersion__contains"}, {PublicName: "k8sControllerLabels__contains", WireName: "k8sControllerLabels__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "analystVerdicts", WireName: "analystVerdicts"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "containerName__contains", WireName: "containerName__contains"}, {PublicName: "classificationSourcesNin", WireName: "classificationSourcesNin"}, {PublicName: "commandLineArguments__contains", WireName: "commandLineArguments__contains"}, {PublicName: "osArchs", WireName: "osArchs"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "mitigationStatusesNin", WireName: "mitigationStatusesNin"}, {PublicName: "osNames", WireName: "osNames"}, {PublicName: "classificationSources", WireName: "classificationSources"}, {PublicName: "agentMachineTypes", WireName: "agentMachineTypes"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "export", "Export data of threats (as seen in the Console > Incidents) that match the filter. Note: Use the filter.", "/threats/export"),
 	},
 	{
@@ -2940,6 +3530,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"report_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "export-mitigation-report", "Export the mitigation report as a CSV file.", "/threats/mitigation-report/{report_id}"),
 	},
 	{
@@ -2950,6 +3542,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "fetch-file", "Fetch a file associated with the threat that matches the filter.", "/threats/fetch-file"),
 	},
 	{
@@ -2959,7 +3553,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get data of threats that match the filter. <BR>Best Practice: Use the filters.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "k8sNodeName__contains", WireName: "k8sNodeName__contains"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "filePath__contains", WireName: "filePath__contains"}, {PublicName: "analystVerdictsNin", WireName: "analystVerdictsNin"}, {PublicName: "confidenceLevelsNin", WireName: "confidenceLevelsNin"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "incidentStatusesNin", WireName: "incidentStatusesNin"}, {PublicName: "initiatedByUsername__contains", WireName: "initiatedByUsername__contains"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "classificationsNin", WireName: "classificationsNin"}, {PublicName: "k8sPodName__contains", WireName: "k8sPodName__contains"}, {PublicName: "k8sNamespaceLabels__contains", WireName: "k8sNamespaceLabels__contains"}, {PublicName: "agentIsActive", WireName: "agentIsActive"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "detectionEnginesNin", WireName: "detectionEnginesNin"}, {PublicName: "k8sNamespaceName__contains", WireName: "k8sNamespaceName__contains"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "noteExists", WireName: "noteExists"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "resolved", WireName: "resolved"}, {PublicName: "rebootRequired", WireName: "rebootRequired"}, {PublicName: "detectionAgentDomain__contains", WireName: "detectionAgentDomain__contains"}, {PublicName: "engines", WireName: "engines"}, {PublicName: "externalTicketExists", WireName: "externalTicketExists"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "contentHash__contains", WireName: "contentHash__contains"}, {PublicName: "k8sControllerName__contains", WireName: "k8sControllerName__contains"}, {PublicName: "collectionIds", WireName: "collectionIds"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "k8sPodLabels__contains", WireName: "k8sPodLabels__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "threatDetails__contains", WireName: "threatDetails__contains"}, {PublicName: "detectionAgentVersion__contains", WireName: "detectionAgentVersion__contains"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "mitigationStatuses", WireName: "mitigationStatuses"}, {PublicName: "containerImageName__contains", WireName: "containerImageName__contains"}, {PublicName: "agentMachineTypesNin", WireName: "agentMachineTypesNin"}, {PublicName: "contentHashes", WireName: "contentHashes"}, {PublicName: "originatedProcess__contains", WireName: "originatedProcess__contains"}, {PublicName: "publisherName__contains", WireName: "publisherName__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "containerLabels__contains", WireName: "containerLabels__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "classifications", WireName: "classifications"}, {PublicName: "confidenceLevels", WireName: "confidenceLevels"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "initiatedBy", WireName: "initiatedBy"}, {PublicName: "externalTicketId__contains", WireName: "externalTicketId__contains"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "externalTicketIds", WireName: "externalTicketIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "displayName", WireName: "displayName"}, {PublicName: "storylines", WireName: "storylines"}, {PublicName: "storyline__contains", WireName: "storyline__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "pendingActions", WireName: "pendingActions"}, {PublicName: "k8sClusterName__contains", WireName: "k8sClusterName__contains"}, {PublicName: "initiatedByNin", WireName: "initiatedByNin"}, {PublicName: "detectionEngines", WireName: "detectionEngines"}, {PublicName: "enginesNin", WireName: "enginesNin"}, {PublicName: "osNamesNin", WireName: "osNamesNin"}, {PublicName: "incidentStatuses", WireName: "incidentStatuses"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "mitigatedPreemptively", WireName: "mitigatedPreemptively"}, {PublicName: "failedActions", WireName: "failedActions"}, {PublicName: "realtimeAgentVersion__contains", WireName: "realtimeAgentVersion__contains"}, {PublicName: "k8sControllerLabels__contains", WireName: "k8sControllerLabels__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "analystVerdicts", WireName: "analystVerdicts"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "containerName__contains", WireName: "containerName__contains"}, {PublicName: "classificationSourcesNin", WireName: "classificationSourcesNin"}, {PublicName: "commandLineArguments__contains", WireName: "commandLineArguments__contains"}, {PublicName: "osArchs", WireName: "osArchs"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "mitigationStatusesNin", WireName: "mitigationStatusesNin"}, {PublicName: "osNames", WireName: "osNames"}, {PublicName: "classificationSources", WireName: "classificationSources"}, {PublicName: "agentMachineTypes", WireName: "agentMachineTypes"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "k8sNodeName__contains", WireName: "k8sNodeName__contains"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "filePath__contains", WireName: "filePath__contains"}, {PublicName: "analystVerdictsNin", WireName: "analystVerdictsNin"}, {PublicName: "confidenceLevelsNin", WireName: "confidenceLevelsNin"}, {PublicName: "agentIds", WireName: "agentIds"}, {PublicName: "createdAt__gte", WireName: "createdAt__gte"}, {PublicName: "incidentStatusesNin", WireName: "incidentStatusesNin"}, {PublicName: "initiatedByUsername__contains", WireName: "initiatedByUsername__contains"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "classificationsNin", WireName: "classificationsNin"}, {PublicName: "k8sPodName__contains", WireName: "k8sPodName__contains"}, {PublicName: "k8sNamespaceLabels__contains", WireName: "k8sNamespaceLabels__contains"}, {PublicName: "agentIsActive", WireName: "agentIsActive"}, {PublicName: "updatedAt__gte", WireName: "updatedAt__gte"}, {PublicName: "detectionEnginesNin", WireName: "detectionEnginesNin"}, {PublicName: "k8sNamespaceName__contains", WireName: "k8sNamespaceName__contains"}, {PublicName: "osTypesNin", WireName: "osTypesNin"}, {PublicName: "noteExists", WireName: "noteExists"}, {PublicName: "tenant", WireName: "tenant"}, {PublicName: "resolved", WireName: "resolved"}, {PublicName: "rebootRequired", WireName: "rebootRequired"}, {PublicName: "detectionAgentDomain__contains", WireName: "detectionAgentDomain__contains"}, {PublicName: "engines", WireName: "engines"}, {PublicName: "externalTicketExists", WireName: "externalTicketExists"}, {PublicName: "updatedAt__gt", WireName: "updatedAt__gt"}, {PublicName: "agentVersions", WireName: "agentVersions"}, {PublicName: "contentHash__contains", WireName: "contentHash__contains"}, {PublicName: "k8sControllerName__contains", WireName: "k8sControllerName__contains"}, {PublicName: "collectionIds", WireName: "collectionIds"}, {PublicName: "updatedAt__lte", WireName: "updatedAt__lte"}, {PublicName: "k8sPodLabels__contains", WireName: "k8sPodLabels__contains"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "threatDetails__contains", WireName: "threatDetails__contains"}, {PublicName: "detectionAgentVersion__contains", WireName: "detectionAgentVersion__contains"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "mitigationStatuses", WireName: "mitigationStatuses"}, {PublicName: "containerImageName__contains", WireName: "containerImageName__contains"}, {PublicName: "agentMachineTypesNin", WireName: "agentMachineTypesNin"}, {PublicName: "contentHashes", WireName: "contentHashes"}, {PublicName: "originatedProcess__contains", WireName: "originatedProcess__contains"}, {PublicName: "publisherName__contains", WireName: "publisherName__contains"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "containerLabels__contains", WireName: "containerLabels__contains"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "createdAt__lte", WireName: "createdAt__lte"}, {PublicName: "classifications", WireName: "classifications"}, {PublicName: "confidenceLevels", WireName: "confidenceLevels"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "initiatedBy", WireName: "initiatedBy"}, {PublicName: "externalTicketId__contains", WireName: "externalTicketId__contains"}, {PublicName: "agentVersionsNin", WireName: "agentVersionsNin"}, {PublicName: "externalTicketIds", WireName: "externalTicketIds"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "displayName", WireName: "displayName"}, {PublicName: "storylines", WireName: "storylines"}, {PublicName: "storyline__contains", WireName: "storyline__contains"}, {PublicName: "query", WireName: "query"}, {PublicName: "pendingActions", WireName: "pendingActions"}, {PublicName: "k8sClusterName__contains", WireName: "k8sClusterName__contains"}, {PublicName: "initiatedByNin", WireName: "initiatedByNin"}, {PublicName: "detectionEngines", WireName: "detectionEngines"}, {PublicName: "enginesNin", WireName: "enginesNin"}, {PublicName: "osNamesNin", WireName: "osNamesNin"}, {PublicName: "incidentStatuses", WireName: "incidentStatuses"}, {PublicName: "createdAt__gt", WireName: "createdAt__gt"}, {PublicName: "updatedAt__lt", WireName: "updatedAt__lt"}, {PublicName: "createdAt__lt", WireName: "createdAt__lt"}, {PublicName: "mitigatedPreemptively", WireName: "mitigatedPreemptively"}, {PublicName: "failedActions", WireName: "failedActions"}, {PublicName: "realtimeAgentVersion__contains", WireName: "realtimeAgentVersion__contains"}, {PublicName: "k8sControllerLabels__contains", WireName: "k8sControllerLabels__contains"}, {PublicName: "uuid__contains", WireName: "uuid__contains"}, {PublicName: "analystVerdicts", WireName: "analystVerdicts"}, {PublicName: "countsFor", WireName: "countsFor"}, {PublicName: "containerName__contains", WireName: "containerName__contains"}, {PublicName: "classificationSourcesNin", WireName: "classificationSourcesNin"}, {PublicName: "commandLineArguments__contains", WireName: "commandLineArguments__contains"}, {PublicName: "osArchs", WireName: "osArchs"}, {PublicName: "computerName__contains", WireName: "computerName__contains"}, {PublicName: "mitigationStatusesNin", WireName: "mitigationStatusesNin"}, {PublicName: "osNames", WireName: "osNames"}, {PublicName: "classificationSources", WireName: "classificationSources"}, {PublicName: "agentMachineTypes", WireName: "agentMachineTypes"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "get", "Get data of threats that match the filter. <BR>Best Practice: Use the filters.", "/threats"),
 	},
 	{
@@ -2970,6 +3566,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"action"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "mitigate", "Apply a mitigation action to a group of threats that match the filter.", "/threats/mitigate/{action}"),
 	},
 	{
@@ -2980,6 +3578,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "update-analyst-verdict", "Change the verdict of a threat, as determined by a Console user.", "/threats/analyst-verdict"),
 	},
 	{
@@ -2990,6 +3590,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "update-external-ticket-id", "Change the external ticket ID of a threat.", "/threats/external-ticket-id"),
 	},
 	{
@@ -3000,6 +3602,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "updated-incident", "Update the incident details of a threat.", "/threats/incident"),
 	},
 	{
@@ -3010,6 +3614,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "download_from_cloud", "Download threat file from cloud.", "/threats/{threat_id}/download-from-cloud"),
 	},
 	{
@@ -3019,7 +3625,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get all threat events.",
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "eventId", WireName: "eventId"}, {PublicName: "eventSubTypes", WireName: "eventSubTypes"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "eventTypes", WireName: "eventTypes"}, {PublicName: "processName__like", WireName: "processName__like"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "eventId", WireName: "eventId"}, {PublicName: "eventSubTypes", WireName: "eventSubTypes"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "eventTypes", WireName: "eventTypes"}, {PublicName: "processName__like", WireName: "processName__like"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "get-events", "Get all threat events.", "/threats/{threat_id}/explore/events"),
 	},
 	{
@@ -3030,6 +3638,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"note_id", "threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "delete-threat", "Delete a threat note.", "/threats/{threat_id}/notes/{note_id}"),
 	},
 	{
@@ -3039,7 +3649,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the threat notes that match the filter.",
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "creator__like", WireName: "creator__like"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "creatorId", WireName: "creatorId"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "creator__like", WireName: "creator__like"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "creatorId", WireName: "creatorId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "get-threat", "Get the threat notes that match the filter.", "/threats/{threat_id}/notes"),
 	},
 	{
@@ -3050,6 +3662,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"note_id", "threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "update-threat", "Change the text of a threat note.", "/threats/{threat_id}/notes/{note_id}"),
 	},
 	{
@@ -3059,7 +3673,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a threat's timeline.",
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}, {PublicName: "cursor", WireName: "cursor"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "activityTypes", WireName: "activityTypes"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "query", WireName: "query"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "get-threat", "Get a threat's timeline.", "/threats/{threat_id}/timeline"),
 	},
 	{
@@ -3070,6 +3686,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"threat_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("threats", "exclusion-options", "Get the Exclusion types that can be created from the detection data.", "/threats/{threat_id}/whitening-options"),
 	},
 	{
@@ -3080,6 +3698,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("update", "delete-packages", "Delete Agent packages from your Management. Use the IDs from Get Latest Packages.", "/update/agent/packages"),
 	},
 	{
@@ -3090,6 +3710,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"package_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("update", "download-agent-package", "[DEPRECATED] Download an agent package by package ID.Rate limit: 2 call per minute for each different user token", "/update/agent/download/{package_id}"),
 	},
 	{
@@ -3100,6 +3722,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"site_id", "package_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("update", "download-package", "Download a package by site_id ('sites') and filename. Rate limit: 2 call per minute for each user token.", "/update/agent/download/{site_id}/{package_id}"),
 	},
 	{
@@ -3109,7 +3733,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get the Agent packages that are uploaded to your Management.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "version", WireName: "version"}, {PublicName: "status", WireName: "status"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "packageTypes", WireName: "packageTypes"}, {PublicName: "minorVersion", WireName: "minorVersion"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "osArches", WireName: "osArches"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "platformTypes", WireName: "platformTypes"}, {PublicName: "query", WireName: "query"}, {PublicName: "sha1", WireName: "sha1"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "fileExtension", WireName: "fileExtension"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "rangerVersion", WireName: "rangerVersion"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "packageType", WireName: "packageType"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "version", WireName: "version"}, {PublicName: "status", WireName: "status"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "packageTypes", WireName: "packageTypes"}, {PublicName: "minorVersion", WireName: "minorVersion"}, {PublicName: "osTypes", WireName: "osTypes"}, {PublicName: "osArches", WireName: "osArches"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "platformTypes", WireName: "platformTypes"}, {PublicName: "query", WireName: "query"}, {PublicName: "sha1", WireName: "sha1"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "fileExtension", WireName: "fileExtension"}, {PublicName: "rangerVersion", WireName: "rangerVersion"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "packageType", WireName: "packageType"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("update", "get-latest-packages", "Get the Agent packages that are uploaded to your Management.", "/update/agent/packages"),
 	},
 	{
@@ -3120,6 +3746,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "packageType", WireName: "packageType"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("update", "latest-packages-by-os", "[DEPRECATED] Use 'Latest packages' API call instead ('GET /web/api/v2.1/update/agent/packages').", "/update/agent/latest-packages"),
 	},
 	{
@@ -3130,6 +3758,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"package_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("update", "package", "Update the metadata for an existing package.", "/update/agent/packages/{package_id}"),
 	},
 	{
@@ -3140,6 +3770,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("upload", "agent-package", "If you have an On-Prem Management or you are a participant in the Beta program", "/upload/agent/software"),
 	},
 	{
@@ -3150,6 +3782,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("upload", "deploy-system-package", "If you have an On-Prem Management or you are a participant in the Beta program", "/upload/software/deploy"),
 	},
 	{
@@ -3160,6 +3794,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("upload", "system-package", "If you have an On-Prem Management or otherwise require a manual package upload", "/upload/software"),
 	},
 	{
@@ -3170,6 +3806,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "groupIds", WireName: "groupIds"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "tenant", WireName: "tenant"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("user", "by-token", "Get a user by token.", "/user"),
 	},
 	{
@@ -3180,6 +3818,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "auth-app", "Authenticate a user with a third-party app, such as DUO or Google Authenticator", "/users/auth/app"),
 	},
 	{
@@ -3190,6 +3830,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"scope_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "auth-by-sso", "Authenticate a Single Sign-On response over SAML v2 protocol.", "/users/login/sso-saml2/{scope_id}"),
 	},
 	{
@@ -3200,6 +3842,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "auth-recovery-code", "Authenticate a user with a recovery code.", "/users/auth/recovery-code"),
 	},
 	{
@@ -3210,6 +3854,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "bulk-delete", "Delete all users that match the filter.", "/users/delete-users"),
 	},
 	{
@@ -3220,6 +3866,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "change-password", "Change the user password.", "/users/change-password"),
 	},
 	{
@@ -3230,6 +3878,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "check-global", "See if logged in user is a user with the Global scope of access.", "/users/tenant-admin-auth-check"),
 	},
 	{
@@ -3240,6 +3890,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "check-remote-shell-permissions", "See if the logged in user is allowed to use Remote Shell.", "/users/rs-auth-check"),
 	},
 	{
@@ -3250,6 +3902,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "check-viewer", "See if the logged in user has only viewer permissions.", "/users/viewer-auth-check"),
 	},
 	{
@@ -3260,6 +3914,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "create", "Create a new user.", "/users"),
 	},
 	{
@@ -3270,6 +3926,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"user_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "delete", "Delete a user by ID.", "/users/{user_id}"),
 	},
 	{
@@ -3280,6 +3938,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "disable-2-fa", "Disable Two-Factor Authentication for one user. This requires the ID of the user (run 'users').", "/users/2fa/disable"),
 	},
 	{
@@ -3290,6 +3950,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "email-verification", "When a new user verifies their email, the Management gets a token.", "/users/onboarding/verify"),
 	},
 	{
@@ -3300,6 +3962,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "enable-2-fa", "Enable two-factor authentication for a given user.", "/users/2fa/enable"),
 	},
 	{
@@ -3310,6 +3974,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "enable-2-fa-app", "Enable support for the 2FA app (such as Duo or Google Authenticator) that your Console users will use to log in.", "/users/enable-app"),
 	},
 	{
@@ -3320,6 +3986,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "generate-api-token", "Get the API token for the authenticated user.", "/users/generate-api-token"),
 	},
 	{
@@ -3330,6 +3998,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "generate-i-frame-token", "Get a new iFrame token with the provided limitations.", "/users/generate-iframe-token"),
 	},
 	{
@@ -3340,6 +4010,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "generate-recovery-code", "Get recovery codes for user authentication.", "/users/generate-recovery-codes"),
 	},
 	{
@@ -3350,6 +4022,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"user_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "get", "Get a user by ID.", "/users/{user_id}"),
 	},
 	{
@@ -3359,7 +4033,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get a list of users.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "roleIds", WireName: "roleIds"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "source", WireName: "source"}, {PublicName: "firstLogin", WireName: "firstLogin"}, {PublicName: "lastLogin", WireName: "lastLogin"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "twoFaEnabled", WireName: "twoFaEnabled"}, {PublicName: "email", WireName: "email"}, {PublicName: "emailReadOnly", WireName: "emailReadOnly"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupsReadOnly", WireName: "groupsReadOnly"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "fullName", WireName: "fullName"}, {PublicName: "dateJoined", WireName: "dateJoined"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "cursor", WireName: "cursor"}, {PublicName: "emailVerified", WireName: "emailVerified"}, {PublicName: "primaryTwoFaMethod", WireName: "primaryTwoFaMethod"}, {PublicName: "fullNameReadOnly", WireName: "fullNameReadOnly"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "roleIds", WireName: "roleIds"}, {PublicName: "skip", WireName: "skip"}, {PublicName: "sortOrder", WireName: "sortOrder"}, {PublicName: "source", WireName: "source"}, {PublicName: "firstLogin", WireName: "firstLogin"}, {PublicName: "lastLogin", WireName: "lastLogin"}, {PublicName: "ids", WireName: "ids"}, {PublicName: "twoFaEnabled", WireName: "twoFaEnabled"}, {PublicName: "email", WireName: "email"}, {PublicName: "emailReadOnly", WireName: "emailReadOnly"}, {PublicName: "siteIds", WireName: "siteIds"}, {PublicName: "sortBy", WireName: "sortBy"}, {PublicName: "groupsReadOnly", WireName: "groupsReadOnly"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "query", WireName: "query"}, {PublicName: "fullName", WireName: "fullName"}, {PublicName: "dateJoined", WireName: "dateJoined"}, {PublicName: "accountIds", WireName: "accountIds"}, {PublicName: "emailVerified", WireName: "emailVerified"}, {PublicName: "primaryTwoFaMethod", WireName: "primaryTwoFaMethod"}, {PublicName: "fullNameReadOnly", WireName: "fullNameReadOnly"}, {PublicName: "skipCount", WireName: "skipCount"}, {PublicName: "countOnly", WireName: "countOnly"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "list", "Get a list of users.", "/users"),
 	},
 	{
@@ -3370,6 +4046,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "login", "Authenticate a user by username and password and return an authentication token.", "/users/login"),
 	},
 	{
@@ -3380,6 +4058,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "login-by-api-token", "Log in to the API with a token.", "/users/login/by-api-token"),
 	},
 	{
@@ -3390,6 +4070,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "removedSavedScope", WireName: "removedSavedScope"}, {PublicName: "token", WireName: "token"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "login-by-token", "Log in with user token.", "/users/login/by-token"),
 	},
 	{
@@ -3400,6 +4082,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "logout", "Log out the authenticated user.", "/users/logout"),
 	},
 	{
@@ -3410,6 +4094,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "email", WireName: "email"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "redirect-to-sso", "If SSO is enabled for a deployment or scope, and a user attempts to log in with name and password", "/users/login/sso-saml2"),
 	},
 	{
@@ -3420,6 +4106,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "request-2-fa-app", "Request 2FA App response.", "/users/request-app"),
 	},
 	{
@@ -3430,6 +4118,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "revoke-api-token", "Revoke an API token.", "/users/revoke-api-token"),
 	},
 	{
@@ -3440,6 +4130,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "send-verification-email", "Send verification email to users that match the filter.", "/users/onboarding/send-verification-email"),
 	},
 	{
@@ -3450,6 +4142,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "sign-eula", "Mark the End User License Agreement (EULA) as signed for user scopes.", "/users/auth/eula"),
 	},
 	{
@@ -3460,6 +4154,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "token-details", "Get details of the API token that matches the filter.", "/users/api-token-details"),
 	},
 	{
@@ -3470,6 +4166,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"user_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "update", "Change properties of the user of the given ID.", "/users/{user_id}"),
 	},
 	{
@@ -3480,6 +4178,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "token", WireName: "token"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "validate-verification-token", "When a new user verifies their email, the Management gets a token. Use this command to validate the token.", "/users/onboarding/validate-token"),
 	},
 	{
@@ -3490,6 +4190,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"user_id"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("users", "token-by-user-id", "Get the details of the API token generated for a given user.", "/users/{user_id}/api-token-details"),
 	},
 }
@@ -3532,16 +4234,47 @@ func codeOrchKeywords(resource, endpoint, summary, path string) []string {
 	return out
 }
 
+func codeOrchEndpointMetadata(ep *codeOrchEndpoint) map[string]any {
+	out := map[string]any{
+		"endpoint_id": ep.ID,
+		"method":      ep.Method,
+		"path":        ep.Path,
+		"summary":     ep.Summary,
+	}
+	return out
+}
+
+func findCodeOrchEndpoint(id string) *codeOrchEndpoint {
+	for i := range codeOrchEndpoints {
+		if codeOrchEndpoints[i].ID == id {
+			return &codeOrchEndpoints[i]
+		}
+	}
+	return nil
+}
+
+const (
+	codeOrchSearchDefaultLimit = 10
+	codeOrchSearchMaxLimit     = 100
+)
+
+func codeOrchSearchLimit(args map[string]any) int {
+	if v, ok := args["limit"].(float64); ok && v > 0 {
+		if v > float64(codeOrchSearchMaxLimit) {
+			return codeOrchSearchMaxLimit
+		}
+		return int(v)
+	}
+	return codeOrchSearchDefaultLimit
+}
+
 func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
 	query, ok := args["query"].(string)
 	if !ok || strings.TrimSpace(query) == "" {
 		return mcplib.NewToolResultError("query is required"), nil
 	}
-	limit := 10
-	if v, ok := args["limit"].(float64); ok && v > 0 {
-		limit = int(v)
-	}
+	limit := codeOrchSearchLimit(args)
 
 	terms := codeOrchKeywords("", "", query, "")
 	type scored struct {
@@ -3572,16 +4305,35 @@ func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcp
 
 	out := make([]map[string]any, 0, len(results))
 	for _, r := range results {
-		out = append(out, map[string]any{
-			"endpoint_id": r.ep.ID,
-			"method":      r.ep.Method,
-			"path":        r.ep.Path,
-			"summary":     r.ep.Summary,
-			"score":       r.score,
-		})
+		item := codeOrchEndpointMetadata(r.ep)
+		item["score"] = r.score
+		out = append(out, item)
 	}
-	data, _ := json.Marshal(map[string]any{"count": len(out), "results": out})
-	return mcplib.NewToolResultText(string(data)), nil
+	text, err := bound.JSON(map[string]any{"count": len(out), "results": out})
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("encoding search results: %v", err)), nil
+	}
+	return mcplib.NewToolResultText(text), nil
+}
+
+func handleCodeOrchGet(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	args := req.GetArguments()
+	id, ok := args["endpoint_id"].(string)
+	if !ok || id == "" {
+		return mcplib.NewToolResultError("endpoint_id is required (call sentinelone_search first)"), nil
+	}
+	ep := findCodeOrchEndpoint(id)
+	if ep == nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("unknown endpoint_id %q — call sentinelone_search to discover valid ids", id)), nil
+	}
+	if ep.Method != "GET" {
+		return mcplib.NewToolResultError(fmt.Sprintf("endpoint_id %q is %s, but sentinelone_get only permits GET endpoints", id, ep.Method)), nil
+	}
+	text, err := bound.JSON(codeOrchEndpointMetadata(ep))
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("encoding endpoint metadata: %v", err)), nil
+	}
+	return mcplib.NewToolResultText(text), nil
 }
 
 func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -3591,13 +4343,7 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		return mcplib.NewToolResultError("endpoint_id is required (call sentinelone_search first)"), nil
 	}
 
-	var ep *codeOrchEndpoint
-	for i := range codeOrchEndpoints {
-		if codeOrchEndpoints[i].ID == id {
-			ep = &codeOrchEndpoints[i]
-			break
-		}
-	}
+	ep := findCodeOrchEndpoint(id)
 	if ep == nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("unknown endpoint_id %q — call sentinelone_search to discover valid ids", id)), nil
 	}
@@ -3607,17 +4353,44 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		params = map[string]any{}
 	}
 
-	c, err := newMCPClient()
+	c, platformSession, err := newMCPClient(ctx)
 	if err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
+
+	if platformSession != nil {
+		defer platformSession.ZeroCredentials()
+	}
+	if err := cli.AdoptMCPOutputSemantics(platformSession, params); err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
 
 	path := ep.Path
 	for _, p := range ep.Positional {
-		if v, ok := params[p]; ok {
-			path = strings.ReplaceAll(path, "{"+p+"}", formatMCPParamValue(v))
+		if v, ok := params[p]; ok && strings.Contains(path, "{"+p+"}") {
+			path = strings.ReplaceAll(path, "{"+p+"}", mcpPathValue(v))
 			delete(params, p)
 		}
+	}
+
+	hdrs := make(map[string]string, len(ep.HeaderOverrides)+len(ep.HeaderParams))
+	for k, v := range ep.HeaderOverrides {
+		hdrs[k] = v
+	}
+	for _, binding := range ep.HeaderParams {
+		if binding.Default != "" {
+			hdrs[binding.WireName] = binding.Default
+		}
+		for _, key := range []string{binding.PublicName, binding.WireName} {
+			if v, ok := params[key]; ok {
+				hdrs[binding.WireName] = formatMCPParamValue(v)
+				delete(params, key)
+				break
+			}
+		}
+	}
+	if len(hdrs) == 0 {
+		hdrs = nil
 	}
 
 	// Route params to their runtime slots. GET/DELETE params are query
@@ -3643,7 +4416,6 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		}
 	}
 
-	hdrs := ep.HeaderOverrides
 	writeBody := func() any {
 		if ep.BodyIsArray {
 			return codeOrchArrayBody(params)
@@ -3654,9 +4426,17 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	switch ep.Method {
 	case "GET":
 		if len(hdrs) > 0 {
-			data, err = c.GetWithHeaders(ctx, path, query, hdrs)
+			if ep.Mutating {
+				data, err = c.GetMutatingWithHeaders(ctx, path, query, hdrs)
+			} else {
+				data, err = c.GetWithHeaders(ctx, path, query, hdrs)
+			}
 		} else {
-			data, err = c.Get(ctx, path, query)
+			if ep.Mutating {
+				data, err = c.GetMutating(ctx, path, query)
+			} else {
+				data, err = c.Get(ctx, path, query)
+			}
 		}
 	case "DELETE":
 		if len(hdrs) > 0 {
@@ -3691,7 +4471,11 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	if err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
-	return mcplib.NewToolResultText(string(data)), nil
+	text := bound.EndpointResponse(ep.Method, data)
+	if platformSession != nil {
+		text = bound.WithMetadata(text, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(text), nil
 }
 
 // codeOrchWriteBody returns the value handed to the client layer as the

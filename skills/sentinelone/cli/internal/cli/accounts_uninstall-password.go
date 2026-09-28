@@ -11,7 +11,7 @@ func newAccountsUninstallPasswordCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "uninstall-password",
 		Short:       "Get, generate, and create uninstall password for accounts",
-		Annotations: map[string]string{"mcp:read-only": "true"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
