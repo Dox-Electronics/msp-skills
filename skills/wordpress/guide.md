@@ -107,8 +107,7 @@ Get your API key from your API provider's developer portal. The key typically lo
 ```bash
 export WORDPRESS_BASIC_AUTH="<paste-your-key>"
 ```
-
-To persist credentials, use `wordpress-cli auth set-token <token>`. Stored secrets live in `credentials.toml` under the data directory, not in `config.toml`.
+To persist credentials, use `echo "$TOKEN" | wordpress-cli auth set-token`. Stored secrets live in `credentials.toml` under the data directory, not in `config.toml`.
 
 ### 3. Verify Setup
 
@@ -240,6 +239,23 @@ List and read users (for author assignment)
 - **`wordpress-cli users list`** - List users
 
 
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`wordpress-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`wordpress-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`wordpress-cli learnings list`** - Inspect taught rows
+- **`wordpress-cli learnings forget <query>`** - Undo a teach
+- **`wordpress-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`wordpress-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`wordpress-cli teach-pattern`** - Install a query/resource template up front
+- **`wordpress-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `WORDPRESS_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `wordpress-cli` opens the database, older binaries refuse it with a version error  -  upgrade the binary rather than downgrading.
+
 ## Output Formats
 
 ```bash
@@ -248,9 +264,8 @@ wordpress-cli categories list
 
 # JSON for scripting and agents
 wordpress-cli categories list --json
-
 # Filter to specific fields
-wordpress-cli categories list --json --select id,name,status
+wordpress-cli categories list --json --select id,name,slug
 
 # Dry run  -  show the request without sending
 wordpress-cli categories list --dry-run
@@ -265,15 +280,15 @@ This CLI is designed for AI agent consumption:
 
 - **Non-interactive** - never prompts, every input is a flag
 - **Pipeable** - `--json` output to stdout, errors to stderr
-- **Filterable** - `--select id,name` returns only fields you need
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
 - **Previewable** - `--dry-run` shows the request without sending
-- **Explicit retries** - add `--idempotent` to create retries and `--ignore-missing` to delete retries when a no-op success is acceptable
-- **Confirmable** - `--yes` for explicit confirmation of destructive actions
+- **Explicit retries** - add `--idempotent` to create retries and add `--ignore-missing` to delete retries when a no-op success is acceptable
+- **Explicit confirmation** - `--agent` does not imply `--yes`; pass `--yes` separately only after the target, arguments, and side effects are clear
 - **Piped input** - write commands can accept structured input when their help lists `--stdin`
 - **Offline-friendly** - sync/search commands can use the local SQLite store when available
 - **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
 
-Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `7` rate limited, `10` config error.
+Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `6` partial failure, `7` rate limited, `10` config error.
 
 ## Health Check
 

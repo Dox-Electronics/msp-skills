@@ -1655,10 +1655,10 @@
       "first_party": false,
       "category": "Marketing",
       "display_name": "WordPress",
-      "cli_hash": "sha256:d0081cf1a1e1f73bb156e7584a6c8cb5956845ceb1e318e68bd6e267bae3a18e",
+      "cli_hash": "sha256:ac9745976dd80daee6b3c16f61f17dbba3b3675b3d6df3dc704318c183cbe41b",
       "template_version": 3,
-      "version": "0.1.4",
-      "cli_hash_at_release": "sha256:2a65663dc14cb16ea6f3e08b3b32891ce0bde941cf8f60e3a4bfeeb6bf228f84",
+      "version": "0.1.5",
+      "cli_hash_at_release": "sha256:53b8a6d8d8c1820b4250572851888164cf25516379155029eda5cd6bacbdd0d3",
       "has_video": true,
       "live_verified": {
         "status": "live-verified",
