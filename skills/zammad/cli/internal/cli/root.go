@@ -5,6 +5,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"zammad-pp-cli/internal/cliutil"
 	"zammad-pp-cli/internal/config"
 	"zammad-pp-cli/internal/learn"
+	"zammad-pp-cli/internal/platform"
 	"zammad-pp-cli/internal/store"
 )
 
@@ -42,22 +44,122 @@ type rootFlags struct {
 	// (e.g. Google Ads `partialFailureError`) from a non-zero exit to a
 	// stderr warning. Default false so silent partial successes surface as
 	// failures by default.
-	allowPartialFailure bool
-	selectFields        string
-	configPath          string
-	homePath            string
-	profileName         string
-	deliverSpec         string
-	timeout             time.Duration
-	rateLimit           float64
-	maxAge              time.Duration
-	dataSource          string
-	freshnessMeta       any
+	allowPartialFailure     bool
+	selectFields            string
+	configPath              string
+	homePath                string
+	runProfileName          string
+	clientProfileName       string
+	platformSession         *platform.Session
+	platformResolver        platform.CredentialResolver
+	platformResolverReady   bool
+	platformAnalytics       *platform.AnalyticsDeclaration
+	platformGateError       error
+	platformMetadataWriter  io.Writer
+	receiptEnabled          bool
+	receiptFile             string
+	auditDir                string
+	receiptWriter           *platform.ReceiptWriter
+	platformMetadataEmitted bool
+	deliverSpec             string
+	timeout                 time.Duration
+	timeoutExplicit         bool
+	rateLimit               float64
+	maxAge                  time.Duration
+	dataSource              string
+	agentSource             string
+	freshnessMeta           any
 
 	// deliverBuf captures command output when --deliver is set to a
 	// non-stdout sink. Flushed to the sink after Execute returns.
 	deliverBuf  *bytes.Buffer
 	deliverSink DeliverSink
+}
+
+// novelCommandHooks are optional hooks for hand-authored command extensions.
+// A markerless file in package cli may register one from init without editing
+// this generated root, so force regeneration preserves both the source and
+// wiring. Hooks run after generated novel parent groups are attached so a
+// hook can Find a novel parent and add children. Registration is additive:
+// independent extensions never replace one another, except that a real
+// command replaces a TODO scaffold with the same name.
+var novelCommandHooks []func(root *cobra.Command, flags *rootFlags)
+
+func registerNovelCommand(hook func(root *cobra.Command, flags *rootFlags)) {
+	novelCommandHooks = append(novelCommandHooks, hook)
+}
+
+const novelScaffoldAnnotation = "pp:novel-scaffold"
+
+func isNovelScaffoldCommand(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Annotations[novelScaffoldAnnotation] == "true"
+}
+
+func addNovelCommandIfAbsent(parent *cobra.Command, candidate *cobra.Command) {
+	if parent == nil || candidate == nil {
+		return
+	}
+	for _, existing := range parent.Commands() {
+		if existing.Name() != candidate.Name() {
+			continue
+		}
+		if isNovelScaffoldCommand(existing) && !isNovelScaffoldCommand(candidate) {
+			parent.RemoveCommand(existing)
+			parent.AddCommand(candidate)
+		}
+		return
+	}
+	parent.AddCommand(candidate)
+}
+
+func preferImplementedNovelCommands(cmd *cobra.Command) {
+	if cmd == nil {
+		return
+	}
+	byName := map[string][]*cobra.Command{}
+	for _, child := range cmd.Commands() {
+		byName[child.Name()] = append(byName[child.Name()], child)
+	}
+	for _, group := range byName {
+		var keep *cobra.Command
+		for _, child := range group {
+			if !isNovelScaffoldCommand(child) {
+				keep = child
+				break
+			}
+		}
+		if keep == nil {
+			continue
+		}
+		for _, child := range group {
+			if child != keep && isNovelScaffoldCommand(child) {
+				cmd.RemoveCommand(child)
+			}
+		}
+	}
+	for _, child := range cmd.Commands() {
+		preferImplementedNovelCommands(child)
+	}
+}
+
+// clientHooks let preserved package-local extensions configure a newly-created
+// client without editing generated code. Hooks are additive and run once per
+// client construction; they must not perform provider-specific behavior here.
+var clientHooks []func(*client.Client) error
+
+func registerClientHook(hook func(*client.Client) error) {
+	clientHooks = append(clientHooks, hook)
+}
+
+// Keeps preserved post-construction setup consistent across interactive CLI
+// and MCP clients.
+func ApplyClientHooks(c *client.Client) error {
+	for _, hook := range clientHooks {
+		if err := hook(c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RootCmd returns the Cobra command tree without executing it. The MCP server
@@ -74,6 +176,7 @@ func RootCmd() *cobra.Command {
 func Execute() (retErr error) {
 	var flags rootFlags
 	rootCmd := newRootCmd(&flags)
+	defer finalizePlatformInvocation(&flags, &retErr)
 
 	executedCmd, err := rootCmd.ExecuteC()
 	var journalFailedFlag, journalSuggestedFlag string
@@ -85,6 +188,16 @@ func Execute() (retErr error) {
 	}()
 	if errors.Is(err, pflag.ErrHelp) {
 		return nil
+	}
+	envelopeWriter := io.Writer(os.Stdout)
+	if flags.deliverBuf != nil {
+		envelopeWriter = io.MultiWriter(os.Stdout, flags.deliverBuf)
+	}
+	envelopeWritten := writeCredentialSaveErrorEnvelope(envelopeWriter, &flags, err)
+	if envelopeWritten && flags.deliverBuf != nil {
+		if derr := Deliver(flags.deliverSink, flags.deliverBuf.Bytes(), flags.compact); derr != nil {
+			fmt.Fprintf(os.Stderr, "warning: deliver to %s:%s failed: %v\n", flags.deliverSink.Scheme, flags.deliverSink.Target, derr)
+		}
 	}
 	if err != nil && strings.Contains(err.Error(), "unknown flag") {
 		msg := err.Error()
@@ -126,6 +239,24 @@ func Execute() (retErr error) {
 		return usageErr(err)
 	}
 	return err
+}
+
+func writeCredentialSaveErrorEnvelope(w io.Writer, flags *rootFlags, err error) bool {
+	if flags == nil || !flags.asJSON || err == nil {
+		return false
+	}
+	var permissionErr *cliutil.CredentialsPermissionError
+	if !errors.As(err, &permissionErr) {
+		return false
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"saved":                true,
+		"credentials_path":     permissionErr.Path,
+		"permissions_verified": false,
+		"error":                permissionErr.Error(),
+		"code":                 ExitCode(err),
+	})
+	return true
 }
 
 // isCobraUsageError reports whether err matches one of Cobra/pflag's
@@ -206,26 +337,43 @@ See README.md or the bundled SKILL.md for recipes.`,
 	rootCmd.PersistentFlags().DurationVar(&flags.timeout, "timeout", 60*time.Second, "Request timeout")
 	rootCmd.PersistentFlags().BoolVar(&flags.dryRun, "dry-run", false, "Show request without sending")
 	rootCmd.PersistentFlags().BoolVar(&flags.noCache, "no-cache", false, "Bypass response cache")
+	rootCmd.PersistentFlags().BoolVar(&flags.receiptEnabled, "receipt", false, "Write an atomic private run receipt")
+	rootCmd.PersistentFlags().StringVar(&flags.receiptFile, "receipt-file", "", "Override the run receipt destination")
+	rootCmd.PersistentFlags().StringVar(&flags.auditDir, "audit-dir", "", "Aggregate the receipt and index under this audit directory")
 	rootCmd.PersistentFlags().BoolVar(&flags.noInput, "no-input", false, "Disable all interactive prompts (for CI/agents)")
 	rootCmd.PersistentFlags().BoolVar(&flags.idempotent, "idempotent", false, "Treat already-existing create results as a successful no-op")
 	rootCmd.PersistentFlags().BoolVar(&flags.ignoreMissing, "ignore-missing", false, "Treat missing delete targets as a successful no-op")
-	rootCmd.PersistentFlags().StringVar(&flags.selectFields, "select", "", "Comma-separated fields to include in output (e.g. --select id,name,status)")
-	rootCmd.PersistentFlags().BoolVar(&flags.yes, "yes", false, "Skip confirmation prompts (for agents and scripts)")
+	rootCmd.PersistentFlags().StringVar(&flags.selectFields, "select", "", "Comma-separated fields to include in output (e.g. --select id,ticket_id,type_id)")
+	rootCmd.PersistentFlags().BoolVar(&flags.yes, "yes", false, "Skip confirmation prompts (explicit confirmation for scripts)")
 	rootCmd.PersistentFlags().BoolVar(&noColor, "no-color", false, "Disable colored output")
 	rootCmd.PersistentFlags().BoolVar(&humanFriendly, "human-friendly", false, "Enable colored output and rich formatting")
-	rootCmd.PersistentFlags().BoolVar(&flags.agent, "agent", false, "Set all agent-friendly defaults (--json --compact --no-input --no-color --yes)")
+	rootCmd.PersistentFlags().BoolVar(&flags.agent, "agent", false, "Set agent-friendly output defaults (--json --compact --no-input --no-color)")
 	rootCmd.PersistentFlags().BoolVar(&flags.noLearn, "no-learn", false, "Disable the teach/recall learning loop for this invocation")
 	rootCmd.PersistentFlags().BoolVar(&flags.allowPartialFailure, "allow-partial-failure", false, "Downgrade response-body partial-failure (e.g. partialFailureError) to a warning instead of a non-zero exit")
 	rootCmd.PersistentFlags().StringVar(&flags.dataSource, "data-source", "auto", "Data source for read commands: auto (live with local fallback), live (API only), local (synced data only)")
 	rootCmd.PersistentFlags().DurationVar(&flags.maxAge, "max-age", 30*time.Minute, "Maximum acceptable age of local-store data before a stderr hint suggests sync; 0 disables")
-	rootCmd.PersistentFlags().StringVar(&flags.profileName, "profile", "", "Apply values from a saved profile (see 'zammad-cli profile list')")
+	rootCmd.PersistentFlags().StringVar(&flags.runProfileName, "profile", "", "Apply values from a saved run profile; this does not select a client (see 'zammad-cli profile list')")
+	rootCmd.PersistentFlags().StringVar(&flags.clientProfileName, "client-profile", "", "Select the tenant-gated client profile (env: PRINTING_PRESS_CLIENT_PROFILE)")
+	if strings.TrimSpace(os.Getenv(mcpBoundProfileEnv)) != "" {
+		if flag := rootCmd.PersistentFlags().Lookup("client-profile"); flag != nil {
+			flag.Hidden = true
+		}
+	}
 	rootCmd.PersistentFlags().StringVar(&flags.deliverSpec, "deliver", "", "Route output to a sink: stdout (default), file:<path>, webhook:<url>")
-	rootCmd.PersistentFlags().Float64Var(&flags.rateLimit, "rate-limit", 0, "Max requests per second (0 to disable)")
+	rootCmd.PersistentFlags().Float64Var(&flags.rateLimit, "rate-limit", client.RateLimitAuto, "Max requests per second (0 to disable; default auto — pace to server rate-limit headers)")
+	if f := rootCmd.PersistentFlags().Lookup("rate-limit"); f != nil {
+		f.DefValue = "auto"
+	}
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		var appliedProfile *Profile
+		if err := enforceMCPBoundProfile(cmd, flags); err != nil {
+			return err
+		}
 		if _, err := cliutil.SetHomeOverride(flags.homePath); err != nil {
 			return err
 		}
+		configureDefaultDBScope(flags.configPath)
 		if flags.deliverSpec != "" {
 			sink, err := ParseDeliverSink(flags.deliverSpec)
 			if err != nil {
@@ -237,20 +385,44 @@ See README.md or the bundled SKILL.md for recipes.`,
 				cmd.SetOut(io.MultiWriter(os.Stdout, flags.deliverBuf))
 			}
 		}
-		if flags.profileName != "" {
-			profile, err := GetProfile(flags.profileName)
+		if flags.runProfileName != "" {
+			profile, err := GetProfile(flags.runProfileName)
 			if err != nil {
 				return err
 			}
 			if profile == nil {
 				available := ListProfileNames()
 				if len(available) == 0 {
-					return fmt.Errorf("profile %q not found (no profiles saved yet; run '%s profile save <name> --<flag> <value>')", flags.profileName, cmd.Root().Name())
+					return fmt.Errorf("run profile %q not found (no profiles saved yet; run '%s profile save <name> --<flag> <value>')", flags.runProfileName, cmd.Root().Name())
 				}
-				return fmt.Errorf("profile %q not found; available: %s", flags.profileName, strings.Join(available, ", "))
+				return fmt.Errorf("run profile %q not found; available: %s", flags.runProfileName, strings.Join(available, ", "))
 			}
 			if err := ApplyProfileToFlags(cmd, profile); err != nil {
 				return err
+			}
+			appliedProfile = profile
+		}
+		if platformCommandNeedsGate(cmd) {
+			if err := preparePlatformSession(flags); err != nil {
+				return err
+			}
+			cmd.SetContext(platform.ContextWithSession(cmd.Context(), flags.platformSession))
+			if err := validatePlatformLegacyInputs(cmd, flags); err != nil {
+				return err
+			}
+			if err := initializePlatformReceipt(cmd, flags); err != nil {
+				return err
+			}
+			if err := adoptPlatformCommandWindow(cmd, flags); err != nil {
+				return err
+			}
+			flags.platformMetadataWriter = cmd.ErrOrStderr()
+			if err := verifyPlatformSession(cmd.Context(), flags); err != nil {
+				if platformCommandIsDoctor(cmd) {
+					flags.platformGateError = err
+				} else {
+					return err
+				}
 			}
 		}
 		if flags.agent {
@@ -262,9 +434,6 @@ See README.md or the bundled SKILL.md for recipes.`,
 			}
 			if !cmd.Flags().Changed("no-input") {
 				flags.noInput = true
-			}
-			if !cmd.Flags().Changed("yes") {
-				flags.yes = true
 			}
 			if !cmd.Flags().Changed("no-color") {
 				noColor = true
@@ -278,13 +447,16 @@ See README.md or the bundled SKILL.md for recipes.`,
 		}
 		// Seed entity_lookups from spec.Learn.EntityLookupSeeds once per
 		// process. Skipped for framework commands that should never
-		// touch the local store (auth, doctor, help, etc.) and for
+		// touch the local store (auth, doctor, help, etc.), for
 		// --no-learn invocations so deterministic agent flows don't
-		// race a background seed.
-		if !noLearnActive(flags) && !shouldSkipLearnHook(cmd.CommandPath()) {
+		// race a background seed, and for read-only commands so a GET
+		// never runs the one-way schema migration.
+		if !noLearnActive(flags) && !shouldSkipLearnHook(cmd.CommandPath()) && commandMayWriteStore(cmd) {
 			runLearnInitOnce(cmd.Context())
 			runPlaybookInitOnce(cmd.Context())
 		}
+		flags.timeoutExplicit = timeoutExplicitFrom(cmd, appliedProfile)
+		flags.agentSource = declaredAgentSource(cmd, flags)
 		return nil
 	}
 	rootCmd.AddCommand(newArticlesCmd(flags))
@@ -296,6 +468,9 @@ See README.md or the bundled SKILL.md for recipes.`,
 	rootCmd.AddCommand(newTicketsCmd(flags))
 	rootCmd.AddCommand(newUsersCmd(flags))
 	rootCmd.AddCommand(newDoctorCmd(flags))
+	if registeredPlatformSource != nil {
+		attachPlatformClientCommands(rootCmd, flags)
+	}
 	rootCmd.AddCommand(newAuthCmd(flags))
 	rootCmd.AddCommand(newAgentContextCmd(rootCmd))
 	rootCmd.AddCommand(newProfileCmd(flags))
@@ -306,17 +481,6 @@ See README.md or the bundled SKILL.md for recipes.`,
 	rootCmd.AddCommand(newSearchCmd(flags))
 	rootCmd.AddCommand(newSyncCmd(flags))
 	rootCmd.AddCommand(newWorkflowCmd(flags))
-	rootCmd.AddCommand(newStaleCmd(flags))
-	rootCmd.AddCommand(newOrphansCmd(flags))
-	rootCmd.AddCommand(newLoadCmd(flags))
-	rootCmd.AddCommand(newNovelAgentLoadCmd(flags))
-	rootCmd.AddCommand(newNovelAgentTrendCmd(flags))
-	rootCmd.AddCommand(newNovelChurnRiskCmd(flags))
-	rootCmd.AddCommand(newNovelCustomerHealthCmd(flags))
-	rootCmd.AddCommand(newNovelEscalateCmd(flags))
-	rootCmd.AddCommand(newNovelFeedbackScanCmd(flags))
-	rootCmd.AddCommand(newNovelOverdueCmd(flags))
-	rootCmd.AddCommand(newNovelTicketCmd(flags))
 	rootCmd.AddCommand(newAPICmd(flags))
 	rootCmd.AddCommand(newPrioritiesPromotedCmd(flags))
 	rootCmd.AddCommand(newStatesPromotedCmd(flags))
@@ -334,6 +498,23 @@ See README.md or the bundled SKILL.md for recipes.`,
 	rootCmd.AddCommand(newTeachLookupCmd(flags))
 	rootCmd.AddCommand(newTeachPlaybookCmd(flags, learnCfg))
 	rootCmd.AddCommand(newPlaybookCmd(flags, learnCfg))
+	addNovelCommandIfAbsent(rootCmd, newNovelAgentLoadCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelAgentTrendCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelChurnRiskCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelCustomerHealthCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelEscalateCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelFeedbackScanCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelOverdueCmd(flags))
+	addNovelCommandIfAbsent(rootCmd, newNovelTicketCmd(flags))
+	for _, hook := range novelCommandHooks {
+		hook(rootCmd, flags)
+	}
+	preferImplementedNovelCommands(rootCmd)
+	// Attach the conditional platform identity command last so ordinary,
+	// promoted, and novel API-owned `whoami` commands all win the name.
+	if registeredPlatformSource != nil {
+		attachPlatformWhoamiCommand(rootCmd, flags)
+	}
 
 	return rootCmd
 }
@@ -370,6 +551,49 @@ func shouldSkipLearnHook(commandPath string) bool {
 		}
 	}
 	return false
+}
+
+// commandIsHelpInvocation reports --help / the help command so PreRun hooks
+// that open the operator store do not run as a side effect of help.
+func commandIsHelpInvocation(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.Name() == "help" {
+		return true
+	}
+	if f := cmd.Flags().Lookup("help"); f != nil && f.Changed {
+		return true
+	}
+	return false
+}
+
+// commandMayWriteStore reports whether cmd is allowed to open the operator
+// store read-write from PersistentPreRunE. Read-only commands (mcp:read-only,
+// conventional GET/HEAD, doctor, help) must not run schema migration as a
+// side effect of learn/playbook init.
+func commandMayWriteStore(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if commandIsHelpInvocation(cmd) {
+		return false
+	}
+	if cmd.Name() == "doctor" {
+		return false
+	}
+	ann := cmd.Annotations
+	if ann["mcp:read-only"] == "true" {
+		return false
+	}
+	if ann["pp:parent-group"] == "true" || ann["pp:api-resource"] == "true" {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(ann["pp:method"])) {
+	case "GET", "HEAD", "OPTIONS":
+		return false
+	}
+	return true
 }
 
 // journalInvocation records the invocation in the learn journal from
@@ -553,6 +777,21 @@ func commandTreeHasFlag(cmd *cobra.Command, name string) bool {
 	return false
 }
 
+// ApplyProfileToFlags overlays values without setting Flag.Changed, so a
+// profile-supplied timeout must count here or binary transfers would drop
+// the whole-call bound.
+func timeoutExplicitFrom(cmd *cobra.Command, profile *Profile) bool {
+	if cmd != nil && cmd.Flags().Changed("timeout") {
+		return true
+	}
+	if profile != nil {
+		if _, ok := profile.Values["timeout"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func ExitCode(err error) int {
 	var codeErr *cliError
 	if As(err, &codeErr) {
@@ -567,8 +806,17 @@ func (f *rootFlags) newClient() (*client.Client, error) {
 		return nil, configErr(err)
 	}
 	c := client.New(cfg, f.timeout, f.rateLimit)
+	if f.timeoutExplicit {
+		c.SetTimeoutExplicit(true)
+	}
 	c.DryRun = f.dryRun
 	c.NoCache = f.noCache
+	if err := bindPlatformClient(c, f); err != nil {
+		return nil, err
+	}
+	if err := ApplyClientHooks(c); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 

@@ -76,7 +76,7 @@ func fetchZammadKBBundle(cmd *cobra.Command, flags *rootFlags) (kbBundle, error)
 	}
 	data, status, err := c.PostQueryWithParams(cmd.Context(), "/knowledge_bases/init", nil, map[string]any{})
 	if err != nil {
-		return kbBundle{}, classifyAPIError(err, flags)
+		return kbBundle{}, classifyAPIError(cmd.OutOrStdout(), err, flags)
 	}
 	if status < 200 || status >= 300 {
 		return kbBundle{}, fmt.Errorf("POST /knowledge_bases/init returned HTTP %d", status)

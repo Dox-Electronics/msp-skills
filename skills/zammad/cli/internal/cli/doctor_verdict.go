@@ -52,25 +52,8 @@ const doctorShippedBaseURL = "https://your-instance.zammad.com/api/v1"
 // paths, versions, and the free-text hints that tell an operator how to get a
 // credential. They are NOT health checks.
 //
-// doctorExitForFailOn used to scan every value in the report for the substrings
-// "error", "missing", "invalid" and "unreachable". That made --fail-on=error
-// trip on a perfectly healthy connector whose auth hint happened to contain the
-// word "missing", or whose suggested read command was named something like
-// `errors list`. Excluding the informational keys keeps --fail-on keyed to the
-// checks and nothing else.
-var doctorInfoKeys = map[string]bool{
-	"config_path":       true,
-	"base_url":          true,
-	"auth_source":       true,
-	"version":           true,
-	"auth_hint":         true,
-	"auth_key_url":      true,
-	"auth_instructions": true,
-	"agentcookie":       true,
-	"db_path":           true,
-}
-
-func doctorIsInfoKey(key string) bool { return doctorInfoKeys[key] }
+// doctorInfoKeys / doctorIsInfoKey are generator-native since press 4.32.5
+// (doctor.go); this file no longer declares them.
 
 // doctorBaseURLIsPlaceholder reports whether base is still the value this
 // connector shipped with rather than the operator's own instance.

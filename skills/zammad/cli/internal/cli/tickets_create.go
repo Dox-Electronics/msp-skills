@@ -16,10 +16,10 @@ func newTicketsCreateCmd(flags *rootFlags) *cobra.Command {
 	var bodyTitle string
 	var bodyGroup string
 	var bodyCustomerId string
-	var bodyStateId string
-	var bodyPriorityId string
-	var bodyOwnerId string
-	var bodyOrganizationId string
+	var bodyStateId int
+	var bodyPriorityId int
+	var bodyOwnerId int
+	var bodyOrganizationId int
 	var bodyArticleSubject string
 	var bodyArticleBody string
 	var bodyArticleType string
@@ -30,17 +30,28 @@ func newTicketsCreateCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "create",
 		Short:       "Create a ticket. Provide title, group, a customer, and an initial article.",
-		Example:     "  zammad-cli tickets create --title example-resource",
-		Annotations: map[string]string{"pp:endpoint": "tickets.create", "pp:method": "POST", "pp:path": "/tickets"},
+		Annotations: map[string]string{"pp:endpoint": "tickets.create", "pp:method": "POST", "pp:path": "/tickets", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("title") && !flags.dryRun {
+				if !cmd.Flags().Changed("title") && bodyTitle == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "title")
 				}
 			}
@@ -64,42 +75,42 @@ func newTicketsCreateCmd(flags *rootFlags) *cobra.Command {
 			} else {
 				bodyMap := map[string]any{}
 				body = bodyMap
-				if bodyTitle != "" {
+				if cmd.Flags().Changed("title") || bodyTitle != "" {
 					bodyMap["title"] = bodyTitle
 				}
-				if bodyGroup != "" {
+				if cmd.Flags().Changed("group") || bodyGroup != "" {
 					bodyMap["group"] = bodyGroup
 				}
-				if bodyCustomerId != "" {
+				if cmd.Flags().Changed("customer-id") || bodyCustomerId != "" {
 					bodyMap["customer_id"] = bodyCustomerId
 				}
-				if bodyStateId != "" {
+				if cmd.Flags().Changed("state-id") || bodyStateId != 0 {
 					bodyMap["state_id"] = bodyStateId
 				}
-				if bodyPriorityId != "" {
+				if cmd.Flags().Changed("priority-id") || bodyPriorityId != 0 {
 					bodyMap["priority_id"] = bodyPriorityId
 				}
-				if bodyOwnerId != "" {
+				if cmd.Flags().Changed("owner-id") || bodyOwnerId != 0 {
 					bodyMap["owner_id"] = bodyOwnerId
 				}
-				if bodyOrganizationId != "" {
+				if cmd.Flags().Changed("organization-id") || bodyOrganizationId != 0 {
 					bodyMap["organization_id"] = bodyOrganizationId
 				}
 				{
 					nestedArticle := map[string]any{}
-					if bodyArticleSubject != "" {
+					if cmd.Flags().Changed("article-subject") || bodyArticleSubject != "" {
 						nestedArticle["subject"] = bodyArticleSubject
 					}
-					if bodyArticleBody != "" {
+					if cmd.Flags().Changed("article-body") || bodyArticleBody != "" {
 						nestedArticle["body"] = bodyArticleBody
 					}
-					if bodyArticleType != "" {
+					if cmd.Flags().Changed("article-type") || bodyArticleType != "" {
 						nestedArticle["type"] = bodyArticleType
 					}
 					if cmd.Flags().Changed("article-internal") {
 						nestedArticle["internal"] = bodyArticleInternal
 					}
-					if bodyArticleContentType != "" {
+					if cmd.Flags().Changed("article-content-type") || bodyArticleContentType != "" {
 						nestedArticle["content_type"] = bodyArticleContentType
 					}
 					if len(nestedArticle) > 0 {
@@ -109,7 +120,7 @@ func newTicketsCreateCmd(flags *rootFlags) *cobra.Command {
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -202,15 +213,22 @@ func newTicketsCreateCmd(flags *rootFlags) *cobra.Command {
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"id": true, "title": true, "group_id": true, "state_id": true, "priority_id": true, "owner_id": true, "customer_id": true, "organization_id": true, "created_at": true, "updated_at": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
@@ -226,37 +244,44 @@ func newTicketsCreateCmd(flags *rootFlags) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "tickets", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"id": true, "title": true, "group_id": true, "state_id": true, "priority_id": true, "owner_id": true, "customer_id": true, "organization_id": true, "created_at": true, "updated_at": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "tickets", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyTitle, "title", "", "Ticket title / subject")
 	cmd.Flags().StringVar(&bodyGroup, "group", "", "Group name (e.g. Users, Support)")
 	cmd.Flags().StringVar(&bodyCustomerId, "customer-id", "", "Customer user id or email address")
-	cmd.Flags().StringVar(&bodyStateId, "state-id", "", "State id (1=new, 2=open, 3=pending, 4=closed, 6=resolved)")
-	cmd.Flags().StringVar(&bodyPriorityId, "priority-id", "", "Priority id (1=low, 2=normal, 3=high)")
-	cmd.Flags().StringVar(&bodyOwnerId, "owner-id", "", "Assigned agent user id")
-	cmd.Flags().StringVar(&bodyOrganizationId, "organization-id", "", "Organization id")
+	cmd.Flags().IntVar(&bodyStateId, "state-id", 0, "State id (1=new, 2=open, 3=pending, 4=closed, 6=resolved)")
+	cmd.Flags().IntVar(&bodyPriorityId, "priority-id", 0, "Priority id (1=low, 2=normal, 3=high)")
+	cmd.Flags().IntVar(&bodyOwnerId, "owner-id", 0, "Assigned agent user id")
+	cmd.Flags().IntVar(&bodyOrganizationId, "organization-id", 0, "Organization id")
 	cmd.Flags().StringVar(&bodyArticleSubject, "article-subject", "", "Article subject")
 	cmd.Flags().StringVar(&bodyArticleBody, "article-body", "", "Article body")
 	cmd.Flags().StringVar(&bodyArticleType, "article-type", "", "Article type: note or email")

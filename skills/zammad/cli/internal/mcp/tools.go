@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -17,6 +18,8 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 	"zammad-pp-cli/internal/cli"
 	"zammad-pp-cli/internal/client"
 	"zammad-pp-cli/internal/cliutil"
@@ -24,6 +27,7 @@ import (
 	"zammad-pp-cli/internal/learn"
 	"zammad-pp-cli/internal/mcp/bound"
 	"zammad-pp-cli/internal/mcp/cobratree"
+	"zammad-pp-cli/internal/platform"
 	"zammad-pp-cli/internal/store"
 )
 
@@ -36,9 +40,12 @@ const (
 
 // RegisterTools registers all API operations as MCP tools.
 func RegisterTools(s *server.MCPServer) {
-	// Code-orchestration mode — the full surface is covered by two tools
-	// (<api>_search + <api>_execute). Endpoint-mirror tools are suppressed.
+	installFreshTenantGate(s)
+	// Code-orchestration mode — the full surface is covered by registry tools
+	// (<api>_search, <api>_get, and <api>_execute). Endpoint-mirror tools are suppressed.
 	RegisterCodeOrchestrationTools(s)
+	// Intent tools — higher-level compositions declared in the spec or lifted from recipes.
+	RegisterIntents(s)
 	// Search tool — faster than iterating list endpoints for finding specific items
 	s.AddTool(
 		mcplib.NewTool("search",
@@ -69,7 +76,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 		),
-		handleContext,
+		handleContext(s),
 	)
 
 	// Runtime Cobra-tree mirror — exposes every user-facing command that is
@@ -125,6 +132,10 @@ func formatMCPParamValue(v any) string {
 		return fmt.Sprintf("%v", v)
 	}
 }
+
+func mcpPathValue(v any) string {
+	return cliutil.EscapePathParam(formatMCPParamValue(v))
+}
 func setNestedBodyArg(body map[string]any, path []string, value any) {
 	if len(path) == 0 {
 		return
@@ -148,15 +159,21 @@ func setNestedBodyArg(body map[string]any, path []string, value any) {
 // makeAPIHandler creates a generic MCP tool handler for an API endpoint.
 func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse bool, headerOverrides map[string]string, pageConfig mcpPageConfig, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-		c, err := newMCPClient()
+		c, platformSession, err := newMCPClient(ctx)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return mcpToolError(err.Error()), nil
+		}
+		if platformSession != nil {
+			defer platformSession.ZeroCredentials()
 		}
 
 		// mcp-go v0.47+ made CallToolParams.Arguments an `any` to support
 		// non-map payloads; GetArguments() returns the map[string]any shape
 		// we rely on here (or an empty map when the payload is something else).
 		args := req.GetArguments()
+		if err := cli.AdoptMCPOutputSemantics(platformSession, args); err != nil {
+			return mcpToolError(err.Error()), nil
+		}
 
 		// positionalParams mixes real URL path params with CLI positional
 		// args that map to query params (e.g. `search <query>` -> ?query=);
@@ -172,12 +189,12 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			if v, ok := args["cursor"]; ok {
 				s, ok := v.(string)
 				if !ok {
-					return mcplib.NewToolResultError("cursor must be an opaque string returned by a previous MCP response"), nil
+					return mcpToolError("cursor must be an opaque string returned by a previous MCP response"), nil
 				}
 				mcpCursor = s
 				upstreamCursor, err := bound.UpstreamCursor(s)
 				if err != nil {
-					return mcplib.NewToolResultError(err.Error()), nil
+					return mcpToolError(err.Error()), nil
 				}
 				if upstreamCursor != "" {
 					params[pageConfig.CursorParam] = upstreamCursor
@@ -211,7 +228,12 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			case "path":
 				placeholder := "{" + binding.WireName + "}"
 				pathParams[binding.PublicName] = true
-				path = strings.Replace(path, placeholder, formatMCPParamValue(v), 1)
+				path = strings.Replace(path, placeholder, mcpPathValue(v), 1)
+			case "header":
+				if headers == nil {
+					headers = map[string]string{}
+				}
+				headers[binding.WireName] = formatMCPParamValue(v)
 			case "body":
 				if len(binding.BodyPath) > 0 {
 					setNestedBodyArg(bodyArgs, binding.BodyPath, v)
@@ -229,7 +251,7 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			pathParams[p] = true
 			if v, ok := args[p]; ok {
-				path = strings.Replace(path, placeholder, formatMCPParamValue(v), 1)
+				path = strings.Replace(path, placeholder, mcpPathValue(v), 1)
 			}
 		}
 
@@ -249,10 +271,18 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 		switch method {
 		case "GET":
 			if len(headers) > 0 {
-				data, err = c.GetWithHeaders(ctx, path, params, headers)
+				if readOnly {
+					data, err = c.GetWithHeaders(ctx, path, params, headers)
+				} else {
+					data, err = c.GetMutatingWithHeaders(ctx, path, params, headers)
+				}
 				break
 			}
-			data, err = c.Get(ctx, path, params)
+			if readOnly {
+				data, err = c.Get(ctx, path, params)
+			} else {
+				data, err = c.GetMutating(ctx, path, params)
+			}
 		case "POST":
 			if len(headers) > 0 {
 				if readOnly {
@@ -269,16 +299,32 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 		case "PUT":
 			if len(headers) > 0 {
-				data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				if readOnly {
+					data, _, err = c.PutQueryWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				} else {
+					data, _, err = c.PutWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				}
 				break
 			}
-			data, _, err = c.PutWithParams(ctx, path, params, bodyArgs)
+			if readOnly {
+				data, _, err = c.PutQueryWithParams(ctx, path, params, bodyArgs)
+			} else {
+				data, _, err = c.PutWithParams(ctx, path, params, bodyArgs)
+			}
 		case "PATCH":
 			if len(headers) > 0 {
-				data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				if readOnly {
+					data, _, err = c.PatchQueryWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				} else {
+					data, _, err = c.PatchWithParamsAndHeaders(ctx, path, params, bodyArgs, headers)
+				}
 				break
 			}
-			data, _, err = c.PatchWithParams(ctx, path, params, bodyArgs)
+			if readOnly {
+				data, _, err = c.PatchQueryWithParams(ctx, path, params, bodyArgs)
+			} else {
+				data, _, err = c.PatchWithParams(ctx, path, params, bodyArgs)
+			}
 		case "DELETE":
 			if len(headers) > 0 {
 				data, _, err = c.DeleteWithParamsAndHeaders(ctx, path, params, headers)
@@ -286,38 +332,38 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 			data, _, err = c.DeleteWithParams(ctx, path, params)
 		default:
-			return mcplib.NewToolResultError("unsupported method: " + method), nil
+			return mcpToolError("unsupported method: " + method), nil
 		}
 
 		if err != nil {
 			msg := err.Error()
 			switch {
 			case strings.Contains(msg, "HTTP 409"):
-				return mcplib.NewToolResultText("already exists (no-op)"), nil
+				return mcpToolTextWithPlatform("already exists (no-op)", platformSession), nil
 			case strings.Contains(msg, "HTTP 400") && cliutil.LooksLikeAuthError(msg):
-				return mcplib.NewToolResultError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: the API rejected the request — this usually means auth is missing or invalid." +
 					"\n      Set your API key with: export ZAMMAD_API_TOKEN=\"your-token-here\"" +
 					"\n      Run 'zammad-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 401"):
-				return mcplib.NewToolResultError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: check your API key." +
 					"\n      Set your API key with: export ZAMMAD_API_TOKEN=\"your-token-here\"" +
 					"\n      Run 'zammad-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 403"):
-				return mcplib.NewToolResultError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
+				return mcpToolError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: your credentials are valid but lack access to this resource. Check that they have the required permissions and match the API's expected auth scheme." +
 					"\n      Set your API key with: export ZAMMAD_API_TOKEN=\"your-token-here\"" +
 					"\n      Run 'zammad-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 404"):
 				if method == "DELETE" {
-					return mcplib.NewToolResultText("already deleted (no-op)"), nil
+					return mcpToolTextWithPlatform("already deleted (no-op)", platformSession), nil
 				}
-				return mcplib.NewToolResultError("not found: " + msg), nil
+				return mcpToolError("not found: " + msg), nil
 			case strings.Contains(msg, "HTTP 429"):
-				return mcplib.NewToolResultError("rate limited: " + msg), nil
+				return mcpToolError("rate limited: " + msg), nil
 			default:
-				return mcplib.NewToolResultError(msg), nil
+				return mcpToolError(msg), nil
 			}
 		}
 
@@ -329,38 +375,68 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 				"byte_count":       len(data),
 			})
 			if err != nil {
-				return mcplib.NewToolResultError(fmt.Sprintf("encoding binary result: %v", err)), nil
+				return mcpToolError(fmt.Sprintf("encoding binary result: %v", err)), nil
 			}
 			if len(out) > bound.MaxBytes {
-				return mcplib.NewToolResultError(fmt.Sprintf("binary response is too large for MCP text output: %d response bytes encode to %d base64 bytes and %d MCP result bytes, exceeding the %d byte budget. Use the companion CLI command with --output <file> to save the payload locally.", len(data), len(encoded), len(out), bound.MaxBytes)), nil
+				return mcpToolError(fmt.Sprintf("binary response is too large for MCP text output: %d response bytes encode to %d base64 bytes and %d MCP result bytes, exceeding the %d byte budget. Use the companion CLI command with --output <file> to save the payload locally.", len(data), len(encoded), len(out), bound.MaxBytes)), nil
 			}
-			return mcplib.NewToolResultText(string(out)), nil
+			result := string(out)
+			if platformSession != nil {
+				result = bound.WithMetadata(result, platformSession.OutputMetadata())
+			}
+			return mcplib.NewToolResultText(result), nil
 		}
 		if pageConfig.CursorParam != "" {
-			return mcpToolPageResultText(method, data, pageConfig, mcpCursor), nil
+			return mcpToolPageResultTextWithPlatform(method, data, pageConfig, mcpCursor, platformSession), nil
 		}
-		return mcpToolResultText(method, data), nil
+		return mcpToolResultTextWithPlatform(method, data, platformSession), nil
 	}
 }
 
 func mcpToolResultText(method string, data json.RawMessage) *mcplib.CallToolResult {
-	return mcplib.NewToolResultText(bound.EndpointResponse(method, data))
+	return mcpToolResultTextWithPlatform(method, data, nil)
+}
+
+func mcpToolTextWithPlatform(result string, platformSession *platform.Session) *mcplib.CallToolResult {
+	if platformSession != nil {
+		result = bound.WithMetadata(result, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(result)
+}
+
+func mcpToolResultTextWithPlatform(method string, data json.RawMessage, platformSession *platform.Session) *mcplib.CallToolResult {
+	result := bound.EndpointResponse(method, data)
+	return mcpToolTextWithPlatform(result, platformSession)
+}
+
+// mcpToolError keeps provider-controlled typed endpoint errors within the MCP
+// text-result budget just like successful endpoint results.
+func mcpToolError(message string) *mcplib.CallToolResult {
+	return mcplib.NewToolResultError(bound.Text(message))
 }
 
 func mcpToolPageResultText(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string) *mcplib.CallToolResult {
-	return mcplib.NewToolResultText(bound.EndpointPageResponse(method, data, bound.PageOptions{
+	return mcpToolPageResultTextWithPlatform(method, data, pageConfig, cursor, nil)
+}
+
+func mcpToolPageResultTextWithPlatform(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string, platformSession *platform.Session) *mcplib.CallToolResult {
+	result := bound.EndpointPageResponse(method, data, bound.PageOptions{
 		Cursor:         cursor,
 		CursorParam:    pageConfig.CursorParam,
 		NextCursorPath: pageConfig.NextCursorPath,
-	}))
+	})
+	if platformSession != nil {
+		result = bound.WithMetadata(result, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(result)
 }
 
-func newMCPClient() (*client.Client, error) {
+func newMCPClient(ctx context.Context) (*client.Client, *platform.Session, error) {
 	cfg, err := newMCPConfig()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return newMCPClientFromConfig(cfg), nil
+	return newMCPClientFromConfig(ctx, cfg)
 }
 
 func newMCPConfig() (*config.Config, error) {
@@ -371,7 +447,7 @@ func newMCPConfig() (*config.Config, error) {
 	return cfg, nil
 }
 
-func newMCPClientFromConfig(cfg *config.Config) *client.Client {
+func newMCPClientFromConfig(ctx context.Context, cfg *config.Config) (*client.Client, *platform.Session, error) {
 	c := client.New(cfg, 60*time.Second, defaultMCPRateLimit)
 	// Agents calling through MCP need fresh data every call. The on-disk
 	// response cache survives across MCP server invocations, so a
@@ -379,7 +455,17 @@ func newMCPClientFromConfig(cfg *config.Config) *client.Client {
 	// pre-mutation snapshot for up to the cache TTL. The interactive CLI
 	// constructs its own client and is unaffected.
 	c.NoCache = true
-	return c
+	session, err := cli.BindMCPClient(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cli.ApplyClientHooks(c); err != nil {
+		if session != nil {
+			session.ZeroCredentials()
+		}
+		return nil, nil, fmt.Errorf("initializing MCP client: %w", err)
+	}
+	return c, session, nil
 }
 
 func mcpDBPath() (string, error) {
@@ -393,8 +479,9 @@ func mcpDBPath() (string, error) {
 type mcpStoreStatusKind string
 
 const (
-	mcpStoreStatusEmpty mcpStoreStatusKind = "empty"
-	mcpStoreStatusReady mcpStoreStatusKind = "ready"
+	mcpStoreStatusEmpty   mcpStoreStatusKind = "empty"
+	mcpStoreStatusPartial mcpStoreStatusKind = "partial"
+	mcpStoreStatusReady   mcpStoreStatusKind = "ready"
 )
 
 func openMCPReadOnlyStore(path string) (*store.Store, *mcplib.CallToolResult) {
@@ -420,14 +507,41 @@ func mcpStoreStatus(db *store.Store) (mcpStoreStatusKind, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(status) == 0 {
-		return mcpStoreStatusEmpty, nil
+	var checkpoints, completed int
+	err = db.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN last_attempt_complete = 1 THEN 1 ELSE 0 END), 0) FROM sync_state`).Scan(&checkpoints, &completed)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no such column: last_attempt_complete") {
+		// Read-only stores have not run the conservative completion migration.
+		// Legacy timestamps were also written by partial walks, so prove nothing.
+		err = db.DB().QueryRow(`SELECT COUNT(*), 0 FROM sync_state`).Scan(&checkpoints, &completed)
 	}
-	return mcpStoreStatusReady, nil
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such table") || strings.Contains(msg, "no such column") {
+			if len(status) > 0 {
+				return mcpStoreStatusReady, nil
+			}
+			return mcpStoreStatusEmpty, nil
+		}
+		return "", err
+	}
+	if checkpoints > 0 {
+		if completed == checkpoints {
+			return mcpStoreStatusReady, nil
+		}
+		return mcpStoreStatusPartial, nil
+	}
+	if len(status) > 0 {
+		return mcpStoreStatusReady, nil
+	}
+	return mcpStoreStatusEmpty, nil
 }
 
 func mcpEmptyStoreNextStep() string {
 	return "Run zammad-cli sync to populate the local SQLite store before using MCP search/sql."
+}
+
+func mcpPartialStoreNextStep() string {
+	return "The latest sync attempt is incomplete. Resume or rerun zammad-cli sync before treating local search/sql results as a complete snapshot."
 }
 
 func handleSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -474,7 +588,10 @@ func mcpSearchEnvelope(results []json.RawMessage, storeStatus mcpStoreStatusKind
 		"store_status": storeStatus,
 		"resumable":    false,
 	}
-	if len(results) == 0 {
+	if storeStatus == mcpStoreStatusPartial {
+		out["warning"] = "Local data may be incomplete because the latest sync attempt did not finish."
+		out["next_step"] = mcpPartialStoreNextStep()
+	} else if len(results) == 0 {
 		if storeStatus == mcpStoreStatusEmpty {
 			out["next_step"] = mcpEmptyStoreNextStep()
 		} else {
@@ -634,6 +751,8 @@ func hasTrailingSQLStatement(query string) bool {
 	return false
 }
 
+const mcpSQLMaxValueBytes = 4 << 20
+
 func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
 	query, ok := args["query"].(string)
@@ -655,9 +774,22 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 	}
 	defer db.Close()
 
-	rows, err := db.DB().QueryContext(ctx, query)
+	queryCtx, cancel := bound.WithSQLQueryDeadline(ctx)
+	defer cancel()
+
+	conn, err := db.DB().Conn(queryCtx)
 	if err != nil {
-		return mcplib.NewToolResultError(mcpSQLQueryError(err)), nil
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+	}
+	defer conn.Close()
+
+	if _, err := sqlite.Limit(conn, sqlite3.SQLITE_LIMIT_LENGTH, mcpSQLMaxValueBytes); err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("setting SQL value length cap: %v", err)), nil
+	}
+
+	rows, err := conn.QueryContext(queryCtx, query)
+	if err != nil {
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
 	}
 	defer rows.Close()
 
@@ -665,7 +797,7 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("reading columns: %v", err)), nil
 	}
-	var results []map[string]any
+	scan := bound.NewSQLScanState(cols)
 	for rows.Next() {
 		values := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -673,28 +805,33 @@ func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToo
 			ptrs[i] = &values[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
+			if mcpSQLValueTooBig(err) {
+				return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
+			}
 			return mcplib.NewToolResultError(fmt.Sprintf("scanning row: %v", err)), nil
 		}
 		row := make(map[string]any)
 		for i, col := range cols {
 			row[col] = values[i]
 		}
-		results = append(results, row)
+		if !scan.Add(row) {
+			break
+		}
 	}
 	// rows.Next() stops on a mid-iteration error without failing the loop, so
 	// skipping rows.Err() would return a truncated result set as success.
 	if err := rows.Err(); err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("reading rows: %v", err)), nil
+		return mcplib.NewToolResultError(mcpSQLQueryError(queryCtx, err)), nil
 	}
 	storeStatus, err := mcpStoreStatus(db)
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("reading store status: %v", err)), nil
 	}
 
-	return toolResultJSON(mcpSQLEnvelope(results, cols, storeStatus))
+	return toolResultJSON(mcpSQLEnvelope(scan.Rows, cols, storeStatus, scan.Truncated))
 }
 
-func mcpSQLEnvelope(rows []map[string]any, columns []string, storeStatus mcpStoreStatusKind) map[string]any {
+func mcpSQLEnvelope(rows []map[string]any, columns []string, storeStatus mcpStoreStatusKind, truncated bool) map[string]any {
 	if rows == nil {
 		rows = []map[string]any{}
 	}
@@ -704,8 +841,17 @@ func mcpSQLEnvelope(rows []map[string]any, columns []string, storeStatus mcpStor
 		"rows":         rows,
 		"store_status": storeStatus,
 		"resumable":    false,
+		"truncated":    truncated,
 	}
-	if len(rows) == 0 {
+	if truncated {
+		out["returned_count"] = len(rows)
+		out["max_bytes"] = bound.MaxBytes
+		out["note"] = bound.SQLResultBoundNote
+	}
+	if storeStatus == mcpStoreStatusPartial {
+		out["warning"] = "Local data may be incomplete because the latest sync attempt did not finish."
+		out["next_step"] = mcpPartialStoreNextStep()
+	} else if len(rows) == 0 && !truncated {
 		if storeStatus == mcpStoreStatusEmpty {
 			out["next_step"] = mcpEmptyStoreNextStep()
 		} else {
@@ -715,12 +861,23 @@ func mcpSQLEnvelope(rows []map[string]any, columns []string, storeStatus mcpStor
 	return out
 }
 
-func mcpSQLQueryError(err error) string {
+func mcpSQLQueryError(queryCtx context.Context, err error) string {
+	if queryCtx.Err() != nil {
+		return fmt.Sprintf("query cancelled: %v. MCP SQL queries are bounded to %s; narrow the query with WHERE, GROUP BY, or an aggregate.", err, bound.SQLQueryTimeout)
+	}
+	if mcpSQLValueTooBig(err) {
+		return fmt.Sprintf("query failed: a string or blob exceeds the MCP SQL value cap of %d bytes (4 MiB). Narrow the selected columns or use substr, json_extract, or length instead of returning oversized values.", mcpSQLMaxValueBytes)
+	}
 	msg := err.Error()
 	if strings.Contains(strings.ToLower(msg), "no such table") {
 		return fmt.Sprintf("query failed: %v. Synced records live in resources(resource_type, id, data), not one SQL table per resource. Filter by resource_type, for example resource_type='articles', and read JSON fields with json_extract(data,'$.field').", err)
 	}
 	return fmt.Sprintf("query failed: %v", err)
+}
+
+func mcpSQLValueTooBig(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_TOOBIG
 }
 
 // toolResultJSON renders v as the indented JSON body of an MCP text result,
@@ -732,8 +889,31 @@ func toolResultJSON(v any) (*mcplib.CallToolResult, error) {
 	}
 	return mcplib.NewToolResultText(text), nil
 }
+func registeredCommandMirrorCapabilities(s *server.MCPServer, capabilities []map[string]string) []map[string]string {
+	registered := make([]map[string]string, 0, len(capabilities))
+	root := cli.RootCmd()
+	for _, capability := range capabilities {
+		toolName := cobratree.ToolNameForCommand(s, root, capability["cli_command"])
+		if toolName == "" {
+			continue
+		}
+		entry := s.GetTool(toolName)
+		if entry == nil || entry.Tool.Meta == nil || entry.Tool.Meta.AdditionalFields["pp:tenant-gate"] != "child-cli" {
+			continue
+		}
+		capability["mcp_tool"] = toolName
+		registered = append(registered, capability)
+	}
+	return registered
+}
 
-func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+func handleContext(s *server.MCPServer) func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		return handleContextResult(s, ctx, req)
+	}
+}
+
+func handleContextResult(s *server.MCPServer, _ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	paths := map[string]string{}
 	if dir, err := cliutil.ConfigDir(); err == nil {
 		paths["config_dir"] = dir
@@ -750,8 +930,8 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 	ctx := map[string]any{
 		"api":         "zammad",
 		"description": "Every Zammad ticket, article, and Knowledge Base operation as one agent-native CLI — plus a team-management layer (agent load, customer health, aging backlog, escalation triage, churn risk, feedback mining) the Zammad API can't answer in a single call.",
-		"archetype":   "project-management",
-		"tool_count":  36,
+		"archetype":   "content",
+		"tool_count":  len(s.ListTools()),
 		"paths":       paths,
 		// tool_surface tells agents which surface a capability lives on.
 		"tool_surface": "MCP exposes typed endpoint tools plus a runtime mirror of user-facing CLI commands. Endpoint tools keep typed schemas; command-mirror tools shell out to the companion zammad-cli binary.",
@@ -853,34 +1033,31 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 		},
 		// Command-mirror capabilities are exposed through MCP by shelling out
 		// to the companion CLI binary.
-		"command_mirror_capabilities": []map[string]string{
-			{"name": "Ticket volume by agent", "command": "agent-load", "description": "See each agent's current ticket load broken out by state (open/pending/backlog) so you can balance work before it piles up.", "rationale": "Requires a local group-by owner across every ticket with a per-state rollup; the Zammad API has no per-agent aggregate endpoint.", "via": "mcp-command-mirror"},
-			{"name": "Agent open/closed trend", "command": "agent-trend", "description": "Show whether each agent's queue is growing or shrinking across the last N weeks, with opened-vs-closed deltas.", "rationale": "Requires windowed historical created/closed timestamps computed locally; no API endpoint returns a trend.", "via": "mcp-command-mirror"},
-			{"name": "Customer health indicators", "command": "customer-health", "description": "Rank organizations by a health signal built from open count, oldest-open age, reopen rate, velocity, and last activity.", "rationale": "Requires joining open count + age + reopen + velocity per organization; the API returns none of these together.", "via": "mcp-command-mirror"},
-			{"name": "Tickets open too long", "command": "overdue", "description": "Find aging tickets still in new/open/pending past a threshold, weighted by priority so the worst rise to the top.", "rationale": "Requires age computation against state and priority over the full backlog, not a single filtered call.", "via": "mcp-command-mirror"},
-			{"name": "Escalation sentiment triage", "command": "escalate", "description": "Surface active tickets whose recent customer messages read as upset (heuristic negative-signal scan), ranked by hits, age, and priority — with the matched snippets shown.", "rationale": "Requires scanning inbound customer article bodies for a negative-signal lexicon and fusing age/priority; the API has no sentiment.", "via": "mcp-command-mirror"},
-			{"name": "Proactive churn risk", "command": "churn-risk", "description": "Score each organization's churn risk from open backlog, overdue tickets, unanswered pending, and negative-sentiment customer messages, listing the contributing factors.", "rationale": "Requires fusing multiple local signals per organization that no single API call exposes.", "via": "mcp-command-mirror"},
-			{"name": "Feedback mining", "command": "feedback-scan", "description": "Bucket ticket and article text into feature-request, pricing, compliance, and bug themes with the source ticket refs and snippets.", "rationale": "Requires lexicon bucketing over the local store; the API cannot classify free text.", "via": "mcp-command-mirror"},
-			{"name": "Knowledge Base browse", "command": "kb browse", "description": "Print the Knowledge Base as a category/answer tree parsed from the init bundle.", "rationale": "knowledge_bases/init returns an asset bundle, not a list — it must be parsed into a tree locally.", "via": "mcp-command-mirror"},
-			{"name": "Knowledge Base search", "command": "kb search", "description": "Offline text search over KB answer titles and bodies from the init bundle.", "rationale": "There is no KB text-search endpoint; search runs locally over the parsed init bundle.", "via": "mcp-command-mirror"},
-			{"name": "Knowledge Base get answer", "command": "kb get", "description": "Resolve a KB answer id from the init bundle to its full translated body.", "rationale": "The init bundle stores answers and translations separately; resolving a full body requires local joining.", "via": "mcp-command-mirror"},
-			{"name": "Add ticket note", "command": "ticket note", "description": "Add an internal or partner-visible note to a ticket in one line, with correct content-type defaults.", "rationale": "Wraps the fiddly ticket_articles create shape (type/internal/content_type) into one ergonomic verb.", "via": "mcp-command-mirror"},
-		},
+		"command_mirror_capabilities": registeredCommandMirrorCapabilities(s, []map[string]string{
+			{"name": "Ticket volume by agent", "command": "agent-load", "cli_command": "agent-load", "description": "See each agent's current ticket load broken out by state (open/pending/backlog)", "rationale": "Requires a local group-by owner across every ticket with a per-state rollup", "via": "mcp-command-mirror"},
+			{"name": "Agent open/closed trend", "command": "agent-trend", "cli_command": "agent-trend", "description": "Show whether each agent's queue is growing or shrinking across the last N weeks, with opened-vs-closed deltas.", "rationale": "Requires windowed historical created/closed timestamps computed locally; no API endpoint returns a trend.", "via": "mcp-command-mirror"},
+			{"name": "Customer health indicators", "command": "customer-health", "cli_command": "customer-health", "description": "Rank organizations by a health signal built from open count, oldest-open age, reopen rate, velocity, and last activity.", "rationale": "Requires joining open count + age + reopen + velocity per organization; the API returns none of these together.", "via": "mcp-command-mirror"},
+			{"name": "Tickets open too long", "command": "overdue", "cli_command": "overdue", "description": "Find aging tickets still in new/open/pending past a threshold, weighted by priority so the worst rise to the top.", "rationale": "Requires age computation against state and priority over the full backlog, not a single filtered call.", "via": "mcp-command-mirror"},
+			{"name": "Escalation sentiment triage", "command": "escalate", "cli_command": "escalate", "description": "Surface active tickets whose recent customer messages read as upset (heuristic negative-signal scan), ranked by hits", "rationale": "Requires scanning inbound customer article bodies for a negative-signal lexicon and fusing age/priority", "via": "mcp-command-mirror"},
+			{"name": "Proactive churn risk", "command": "churn-risk", "cli_command": "churn-risk", "description": "Score each organization's churn risk from open backlog, overdue tickets, unanswered pending", "rationale": "Requires fusing multiple local signals per organization that no single API call exposes.", "via": "mcp-command-mirror"},
+			{"name": "Feedback mining", "command": "feedback-scan", "cli_command": "feedback-scan", "description": "Bucket ticket and article text into feature-request, pricing, compliance", "rationale": "Requires lexicon bucketing over the local store; the API cannot classify free text.", "via": "mcp-command-mirror"},
+			{"name": "Knowledge Base browse", "command": "kb browse", "cli_command": "kb browse", "description": "Print the Knowledge Base as a category/answer tree parsed from the init bundle.", "rationale": "knowledge_bases/init returns an asset bundle, not a list — it must be parsed into a tree locally.", "via": "mcp-command-mirror"},
+			{"name": "Knowledge Base search", "command": "kb search", "cli_command": "kb search", "description": "Offline text search over KB answer titles and bodies from the init bundle.", "rationale": "There is no KB text-search endpoint; search runs locally over the parsed init bundle.", "via": "mcp-command-mirror"},
+			{"name": "Knowledge Base get answer", "command": "kb get", "cli_command": "kb get", "description": "Resolve a KB answer id from the init bundle to its full translated body.", "rationale": "The init bundle stores answers and translations separately; resolving a full body requires local joining.", "via": "mcp-command-mirror"},
+			{"name": "Add ticket note", "command": "ticket note", "cli_command": "ticket note", "description": "Add an internal or partner-visible note to a ticket in one line, with correct content-type defaults.", "rationale": "Wraps the fiddly ticket_articles create shape (type/internal/content_type) into one ergonomic verb.", "via": "mcp-command-mirror"},
+		}),
 		"playbook": []map[string]string{
 			{"topic": "Ticket volume by agent", "insight": "Requires a local group-by owner across every ticket with a per-state rollup; the Zammad API has no per-agent aggregate endpoint."},
 			{"topic": "Agent open/closed trend", "insight": "Requires windowed historical created/closed timestamps computed locally; no API endpoint returns a trend."},
 			{"topic": "Customer health indicators", "insight": "Requires joining open count + age + reopen + velocity per organization; the API returns none of these together."},
 			{"topic": "Tickets open too long", "insight": "Requires age computation against state and priority over the full backlog, not a single filtered call."},
-			{"topic": "Escalation sentiment triage", "insight": "Requires scanning article bodies for a negative-signal lexicon and fusing tag/age/priority; the API has no sentiment."},
+			{"topic": "Escalation sentiment triage", "insight": "Requires scanning inbound customer article bodies for a negative-signal lexicon and fusing age/priority; the API has no sentiment."},
 			{"topic": "Proactive churn risk", "insight": "Requires fusing multiple local signals per organization that no single API call exposes."},
 			{"topic": "Feedback mining", "insight": "Requires lexicon bucketing over the local store; the API cannot classify free text."},
 			{"topic": "Knowledge Base browse", "insight": "knowledge_bases/init returns an asset bundle, not a list — it must be parsed into a tree locally."},
 			{"topic": "Knowledge Base search", "insight": "There is no KB text-search endpoint; search runs locally over the parsed init bundle."},
 			{"topic": "Knowledge Base get answer", "insight": "The init bundle stores answers and translations separately; resolving a full body requires local joining."},
 			{"topic": "Add ticket note", "insight": "Wraps the fiddly ticket_articles create shape (type/internal/content_type) into one ergonomic verb."},
-			{"topic": "Finding stale work", "insight": "Use the stale command or sql query to find items not updated recently. More reliable than scanning list results manually."},
-			{"topic": "Load analysis", "insight": "When analyzing team workload, filter by assignee and status. Raw counts without status filtering are misleading."},
-			{"topic": "Bulk operations", "insight": "For bulk status changes, prefer update endpoints over delete+create. Most PM APIs track history on updates."},
 		},
 	}
 	return toolResultJSON(ctx)
