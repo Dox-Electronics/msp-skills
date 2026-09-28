@@ -464,7 +464,7 @@ class GoPackage(Scope):
         return best[1] if best else None
 
 
-RE_ASSIGN = re.compile(r"(?m)(?:^|[{;])[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(.+?)[\t ]*$")
+RE_ASSIGN = re.compile(r"(?m)^[\t ]*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?::?=)\s*(.+?)[\t ]*$")
 # A package-level (or local) `var names = []string{` whose literal spans several
 # lines. RE_ASSIGN stops at the end of the first line and binds the useless
 # opener `[]string{`; slice_literal_bindings() binds the whole literal so a
@@ -639,6 +639,25 @@ def blank_strings(src: str) -> str:
     return "".join(out)
 
 
+RE_RANGE_HEAD = re.compile(r"for\s+(?:([A-Za-z_]\w*)\s*,\s*)?([A-Za-z_]\w*)\s*:?=\s*range\s+$")
+
+
+def range_value_rebound(text: str, operand: "re.Match") -> bool:
+    """True when the VALUE variable of `for _, v := range <operand> {` may be
+    changed or shadowed in the loop body (`v = x`, `v += x`, `v := x`, `&v`).
+    Then the whole literal no longer says what the loop reads."""
+    head = RE_RANGE_HEAD.search(text[:operand.start()])
+    if head is None:
+        return True  # an unrecognised range header: do not vouch for it
+    if head.group(1) is None:
+        return False  # `for i := range names`: only the int index is bound
+    value = re.escape(head.group(2))
+    brace = text.index("{", operand.end())
+    close = match_close(text, brace, "{", "}")
+    body = text[brace + 1:close] if close != -1 else text[brace + 1:]
+    return re.search(rf"(?<![\w.]){value}\s*(?:[-+*/%|&^:]|<<|>>|&\^)?=(?!=)|&\s*{value}\b", body) is not None
+
+
 def guard_whole_slices(packages: list[GoPackage]) -> None:
     """Keep a whole-bound []string literal only while nothing can change it.
 
@@ -672,7 +691,7 @@ def guard_whole_slices(packages: list[GoPackage]) -> None:
                     after = text[m.end():]
                     is_range = (re.search(r"\brange\s+$", before) is not None
                                 and re.match(r"\s*\{", after) is not None)
-                    if not is_range:
+                    if not is_range or range_value_rebound(text, m):
                         unsafe = True
                         break
                 if unsafe:
@@ -1842,6 +1861,13 @@ _fixture(
     'package cli\nimport "os"\n'
     'func a() {\n\tnames := []string{\n\t\t"CODEX_THREAD_ID",\n\t}\n'
     '\tfor _, name := range names {\n\t\tif true { name = pick() }\n\t\tos.Getenv(name)\n\t}\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "a range variable SHADOWED mid-line keeps the read reported",
+    'package cli\nimport "os"\n'
+    'func a() {\n\tnames := []string{\n\t\t"CODEX_THREAD_ID",\n\t}\n'
+    '\tfor _, name := range names {\n\t\tif true { name := pick(); os.Getenv(name) }\n\t\tos.Getenv(name)\n\t}\n}\n',
     {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
