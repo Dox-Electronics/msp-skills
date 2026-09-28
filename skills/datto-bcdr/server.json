@@ -54,6 +54,12 @@
           "isSecret": true
         },
         {
+          "name": "DATTO_BCDR_USER_AGENT",
+          "description": "Overrides the User-Agent the CLI sends on Datto BCDR requests. Leave blank to use the CLI's own built-in User-Agent.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
           "name": "PRINTING_PRESS_CLIENT_PROFILE",
           "description": "Only used when the MCP server is bound to a tenant-gated Printing Press client profile; leave blank otherwise.",
           "isRequired": false,

@@ -41,6 +41,7 @@ Add (or merge with your existing `mcpServers` block):
         "DATTO_BCDR_PUBLIC_KEY": "<your-datto_bcdr_public_key>",
         "DATTO_BCDR_SECRET_KEY": "<your-datto_bcdr_secret_key>",
         "DATTO_BCDR_MCP_HTTP_TOKEN": "",
+        "DATTO_BCDR_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -70,6 +71,7 @@ Configuration**) and add:
         "DATTO_BCDR_PUBLIC_KEY": "<your-datto_bcdr_public_key>",
         "DATTO_BCDR_SECRET_KEY": "<your-datto_bcdr_secret_key>",
         "DATTO_BCDR_MCP_HTTP_TOKEN": "",
+        "DATTO_BCDR_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -95,6 +97,7 @@ Claude Desktop:
         "DATTO_BCDR_PUBLIC_KEY": "<your-datto_bcdr_public_key>",
         "DATTO_BCDR_SECRET_KEY": "<your-datto_bcdr_secret_key>",
         "DATTO_BCDR_MCP_HTTP_TOKEN": "",
+        "DATTO_BCDR_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -113,10 +116,10 @@ All remote agents need `datto-bcdr-mcp` reachable as a public **HTTPS** endpoint
 in HTTP mode with your credentials in the environment:
 
 ```bash
-DATTO_BCDR_BASE_URL=<value> DATTO_BCDR_MCP_HTTP_TOKEN=<value> DATTO_BCDR_PUBLIC_KEY=<value> DATTO_BCDR_SECRET_KEY=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> datto-bcdr-mcp --transport http --addr 127.0.0.1:7777
+DATTO_BCDR_BASE_URL=<value> DATTO_BCDR_MCP_HTTP_TOKEN=<value> DATTO_BCDR_PUBLIC_KEY=<value> DATTO_BCDR_SECRET_KEY=<value> DATTO_BCDR_USER_AGENT=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> datto-bcdr-mcp --transport http
 ```
 
-Bind to loopback (`127.0.0.1:7777`) and let the tunnel terminate TLS: the server refuses a plaintext bind on any non-loopback address unless you pass `--tls-cert` and `--tls-key`. Every caller must send `Authorization: Bearer <DATTO_BCDR_MCP_HTTP_TOKEN>`; the server exits at start-up if that variable is unset.
+Leave `--addr` at its default, which binds loopback only on port 7777, and let the tunnel terminate TLS: the server refuses a plaintext bind on any non-loopback address (including `--addr :7777`, which binds every interface) unless you pass `--tls-cert` and `--tls-key`. Every caller must send `Authorization: Bearer <DATTO_BCDR_MCP_HTTP_TOKEN>`; the server exits at start-up if that variable is unset.
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel
 (Cloudflare Tunnel, ngrok) or your own reverse proxy. The path is part of the
