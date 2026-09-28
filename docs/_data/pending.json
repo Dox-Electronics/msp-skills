@@ -471,7 +471,7 @@
   "wordpress": {
     "state": "up-to-date",
     "version": "0.1.4",
-    "latest_tag": "wordpress-v0.1.4",
+    "latest_tag": "wordpress-v0.1.5",
     "current_hash": "sha256:2a65663dc14cb16ea6f3e08b3b32891ce0bde941cf8f60e3a4bfeeb6bf228f84",
     "released_hash": "sha256:2a65663dc14cb16ea6f3e08b3b32891ce0bde941cf8f60e3a4bfeeb6bf228f84"
   },
