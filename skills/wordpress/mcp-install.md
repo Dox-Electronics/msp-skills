@@ -40,7 +40,8 @@ Add (or merge with your existing `mcpServers` block):
         "WORDPRESS_BASE_URL": "https://wordpress.org/news/wp-json/wp/v2",
         "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>",
         "WORDPRESS_MCP_HTTP_TOKEN": "",
-        "PRINTING_PRESS_CLIENT_PROFILE": ""
+        "PRINTING_PRESS_CLIENT_PROFILE": "",
+        "WORDPRESS_USER_AGENT": ""
       }
     }
   }
@@ -68,7 +69,8 @@ Configuration**) and add:
         "WORDPRESS_BASE_URL": "https://wordpress.org/news/wp-json/wp/v2",
         "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>",
         "WORDPRESS_MCP_HTTP_TOKEN": "",
-        "PRINTING_PRESS_CLIENT_PROFILE": ""
+        "PRINTING_PRESS_CLIENT_PROFILE": "",
+        "WORDPRESS_USER_AGENT": ""
       }
     }
   }
@@ -92,7 +94,8 @@ Claude Desktop:
         "WORDPRESS_BASE_URL": "https://wordpress.org/news/wp-json/wp/v2",
         "WORDPRESS_BASIC_AUTH": "<your-wordpress_basic_auth>",
         "WORDPRESS_MCP_HTTP_TOKEN": "",
-        "PRINTING_PRESS_CLIENT_PROFILE": ""
+        "PRINTING_PRESS_CLIENT_PROFILE": "",
+        "WORDPRESS_USER_AGENT": ""
       }
     }
   }

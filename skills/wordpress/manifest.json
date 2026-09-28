@@ -18,7 +18,8 @@
         "WORDPRESS_BASE_URL": "${user_config.wordpress_base_url}",
         "WORDPRESS_BASIC_AUTH": "${user_config.wordpress_basic_auth}",
         "WORDPRESS_MCP_HTTP_TOKEN": "${user_config.wordpress_mcp_http_token}",
-        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}",
+        "WORDPRESS_USER_AGENT": "${user_config.wordpress_user_agent}"
       }
     }
   },
@@ -48,6 +49,12 @@
       "type": "string",
       "title": "Client profile",
       "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
+      "required": false
+    },
+    "wordpress_user_agent": {
+      "type": "string",
+      "title": "User-Agent header",
+      "description": "Overrides the User-Agent the CLI sends on WordPress requests (some hosts and security plugins block unfamiliar agents). Leave blank to use the CLI's own built-in User-Agent.",
       "required": false
     }
   },
