@@ -543,14 +543,19 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
         pkg.spans[path] = spans
         pkg.decl_sites[path] = decls
 
+        # Line starts where RE_ASSIGN_SLICE bound a complete multi-line []string
+        # literal. Only THOSE openers are skipped below: any other `x := T{`
+        # opener (a map index, a struct literal) keeps its unresolvable binding,
+        # so a read through it stays reported instead of silently falling back
+        # to an unrelated package-level binding of the same name.
+        slice_starts = {m.start() for m in RE_ASSIGN_SLICE.finditer(src)}
         for regex, group in ((RE_ASSIGN, 2), (RE_ASSIGN_SLICE, 2), (RE_RANGE_LIT, 2)):
             for m in regex.finditer(src):
                 rhs = m.group(group)
-                if regex is RE_ASSIGN and rhs.rstrip().endswith("{"):
-                    # An unterminated composite-literal opener (`[]string{` on a
-                    # line of its own); RE_ASSIGN_SLICE binds the whole literal.
-                    # Binding the opener too would make every element read look
-                    # partly unresolved.
+                if regex is RE_ASSIGN and m.start() in slice_starts and rhs.rstrip().endswith("{"):
+                    # The first line of a multi-line []string literal that
+                    # RE_ASSIGN_SLICE bound whole; binding the bare opener too
+                    # would put UNRESOLVED into the union.
                     continue
                 scope = pkg.func_at(path, m.start()) or pkg
                 scope.bind(m.group(1), rhs)
@@ -642,9 +647,15 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
     if slice_lit:
         out = set()
         for element in split_top(slice_lit.group(1), ","):
+            if not element.strip():
+                continue  # trailing comma of a multi-line literal
             value = as_literal(element)
             if value is not None:
                 out.add(value)
+            else:
+                # A non-literal element (`[]string{"A", secretName}`) is resolved
+                # like any other expression; dropping it would hide a read.
+                out |= resolve(element, pkg, env_prefix, scope, depth + 1, seen)
         return out or {UNRESOLVED}
 
     parts = split_top(expr, "+")
@@ -1454,6 +1465,31 @@ _fixture(
     'func a() string {\n\tfor _, name := range JournalHarnessSessionEnvVars {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
     {"CODEX_THREAD_ID", "CLAUDE_SESSION_ID"}, set(),
+)
+_fixture(
+    "multi-line map-index opener keeps its unresolved local binding (no fallback to a package binding)",
+    'package cli\nimport "os"\n'
+    'var name = "CODEX_THREAD_ID"\n'
+    'func a() string {\n\tname := map[string]string{\n\t\t"x": "COVE_PASSWORD",\n\t}["x"]\n'
+    '\treturn os.Getenv(name)\n}\n',
+    set(), {"name"},
+)
+_fixture(
+    "multi-line []string with a non-literal element resolves that element too",
+    'package cli\nimport "os"\n'
+    'const secret = "COVE_PASSWORD"\n'
+    'var names = []string{\n\t"CODEX_THREAD_ID",\n\tsecret,\n}\n'
+    'func a() string {\n\tfor _, name := range names {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    {"CODEX_THREAD_ID", "COVE_PASSWORD"}, set(),
+)
+_fixture(
+    "multi-line []string with an unresolvable element keeps the read reported",
+    'package cli\nimport "os"\n'
+    'var names = []string{\n\t"CODEX_THREAD_ID",\n\tlookup(),\n}\n'
+    'func a() string {\n\tfor _, name := range names {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
