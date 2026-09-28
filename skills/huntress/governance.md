@@ -10,7 +10,7 @@
 The skill drives the `huntress-cli` binary (and `huntress-mcp`),
 authenticating with `HUNTRESS_API_KEY`, `HUNTRESS_API_SECRET`. Credentials come from the environment, or from
 `huntress-cli auth set-credentials`, which saves them to an owner-only (0600) credentials file in the CLI's
-config directory. They are never logged and never sent anywhere except the Huntress API.
+data directory (next to the local store). They are never logged and never sent anywhere except the Huntress API.
 
 ## Default-safe behavior
 
