@@ -430,7 +430,7 @@
   {
    "id": "doctor-probe-requires-auth",
    "summary": "doctor verifies the credential against /users/me (auth-required) instead of the first argument-free GET the tree walk finds (/categories, a public route)",
-   "why": "The doctor-verdict-tracks-reality probe walks the command tree for the first argument-free GET. On WordPress that is /categories, which answers 200 to an anonymous request, so when the web server strips the Authorization header (the most common Application Password failure: Apache/CGI and some hosts drop it) doctor reported the credential 'valid' while every write would fail. /users/me answers 401 rest_not_logged_in unless the request authenticated, so a 200 there proves the credential was accepted. Found by the Codex review of the 4.32.5 reprint (P1, inherited from the 4.26.1 hand-fix, not introduced by the reprint). doctor_auth_probe_test.go uses a server that ignores Authorization: it fails with the override removed (doctor says valid) and passes with it; its twin pins that an honoured credential still reads valid.",
+   "why": "The doctor-verdict-tracks-reality probe walks the command tree for the first argument-free GET. On WordPress that is /categories, which answers 200 to an anonymous request, so when the web server strips the Authorization header (the most common Application Password failure: Apache/CGI and some hosts drop it) doctor reported the credential 'valid' while every write would fail. /users/me answers 401 rest_not_logged_in unless the request authenticated, so a 200 there proves the credential was accepted. Found by the Codex review of the 4.32.5 reprint (P1, inherited from the 4.26.1 hand-fix, not introduced by the reprint). doctor_auth_probe_test.go uses a server that ignores Authorization: it fails with the override removed (doctor says valid) and passes with it; its twin pins that an honoured credential still reads valid. Codex round 3 (P2, cured): a site can unregister /users/me while serving everything else, so a 404 there re-probes the tree-walk route and reports WARN not-verified when that answers, keeping the wrong-base_url ERROR for the case where both routes 404 (TestDoctorDisabledUsersEndpointIsNotAWrongBaseURL, TestDoctorWrongBaseURLStillReported).",
    "status": "active",
    "spec_encode_followup": "Let the spec name an auth-required probe endpoint (e.g. x-doctor-probe: /users/me) so the generated doctor does not have to guess from the tree walk.",
    "asserts": [
@@ -450,6 +450,12 @@
      "file": "cli/internal/cli/doctor_auth_probe_test.go",
      "contains": "func TestDoctorDoesNotCallAnAnonymousAnswerValid(",
      "min_count": 1
+    },
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "case status == 404 && apiPath == doctorAuthProbePath",
+     "min_count": 1,
+     "code_only": true
     }
    ]
   }

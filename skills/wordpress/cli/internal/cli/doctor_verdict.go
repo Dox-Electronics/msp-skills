@@ -213,6 +213,7 @@ func doctorProbeCredentials(ctx context.Context, c *client.Client, root *cobra.C
 		return
 	}
 	apiPath, cmdPath := doctorReadProbe(root)
+	walkPath := apiPath
 	if doctorAuthProbePath != "" {
 		apiPath, cmdPath = doctorAuthProbePath, doctorAuthProbeCmd
 	}
@@ -233,6 +234,17 @@ func doctorProbeCredentials(ctx context.Context, c *client.Client, root *cobra.C
 		report["credentials"] = fmt.Sprintf("ERROR rejected (HTTP 401 from %s) - the credential is invalid, expired, or for a different tenant.", apiPath)
 	case status == 403:
 		report["credentials"] = fmt.Sprintf("scope-limited (HTTP 403 from %s) - the credential is accepted but lacks permission for this endpoint.", apiPath)
+	case status == 404 && apiPath == doctorAuthProbePath && walkPath != "" && walkPath != apiPath:
+		// A site can unregister /users/me (rest_endpoints filter) and still
+		// serve everything else. Only call base_url wrong when a second,
+		// ordinary route is missing too.
+		if walkStatus, walkErr := c.ProbeGet(ctx, walkPath); walkErr == nil {
+			report["credentials"] = fmt.Sprintf("WARN not verified: %s is unavailable on this site (HTTP 404; it may be disabled) while %s answers, so base_url is right but the credential could not be checked. Run any write command to confirm it end-to-end.", apiPath, walkPath)
+		} else if walkStatus == 404 {
+			doctorWrongBaseURL(apiPath, report)
+		} else {
+			report["credentials"] = fmt.Sprintf("WARN not verified (HTTP 404 from %s, HTTP %d from %s).", apiPath, walkStatus, walkPath)
+		}
 	case status == 404:
 		doctorWrongBaseURL(apiPath, report)
 	case status >= 500:

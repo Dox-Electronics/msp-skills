@@ -64,3 +64,29 @@ func TestDoctorCallsAnAuthenticatedAnswerValid(t *testing.T) {
 		t.Fatalf("credential honoured by the server, yet doctor said %q", got)
 	}
 }
+
+func TestDoctorDisabledUsersEndpointIsNotAWrongBaseURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/users/me") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"rest_no_route"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	got := probeVerdict(t, srv.URL)
+	if strings.HasPrefix(got, "valid") || strings.HasPrefix(got, "ERROR") {
+		t.Fatalf("/users/me disabled but site healthy: want a WARN not-verified verdict, got %q", got)
+	}
+}
+
+func TestDoctorWrongBaseURLStillReported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	if got := probeVerdict(t, srv.URL); !strings.Contains(got, "HTTP 404") || !strings.HasPrefix(got, "ERROR") {
+		t.Fatalf("every route 404s: want the wrong-base_url ERROR, got %q", got)
+	}
+}
