@@ -6,7 +6,7 @@
   {
    "id": "doctor-verdict-tracks-reality",
    "summary": "doctor probes a real GET endpoint with the real credential and refuses to dial a placeholder base_url, instead of calling any HTTP response 'reachable' and never checking the credential",
-   "why": "`doctor` is the command every SKILL, guide and docs page tells an operator to run to confirm the connector works, and it could not tell a working install from a broken one. It called any HTTP response to `GET /` \"reachable\" and rendered it green, so a base_url aimed at the vendor's web UI (where every API path 404s) and a token rejected with 401 on every call both produced an all-green report. On this connector family it also never probed the credential at all: it printed \"present, not verified\" and left the operator to guess. The mirror defect: a connector whose shipped base_url default is a placeholder dialled the placeholder host, and the DNS failure rendered as \"FAIL API: unreachable\" - telling a correctly-credentialled operator they were broken without naming the one variable that would fix it. Several placeholder hosts resolve through live wildcard DNS and answer real HTTP, so dialling one produced a confident green verdict against a stranger's server. Measured and gated by tools/maintainer/check_doctor_truth.py. See issue #282. 2026-09-28 reprint on press 4.32.5: the info-key exclusion in doctorExitForFailOn (doctorInfoKeys + doctorIsInfoKey) is now emitted natively, so doctor_verdict.go no longer defines it and only adds \"db_path\" to the native map by a one-line body edit in doctor.go; the placeholder refusal, the credential probe and the no-credential row are still connector-only and were re-applied by hand (the 4.32.5 doctor body moved the credentials branch behind cfg.AuthHeader()). Stays active.",
+   "why": "`doctor` is the command every SKILL, guide and docs page tells an operator to run to confirm the connector works, and it could not tell a working install from a broken one. It called any HTTP response to `GET /` \"reachable\" and rendered it green, so a base_url aimed at the vendor's web UI (where every API path 404s) and a token rejected with 401 on every call both produced an all-green report. On this connector family it also never probed the credential at all: it printed \"present, not verified\" and left the operator to guess. The mirror defect: a connector whose shipped base_url default is a placeholder dialled the placeholder host, and the DNS failure rendered as \"FAIL API: unreachable\" - telling a correctly-credentialled operator they were broken without naming the one variable that would fix it. Several placeholder hosts resolve through live wildcard DNS and answer real HTTP, so dialling one produced a confident green verdict against a stranger's server. Measured and gated by tools/maintainer/check_doctor_truth.py. See issue #282. 2026-09-28 reprint on press 4.32.5: the info-key exclusion in doctorExitForFailOn (doctorInfoKeys + doctorIsInfoKey) is now emitted natively, so doctor_verdict.go no longer defines it and only adds \"db_path\" to the native map by a one-line body edit in doctor.go; the placeholder refusal, the credential probe and the no-credential row are still connector-only and were re-applied by hand (the 4.32.5 doctor body moved the credentials branch behind cfg.AuthHeader()). Stays active. 2026-09-28 reprint review also cured two defects the SHIPPED v0.1.6 carried: doctorShippedBaseURL was set to https://api.hubapi.com, which is HubSpot's one real API root for every portal, so doctor refused to dial it and told every operator (real token included) 'FAIL API: base_url is still the shipped placeholder; set HUBSPOT_BASE_URL' - it is now empty, which disables only the exact-match rule; and api.hubapi.com answers GET / with a 302 to http://developers.hubspot.com, which the client refuses (https->http downgrade), so doctor rendered 'unreachable' and skipped the credential probe. doctorReachIsRefusedRedirect treats a refused redirect as the server answering. Receipt: with a real token doctor now reports 'OK Credentials: valid (verified with GET /crm/v3/objects/calls)' and a bad token 'HTTP 401'. doctor_verdict_test.go pins both directions.",
    "status": "active",
    "asserts": [
     {
@@ -36,6 +36,24 @@
     {
      "file": "cli/internal/cli/doctor.go",
      "not_contains": "for _, v := range report {"
+    },
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "const doctorShippedBaseURL = \"\"",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/doctor.go",
+     "contains": "doctorReachIsRefusedRedirect(reachErr)",
+     "min_count": 2,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "func doctorReachIsRefusedRedirect(",
+     "min_count": 1,
+     "code_only": true
     }
    ]
   },
@@ -341,6 +359,53 @@
      "contains": "cliutil.EffectiveEnv(os.Getenv(\"HUBSPOT_BASE_URL\"))",
      "min_count": 1,
      "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "sync-prune-skips-filtered-walk",
+   "summary": "`sync --full` prunes local rows only when the walk was unfiltered: any --param, --resource-param or --global-param disables deletion reconciliation (hsSyncPruneAllowed)",
+   "why": "cli-printing-press 4.32 made `sync --full` delete local rows the API did not return on a complete walk (prune := full && !noPrune). An operator query parameter can narrow the enumerated collection - `sync --resources hubspot-contacts-crm --full --param archived=true` lists only archived contacts - and pruning against that walk deletes every cached active contact (an empty archived set clears the mirror). The shipped 4.24 tree never pruned, so this was a regression the reprint introduced; found by the Codex review of the 2026-09-28 reprint. The one-line body edit in the generated sync.go routes the decision through the hand-authored hs_sync_prune.go; hs_sync_prune_test.go pins both directions (unfiltered full walk still prunes; each filter flag disables it).",
+   "status": "active",
+   "spec_encode_followup": "press: sync.go.tmpl should not prune a walk narrowed by operator --param/--resource-param/--global-param (or should reconcile only the filtered partition)",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/sync.go",
+     "contains": "prune := hsSyncPruneAllowed(full, noPrune, paramFlags, resourceParamFlags, globalParamFlags)",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/hs_sync_prune.go",
+     "contains": "func hsSyncPruneAllowed(",
+     "min_count": 1,
+     "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "remote-recipe-loopback-default",
+   "summary": "The remote-agent recipe runs `hubspot-mcp --transport http` with no --addr, so the 4.32.5 server's loopback default (127.0.0.1:7777) applies, and names the bearer header the HTTP transport requires",
+   "why": "msp-skills-publish emits `hubspot-mcp --transport http --addr :7777` into mcp-install.md, README.md and page.json (and from there docs/skills/hubspot.md). From press 4.32 the server refuses a non-loopback --addr without --tls-cert/--tls-key (`MCP server error: non-loopback --addr \":7777\" requires --tls-cert and --tls-key`), so the documented command exits before the suggested tunnel can connect. Spelling it `--addr 127.0.0.1:7777` trips check_install_docs.py R3 (bare loopback origin), so the flag is dropped and the default does the binding. Found by the Codex review of the 2026-09-28 reprint; the same template line affects every 4.32.x connector.",
+   "status": "active",
+   "spec_encode_followup": "msp-skills-publish onboard template: emit `<slug>-mcp --transport http` (no --addr) for press >= 4.32 connectors and document the Authorization: Bearer <SLUG>_MCP_HTTP_TOKEN header",
+   "asserts": [
+    {
+     "file": "mcp-install.md",
+     "not_contains": "--addr :7777"
+    },
+    {
+     "file": "README.md",
+     "not_contains": "--addr :7777"
+    },
+    {
+     "file": "page.json",
+     "not_contains": "--addr :7777"
+    },
+    {
+     "file": "mcp-install.md",
+     "contains": "Authorization: Bearer <HUBSPOT_MCP_HTTP_TOKEN>",
+     "min_count": 1
     }
    ]
   }

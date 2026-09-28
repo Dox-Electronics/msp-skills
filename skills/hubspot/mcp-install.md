@@ -113,8 +113,12 @@ All remote agents need `hubspot-mcp` reachable as a public **HTTPS** endpoint. R
 in HTTP mode with your credentials in the environment:
 
 ```bash
-HUBSPOT_ACCESS_TOKEN=<value> HUBSPOT_BASE_URL=<value> HUBSPOT_OWNER_EMAIL=<value> HUBSPOT_MCP_HTTP_TOKEN=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> hubspot-mcp --transport http --addr :7777
+HUBSPOT_ACCESS_TOKEN=<value> HUBSPOT_BASE_URL=<value> HUBSPOT_OWNER_EMAIL=<value> HUBSPOT_MCP_HTTP_TOKEN=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> hubspot-mcp --transport http
 ```
+
+It listens on loopback port 7777 by default (a non-loopback `--addr` also needs
+`--tls-cert` and `--tls-key`), and every request must carry
+`Authorization: Bearer <HUBSPOT_MCP_HTTP_TOKEN>` or the server answers 401.
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel
 (Cloudflare Tunnel, ngrok) or your own reverse proxy. The path is part of the

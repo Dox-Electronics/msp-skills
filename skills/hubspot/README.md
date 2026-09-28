@@ -152,7 +152,7 @@ See [pain-point.md](./pain-point.md) for the longer narrative.
 
 ### Does this work with ChatGPT?
 
-Yes, on **paid ChatGPT plans** - ChatGPT's MCP connector support is in beta and plan-dependent, so check [OpenAI's current guidance](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt-beta) for which tiers expose it. ChatGPT connects to **remote** MCP servers over HTTPS, not local stdio binaries. The HubSpot MCP server runs locally, but it speaks HTTP natively: start it with `hubspot-mcp --transport http --addr :7777` and put it behind an HTTPS tunnel or your own reverse proxy. No bridge package is involved. Step-by-step in [mcp-install.md](./mcp-install.md).
+Yes, on **paid ChatGPT plans** - ChatGPT's MCP connector support is in beta and plan-dependent, so check [OpenAI's current guidance](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt-beta) for which tiers expose it. ChatGPT connects to **remote** MCP servers over HTTPS, not local stdio binaries. The HubSpot MCP server runs locally, but it speaks HTTP natively: start it with `hubspot-mcp --transport http` and put it behind an HTTPS tunnel or your own reverse proxy. No bridge package is involved. Step-by-step in [mcp-install.md](./mcp-install.md).
 
 ### Does this work with Codex, Cursor, Windsurf, Cline, Copilot, or Gemini?
 
