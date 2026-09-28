@@ -54,6 +54,12 @@
           "isSecret": true
         },
         {
+          "name": "HUBSPOT_USER_AGENT",
+          "description": "Overrides the User-Agent the CLI sends on HubSpot requests.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
           "name": "PRINTING_PRESS_CLIENT_PROFILE",
           "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
           "isRequired": false,

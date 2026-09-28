@@ -19,6 +19,7 @@
         "HUBSPOT_BASE_URL": "${user_config.hubspot_base_url}",
         "HUBSPOT_OWNER_EMAIL": "${user_config.hubspot_owner_email}",
         "HUBSPOT_MCP_HTTP_TOKEN": "${user_config.hubspot_mcp_http_token}",
+        "HUBSPOT_USER_AGENT": "${user_config.hubspot_user_agent}",
         "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
       }
     }
@@ -49,6 +50,12 @@
       "title": "HTTP transport bearer token",
       "description": "Bearer token that `hubspot-mcp --transport http` requires from every HTTP client (Authorization: Bearer). Leave blank for the default stdio transport, which Claude Desktop uses and which never reads it.",
       "sensitive": true,
+      "required": false
+    },
+    "hubspot_user_agent": {
+      "type": "string",
+      "title": "User-Agent header",
+      "description": "Overrides the User-Agent the CLI sends on HubSpot requests. Leave blank to use the CLI's own built-in User-Agent.",
       "required": false
     },
     "printing_press_client_profile": {

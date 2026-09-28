@@ -44,8 +44,9 @@ the list is what changed for an operator or an agent.
   `127.0.0.1:7777` and requires `Authorization: Bearer <HUBSPOT_MCP_HTTP_TOKEN>`. The
   no-op `workflow` parent tool, which only returned its own help text, is gone;
   `workflow_archive` and `workflow_status` are unchanged.
-- **Two new optional install prompts** on every channel (`.mcpb`, MCP Registry,
-  `mcp-install.md`): `HUBSPOT_MCP_HTTP_TOKEN` (only for `--transport http`) and
+- **Three new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+  `mcp-install.md`): `HUBSPOT_MCP_HTTP_TOKEN` (only for `--transport http`),
+  `HUBSPOT_USER_AGENT` (overrides the request User-Agent) and
   `PRINTING_PRESS_CLIENT_PROFILE`. `HUBSPOT_ACCESS_TOKEN`, `HUBSPOT_BASE_URL` and
   `HUBSPOT_OWNER_EMAIL` are unchanged.
 - **Release artifacts:** first hubspot release cut after the 2026-09-18 pipeline change,

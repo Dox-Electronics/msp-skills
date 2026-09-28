@@ -41,6 +41,7 @@ Add (or merge with your existing `mcpServers` block):
         "HUBSPOT_BASE_URL": "https://api.hubapi.com",
         "HUBSPOT_OWNER_EMAIL": "",
         "HUBSPOT_MCP_HTTP_TOKEN": "",
+        "HUBSPOT_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -70,6 +71,7 @@ Configuration**) and add:
         "HUBSPOT_BASE_URL": "https://api.hubapi.com",
         "HUBSPOT_OWNER_EMAIL": "",
         "HUBSPOT_MCP_HTTP_TOKEN": "",
+        "HUBSPOT_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -95,6 +97,7 @@ Claude Desktop:
         "HUBSPOT_BASE_URL": "https://api.hubapi.com",
         "HUBSPOT_OWNER_EMAIL": "",
         "HUBSPOT_MCP_HTTP_TOKEN": "",
+        "HUBSPOT_USER_AGENT": "",
         "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
@@ -113,7 +116,7 @@ All remote agents need `hubspot-mcp` reachable as a public **HTTPS** endpoint. R
 in HTTP mode with your credentials in the environment:
 
 ```bash
-HUBSPOT_ACCESS_TOKEN=<value> HUBSPOT_BASE_URL=<value> HUBSPOT_OWNER_EMAIL=<value> HUBSPOT_MCP_HTTP_TOKEN=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> hubspot-mcp --transport http
+HUBSPOT_ACCESS_TOKEN=<value> HUBSPOT_BASE_URL=<value> HUBSPOT_OWNER_EMAIL=<value> HUBSPOT_MCP_HTTP_TOKEN=<value> HUBSPOT_USER_AGENT=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> hubspot-mcp --transport http
 ```
 
 It listens on loopback port 7777 by default (a non-loopback `--addr` also needs
