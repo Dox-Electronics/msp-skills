@@ -557,8 +557,8 @@
       "tagline": "Fleet-wide Datto BCDR answers - failed screenshots, stale backups, at-risk clients - from a local mirror in one ask.",
       "cli_hash": "sha256:ada9bd4b046444be57596603d6cb3d812976797b17a67224b198b4b84e697e9f",
       "template_version": 3,
-      "version": "0.1.5",
-      "cli_hash_at_release": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630",
+      "version": "0.1.6",
+      "cli_hash_at_release": "sha256:78185d7d75fc4ccc769aee40f33c9a0ada09183b60755fa3d8e7e22149b2ac62",
       "has_video": true,
       "live_verified": {
         "status": "live-verified",

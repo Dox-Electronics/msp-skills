@@ -8,12 +8,13 @@
 ## What it authenticates as
 
 The skill drives the `datto-bcdr-cli` binary (and `datto-bcdr-mcp`),
-authenticating with `DATTO_BCDR_PUBLIC_KEY`, `DATTO_BCDR_SECRET_KEY`. Credentials are read from the environment only -
-never written to disk, never logged, never sent anywhere except the Datto BCDR API.
+authenticating with `DATTO_BCDR_PUBLIC_KEY`, `DATTO_BCDR_SECRET_KEY`. Credentials are read from the environment (or from
+`credentials.toml` under the data dir, which `auth set-credentials` writes) - never logged, never sent anywhere except the Datto BCDR API.
 
 ## Default-safe behavior
 
-- **`--dry-run` is opt-in - use it.** Mutating commands send immediately unless you pass `--dry-run` first to preview the request without sending. Make your agent's policy: preview, show the exact command, get approval, then run the write.
+- **Nothing here writes to Datto.** The Datto BCDR API this connector targets exposes read endpoints only, and the CLI ships no API-mutating command. `--dry-run` still previews any request before it is sent.
+- **Some commands write local state.** `sync` and `export` read from the Datto BCDR API (GET only) and write the SQLite mirror or a local file (`export --output` is refused over MCP; over MCP it prints to the tool result). `teach*` / `learnings` / `playbook amend` (the local learning store), `profile` and `feedback` never contact the API at all.
 - **Read commands are always safe to run** (reports, rollups, search); they cannot
   change anything.
 - **Agent mode is explicit.** `--agent` produces JSON for scripting but does not
@@ -28,8 +29,8 @@ require a human for anything below the line.
 | Tier | What it does | Examples | Recommended agent policy |
 | --- | --- | --- | --- |
 | **Read** | Reports, rollups, search. No change. | `screenshots`, `stale-backups`, `recoverability`, `client-risk`, `alert-triage`, `storage-runway`, `forgotten-assets`, `agent-versions`, `client-report`, `device`, `agent`, `asset`, `shares`, `alert`, `vm-restore`, `sync`, `search`, `analytics` | Allow |
-| **Write (routine)** | The one API-mutating command. | `import` (POST each record to the Datto BCDR API) | Preview with `--dry-run`, then an approved write |
-| **Credential / security** | Replaces or clears stored credentials. | `auth set-token`, `auth logout` | Human-in-the-loop only |
+| **Write (routine)** | API-mutating commands. | (none - the Datto BCDR API exposes no write endpoints; the former `import` command, which could only POST to paths this API does not serve, was removed in 0.1.6) | n/a |
+| **Credential / security** | Replaces or clears stored credentials. | `auth set-credentials`, `auth logout` | Human-in-the-loop only |
 | **Destructive** | Irreversible data or config loss. | (none detected) | Human-in-the-loop only, explicit confirmation |
 | **Admin** | Back-office administration. | (none detected) | Operator-only, not for agents |
 

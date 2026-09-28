@@ -5,6 +5,8 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"datto-bcdr-pp-cli/internal/cliutil"
 	"encoding/json"
 	"errors"
 	"io"
@@ -94,5 +96,25 @@ func TestEmitCacheRefreshFailedEvent_NilResources(t *testing.T) {
 	}
 	if _, ok := payload["resources"]; ok {
 		t.Errorf("resources key should be omitted on nil slice, got: %v", payload)
+	}
+}
+func TestAutoRefreshNoLearnDoesNotOpenStore(t *testing.T) {
+	home := t.TempDir()
+	restore, err := cliutil.SetHomeOverride(home)
+	if err != nil {
+		t.Fatalf("set home override: %v", err)
+	}
+	defer restore()
+
+	meta := autoRefreshIfStale(context.Background(), &rootFlags{dataSource: "auto", noLearn: true}, []string{"items"})
+	if meta.Decision != "skipped" || meta.Reason != "no_learn" {
+		t.Fatalf("freshness = %+v, want skipped/no_learn", meta)
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatalf("read home: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("--no-learn created local-store files: %v", entries)
 	}
 }

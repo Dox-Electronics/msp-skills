@@ -46,31 +46,15 @@ const doctorBaseURLEnv = "DATTO_BCDR_BASE_URL"
 // placeholder and doctor would never dial it. Refusing to check a healthy
 // install is the same class of defect as blessing a broken one, pointed the
 // other way.
-const doctorShippedBaseURL = "https://api.datto.com/v1"
+// For datto-bcdr the shipped default IS the vendor's real global API root, not a
+// stand-in the operator must replace, so exact-match refusal is disabled here
+// (empty): an operator on the default must still get a real credential probe.
+// The template / YOUR_ / reserved-domain checks below stay active.
+const doctorShippedBaseURL = ""
 
-// doctorInfoKeys are report entries rendered without a status indicator:
-// paths, versions, and the free-text hints that tell an operator how to get a
-// credential. They are NOT health checks.
-//
-// doctorExitForFailOn used to scan every value in the report for the substrings
-// "error", "missing", "invalid" and "unreachable". That made --fail-on=error
-// trip on a perfectly healthy connector whose auth hint happened to contain the
-// word "missing", or whose suggested read command was named something like
-// `errors list`. Excluding the informational keys keeps --fail-on keyed to the
-// checks and nothing else.
-var doctorInfoKeys = map[string]bool{
-	"config_path":       true,
-	"base_url":          true,
-	"auth_source":       true,
-	"version":           true,
-	"auth_hint":         true,
-	"auth_key_url":      true,
-	"auth_instructions": true,
-	"agentcookie":       true,
-	"db_path":           true,
-}
-
-func doctorIsInfoKey(key string) bool { return doctorInfoKeys[key] }
+// doctorInfoKeys / doctorIsInfoKey are emitted natively by cli-printing-press
+// >= 4.30 in doctor.go; the hand-authored copies were retired at the 4.32.5
+// reprint (the fresh map gained db_path so the cache path is not scanned).
 
 // doctorBaseURLIsPlaceholder reports whether base is still the value this
 // connector shipped with rather than the operator's own instance.

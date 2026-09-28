@@ -851,9 +851,9 @@ A: It's gentle by design. The first sync pulls each resource with bounded pagina
 Q: Does this replace the Datto Partner Portal?
 A: No. It answers the fleet-wide, cross-client questions the per-appliance portal can't, and it's read-only for everyday use - you still use the portal for restores, virtualization, and device configuration.
 Q: Can it change anything in Datto, or just read?
-A: Read-only for everyday use - every analysis, list, and report command only reads. The single exception is `import`, an explicit bulk data-load command you would never run by accident; preview it with --dry-run first.
+A: Read-only. Every analysis, list, and report command only reads, and the Datto BCDR API this connector targets exposes no write endpoints, so there is no command that can change anything in Datto. The only things it writes are on your own machine: the local SQLite mirror (`sync`), an optional export file, and the local learning store.
 
-Governance: The datto-bcdr skill is read-only for everyday use: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and writes only to a local SQLite mirror on your machine. The single API-mutating command is `import`, a bulk data load you preview with --dry-run; nothing else can change remote state. Scope the partner key pair to what your workflow needs, and keep autonomous agents to read plus previewed imports.
+Governance: The datto-bcdr skill is read-only against Datto: it reads your Datto BCDR fleet (devices, agents, shares, alerts, screenshots) and the API it targets exposes no write endpoints, so no command can change remote state. It writes only to your own machine - the local SQLite mirror, an optional export file, and the local learning store. Scope the partner key pair to what your workflow needs; the only human-in-the-loop commands are the ones that replace or clear the stored credential.
 
 ### Datto RMM (RMM)
 
