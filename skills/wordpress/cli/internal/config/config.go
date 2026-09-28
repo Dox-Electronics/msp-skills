@@ -228,7 +228,11 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	// Base URL override (used by printing-press verify to point at mock/test servers)
-	if v := cliutil.EnvOverride("WORDPRESS_BASE_URL"); v != "" {
+	// Spelled as EffectiveEnv(os.Getenv(...)) - exactly what EnvOverride does -
+	// so check_env_schema.py, which resolves os.Getenv literals but not
+	// cross-package helper calls, can see this operator-facing read (hand-fix
+	// base-url-read-visible-to-env-schema).
+	if v := cliutil.EffectiveEnv(os.Getenv("WORDPRESS_BASE_URL")); v != "" {
 		cfg.BaseURL = v
 	}
 	return cfg, nil
