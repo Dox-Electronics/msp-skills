@@ -22,6 +22,7 @@ All notable changes to this skill are documented here. Format follows
 ### Fixed
 - **MCP HTTP listener sets a header-read deadline** (`ReadHeaderTimeout` 10s), so a client that opens a connection and never finishes its headers cannot pin the `--transport http` listener. Recorded in `handfixes.json`.
 - **`doctor` info rows.** The engine now skips informational keys natively when evaluating `--fail-on`; the connector's placeholder refusal and real credential probe are re-applied and gated by `check_doctor_truth.py`.
+- **`users login-by-token --token` help** shows `<your-user-token>` again instead of the vendor spec's token-shaped sample value, which the reprint had restored.
 - **Auth header.** SentinelOne requires `Authorization: ApiToken <token>`; the engine still emits the bare token, so the prefix is re-applied (and a token pasted with the prefix is not doubled). This was a silent hand-fix since the first print and is now recorded in `handfixes.json`.
 
 ## [0.1.5] - 2026-09-10
