@@ -345,7 +345,7 @@
   "quickbooks": {
     "state": "up-to-date",
     "version": "0.1.8",
-    "latest_tag": "quickbooks-v0.1.8",
+    "latest_tag": "quickbooks-v0.1.9",
     "current_hash": "sha256:dd1e017a8f613725ff831ad12bd99d8640cd68f0eae912efc63eec3608dbbf2c",
     "released_hash": "sha256:dd1e017a8f613725ff831ad12bd99d8640cd68f0eae912efc63eec3608dbbf2c"
   },
