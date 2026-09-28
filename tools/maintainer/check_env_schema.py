@@ -678,8 +678,12 @@ def guard_whole_slices(packages: list[GoPackage]) -> None:
                 if unsafe:
                     break
             if not unsafe and name[:1].isupper():
-                unsafe = any(re.search(rf"\.{n}\b", text)
-                             for other in packages for _, text in blanked[id(other)])
+                # Any mention in ANOTHER package (`learn.Names`, `learn. Names`,
+                # a dot-import's bare `Names`) could mutate it.
+                any_word = re.compile(rf"(?<!\w){n}\b")
+                unsafe = any(any_word.search(text)
+                             for other in packages if other is not pkg
+                             for _, text in blanked[id(other)])
             if unsafe:
                 scope.bind(name, "[]string{")
 
@@ -1809,6 +1813,28 @@ _fixture(
     'func mutate() {\n\tnames = []string{"COVE_PASSWORD"}\n}\n'
     'func a() {\n\tmutate()\n'
     '\tfor _, name := range names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "an exported []string mutated from another package (spaced selector) keeps the read reported",
+    {
+        "learn": 'package learn\nimport "os"\n'
+                 'var Names = []string{\n\t"CODEX_THREAD_ID",\n}\n'
+                 'func a() {\n\tfor _, name := range Names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+        "cli": 'package cli\nimport "fixture/learn"\n'
+               'func b() {\n\tlearn. Names[0] = "COVE_PASSWORD"\n}\n',
+    },
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "an exported []string mutated through a dot-import keeps the read reported",
+    {
+        "learn": 'package learn\nimport "os"\n'
+                 'var Names = []string{\n\t"CODEX_THREAD_ID",\n}\n'
+                 'func a() {\n\tfor _, name := range Names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+        "cli": 'package cli\nimport . "fixture/learn"\n'
+               'func b() {\n\tNames[0] = "COVE_PASSWORD"\n}\n',
+    },
     {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
