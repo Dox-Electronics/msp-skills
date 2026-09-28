@@ -719,6 +719,11 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
 
     call = RE_CALL.match(expr)
     if call:
+        if not is_whole_call(expr, call):
+            # `pick()[:13]`, `pick() + "_X"` (concat is split above), `pick().F`:
+            # the value is not what pick returns, so resolving it through pick's
+            # returns would name the wrong variable and look complete.
+            return {UNRESOLVED}
         fname = call.group(1)
         fn = pkg.funcs.get(fname)
         key = (id(pkg), fname)
@@ -734,6 +739,12 @@ def resolve(expr: str, pkg: GoPackage, env_prefix: str, scope: Scope | None = No
         return resolve_field(sel.group(1), pkg, env_prefix, depth, seen)
 
     return {UNRESOLVED}
+
+
+def is_whole_call(expr: str, call: "re.Match") -> bool:
+    """True when expr is exactly `f(...)`: the call's '(' closes at the end."""
+    close = match_close(expr, call.end() - 1, "(", ")")
+    return close == len(expr) - 1
 
 
 RE_SELECTOR = re.compile(r"^[A-Za-z_]\w*\.([A-Za-z_]\w*)$")
@@ -846,7 +857,7 @@ def resolve_prefixes(expr: str, pkg: GoPackage, env_prefix: str,
         return out or {""}
 
     call = RE_CALL.match(expr)
-    if call:
+    if call and is_whole_call(expr, call):
         fn = pkg.funcs.get(call.group(1))
         key = (id(pkg), call.group(1))
         if fn is None or key in seen:
@@ -1563,6 +1574,15 @@ _fixture(
     'func a() string {\n\tfor _, name := range names {\n'
     '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
     {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "identifier bound to a sliced call keeps the read reported",
+    'package cli\nimport "os"\n'
+    'func pick() string {\n\treturn "COVE_PASSWORD_UNUSED"\n}\n'
+    'var secret = pick()[:13]\n'
+    'func a() string {\n\tfor _, name := range []string{secret} {\n'
+    '\t\tif v := os.Getenv(name); v != "" {\n\t\t\treturn v\n\t\t}\n\t}\n\treturn ""\n}\n',
+    set(), {"name"},
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
