@@ -64,9 +64,7 @@ To install:
 2. Double-click the `.mcpb` file. Claude Desktop opens and walks you through the install.
 3. Fill in `HUBSPOT_ACCESS_TOKEN` when Claude Desktop prompts you.
 
-Requires Claude Desktop 1.0.0 or later. A bundle carries the five platform binaries the builder downloads - macOS (`darwin-arm64`, `darwin-amd64`), Linux (`linux-arm64`, `linux-amd64`) and Windows (`windows-amd64`). Windows on ARM is released as a standalone binary but is not bundled, so use the manual config below there.
-
-> **Claude Desktop bundle:** the `.mcpb` launches on macOS (Intel and Apple Silicon), Windows x64 and Linux x64. Every tool shells out to the companion `hubspot-cli`. Releases cut from 2026-09-18 on ship that CLI inside the bundle; older bundles contain only the MCP server, so if yours lacks the companion, run the installer above first (or set `HUBSPOT_CLI_PATH` to an existing binary). Details: [#331](https://github.com/Servosity/msp-skills/issues/331).
+Requires Claude Desktop 1.0.0 or later. Pre-built bundles ship for macOS Apple Silicon (`darwin-arm64`) and Windows (`amd64`, `arm64`); for other platforms, use the manual config below.
 
 <details>
 <summary>Manual JSON config (advanced)</summary>
@@ -108,17 +106,22 @@ Authenticate with a HubSpot Private App access token (prefix `pat-…`). Create 
 # First, set HUBSPOT_ACCESS_TOKEN (a Private App token from https://app.hubspot.com/private-apps); then doctor confirms reachability, auth, and scopes
 hubspot-cli doctor
 
+
 # Mirror contacts, companies, deals, engagements, pipelines, owners, properties, and lists into the local SQLite store
 hubspot-cli sync
+
 
 # Re-sync meetings with property snapshots retained in the local hubspot_property_history table
 hubspot-cli sync --resources hubspot-meetings-crm --with-history hs_meeting_outcome,hs_meeting_title,hubspot_owner_id
 
+
 # Customer-ready monthly report: every meeting that was EVER scheduled in April, even if it later flipped to No Show or Completed
 hubspot-cli meetings status-report --status scheduled --month 2026-04 --csv
 
+
 # Daily 'who do I call' list, ranked offline from the local mirror
 hubspot-cli nurture queue --owner me --top 20 --agent
+
 
 # Per-rep pipeline health  -  one offline SQL aggregation
 hubspot-cli owner-load --pipeline default --json
@@ -130,6 +133,7 @@ hubspot-cli owner-load --pipeline default --json
 These capabilities aren't available in any other tool for this API.
 
 ### Local state that compounds
+
 - **`stale`**  -  Find contacts or deals with no engagement in N days, scoped by owner or pipeline stage  -  instantly, offline.
 
   _Use this when the user asks 'what's gone cold'  -  works after one sync, no API quota burn._
@@ -148,7 +152,6 @@ These capabilities aren't available in any other tool for this API.
 
   _Use this for forecast-vs-reality checks before a pipeline review._
 
-  <!-- cli-claims:ignore -->
   ```bash
   hubspot-cli pipeline-health default --idle-days 14 --json
   ```
@@ -168,6 +171,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Property history & audit
+
 - **`meetings history`**  -  Show the full timeline of property changes for a single meeting (outcome, title, owner, custom fields)  -  when each value was set, by whom, and from what source.
 
   _Reach for this when investigating 'when did this meeting flip from Scheduled to No Show, and who changed it'. Requires a prior 'sync --resources hubspot-meetings-crm --with-history <props>' to populate the history table._
@@ -205,6 +209,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Cross-object intelligence
+
 - **`engagements of`**  -  Unified chronological timeline of every call, email, meeting, note, and task touching a contact, deal, or company.
 
   _Use this when an agent or human asks 'what touched this prospect/deal'  -  one command instead of five paginated API calls._
@@ -256,6 +261,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Bulk operations
+
 - **`nurture-mine`**  -  Surface the contacts assigned to you that have gone cold but still have open deals  -  the daily 'who do I call' list, computed across local SQLite.
 
   _Reach for this when an agent or human needs the daily Titans-style nurture queue without round-tripping HubSpot for every prospect._
@@ -325,6 +331,55 @@ Validate the CSV against the local properties schema before any write; drop --dr
 ## Usage
 
 Run `hubspot-cli --help` for the full command reference and flag list.
+
+## Paths & environment variables
+
+This CLI separates local files into four path kinds:
+
+| Kind | Contents |
+|------|----------|
+| `config` | User-editable settings such as `config.toml` and saved profiles |
+| `data` | Durable local data: `credentials.toml`, `data.db`, cookies, browser-session proof files, and other auth sidecars |
+| `state` | Runtime state such as persisted queries, jobs, and `teach.log` |
+| `cache` | Regenerable HTTP/cache files |
+
+Each kind resolves independently. The ladder is:
+
+1. Per-kind env var: `HUBSPOT_CONFIG_DIR`, `HUBSPOT_DATA_DIR`, `HUBSPOT_STATE_DIR`, or `HUBSPOT_CACHE_DIR`
+2. `--home <dir>` for this invocation
+3. `HUBSPOT_HOME` for a flat relocated root
+4. XDG env vars: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+5. Platform defaults matching existing installs
+
+For containers and agent sandboxes, prefer a single relocated root:
+
+```bash
+export HUBSPOT_HOME=/srv/hubspot
+hubspot-cli doctor
+```
+
+Under `HUBSPOT_HOME=/srv/hubspot`, the four dirs resolve to `/srv/hubspot/config`, `/srv/hubspot/data`, `/srv/hubspot/state`, and `/srv/hubspot/cache`.
+
+MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
+
+```json
+{
+  "mcpServers": {
+    "hubspot": {
+      "command": "hubspot-mcp",
+      "env": {
+        "HUBSPOT_HOME": "/srv/hubspot"
+      }
+    }
+  }
+}
+```
+
+Precedence matters in fleets: an ambient per-kind variable such as `HUBSPOT_DATA_DIR` overrides an explicit `--home` for that kind. Use `HUBSPOT_HOME` or the per-kind variables for durable fleet relocation; treat `--home` as the weaker per-invocation lever.
+
+Relocation is one-way. Unsetting `HUBSPOT_HOME` does not move files back to platform defaults, and `doctor` cannot find credentials left under a former root. Move the files manually before unsetting relocation variables.
+
+Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `hubspot-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
 
 ## Commands
 
@@ -681,23 +736,39 @@ Manage objects search
 - **`hubspot-cli objects-search <objectType>`** - Post crm v3 objects object type search do search
 
 
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`hubspot-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`hubspot-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`hubspot-cli learnings list`** - Inspect taught rows
+- **`hubspot-cli learnings forget <query>`** - Undo a teach
+- **`hubspot-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`hubspot-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`hubspot-cli teach-pattern`** - Install a query/resource template up front
+- **`hubspot-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `HUBSPOT_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `hubspot-cli` opens the database, older binaries refuse it with a version error  -  upgrade the binary rather than downgrading.
+
 ## Output Formats
 
 ```bash
 # Human-readable table (default in terminal, JSON when piped)
-hubspot-cli batch post-crm-v3-objects-object-type-archive-archive <id>
+hubspot-cli crm get-v4-objects-object-type-object-id-associations-to-object-type-get-page mock-value mock-value mock-value
 
 # JSON for scripting and agents
-hubspot-cli batch post-crm-v3-objects-object-type-archive-archive <id> --json
-
+hubspot-cli crm get-v4-objects-object-type-object-id-associations-to-object-type-get-page mock-value mock-value mock-value --json
 # Filter to specific fields
-hubspot-cli batch post-crm-v3-objects-object-type-archive-archive <id> --json --select id,name,status
+hubspot-cli crm get-v4-objects-object-type-object-id-associations-to-object-type-get-page mock-value mock-value mock-value --json --select paging,results
 
 # Dry run  -  show the request without sending
-hubspot-cli batch post-crm-v3-objects-object-type-archive-archive <id> --dry-run
+hubspot-cli crm get-v4-objects-object-type-object-id-associations-to-object-type-get-page mock-value mock-value mock-value --dry-run
 
 # Agent mode  -  JSON + compact + no prompts in one flag
-hubspot-cli batch post-crm-v3-objects-object-type-archive-archive <id> --agent
+hubspot-cli crm get-v4-objects-object-type-object-id-associations-to-object-type-get-page mock-value mock-value mock-value --agent
 ```
 
 ## Agent Usage
@@ -706,15 +777,15 @@ This CLI is designed for AI agent consumption:
 
 - **Non-interactive** - never prompts, every input is a flag
 - **Pipeable** - `--json` output to stdout, errors to stderr
-- **Filterable** - `--select id,name` returns only fields you need
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
 - **Previewable** - `--dry-run` shows the request without sending
-- **Explicit retries** - add `--idempotent` to create retries and `--ignore-missing` to delete retries when a no-op success is acceptable
-- **Confirmable** - `--yes` for explicit confirmation of destructive actions
+- **Explicit retries** - add `--idempotent` to create retries and add `--ignore-missing` to delete retries when a no-op success is acceptable
+- **Explicit confirmation** - `--agent` does not imply `--yes`; pass `--yes` separately only after the target, arguments, and side effects are clear
 - **Piped input** - write commands can accept structured input when their help lists `--stdin`
 - **Offline-friendly** - sync/search commands can use the local SQLite store when available
 - **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
 
-Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `7` rate limited, `10` config error.
+Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `6` partial failure, `7` rate limited, `10` config error.
 
 ## Health Check
 
@@ -726,7 +797,7 @@ Verifies configuration, credentials, and connectivity to the API.
 
 ## Configuration
 
-Config file: `~/.config/hubspot-cli/config.toml`
+Run `hubspot-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/hubspot-cli/config.toml`; `--home`, `HUBSPOT_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
 
@@ -749,11 +820,14 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 - Run the `list` command to see available items
 
 ### API-specific
+
 - **doctor reports 401 or token rejected**  -  Verify `HUBSPOT_ACCESS_TOKEN` starts with `pat-` and was copied without surrounding whitespace; recreate at https://app.hubspot.com/private-apps if rotated
 - **Property history is empty after sync**  -  Sync was run without `--with-history`. Re-run with `--with-history <prop1>,<prop2>` (for example `hubspot-cli sync --resources hubspot-meetings-crm --with-history hs_meeting_outcome`)  -  only that path persists the propertiesWithHistory block into the local snapshot table.
 - **Older property history is missing even after --with-history**  -  HubSpot retains property history for ~90 days on free tiers; longer on paid (Professional/Enterprise). Check your account tier  -  the API only returns what HubSpot has kept; the CLI cannot recover snapshots older than the tier limit.
 - **HTTP 429 during sync**  -  HubSpot enforces 110 req / 10s; rerun with `--rate-limit 5` to slow the client, or sync individual objects with `sync --resources contacts`. With `--with-history` the per-object read leg uses GET (not batch search) so it spends more requests  -  narrow `--with-history` to only the properties you actually need.
 - **sync errors with 'MISSING_SCOPES' on a specific object**  -  Open the Private App settings, grant the missing CRM scope (e.g., `crm.objects.deals.read`), and reissue the token. For `--with-history` on meetings, the same `crm.objects.meetings.read` scope is enough  -  property history requires no extra scope.
+
+---
 
 ## Sources & Inspiration
 

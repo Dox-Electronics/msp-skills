@@ -4,11 +4,365 @@
 package cli
 
 import (
+	"bytes"
+
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
+
+	"hubspot-pp-cli/internal/cliutil"
+
+	"github.com/spf13/cobra"
+	"hubspot-pp-cli/internal/cliutil/testenv"
 )
+
+func TestMain(m *testing.M) {
+	os.Exit(testenv.RunSandboxed(m))
+}
+
+func TestDeclaredAPISurfaceReachable(t *testing.T) {
+	expected := []string{
+		"batch",
+		"batch post-crm-v3-objects-object-type-archive-archive",
+		"batch post-crm-v3-objects-object-type-create-create",
+		"batch post-crm-v3-objects-object-type-read-read",
+		"batch post-crm-v3-objects-object-type-update-update",
+		"batch post-crm-v3-objects-object-type-upsert-upsert",
+		"crm",
+		"crm delete-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-archive",
+		"crm get-v4-objects-object-type-object-id-associations-to-object-type-get-page",
+		"crm post-v4-associations-from-object-type-to-object-type-batch-archive-archive",
+		"crm post-v4-associations-from-object-type-to-object-type-batch-associate-default-create-default",
+		"crm post-v4-associations-from-object-type-to-object-type-batch-create-create",
+		"crm post-v4-associations-from-object-type-to-object-type-batch-labels-archive-archive-labels",
+		"crm post-v4-associations-from-object-type-to-object-type-batch-read-get-page",
+		"crm post-v4-associations-usage-high-usage-report-user-id-request",
+		"crm put-v4-objects-from-object-type-from-object-id-associations-default-to-object-type-to-object-id-create-default",
+		"crm put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create",
+		"groups",
+		"groups delete-crm-v3-properties-object-type-name-archive",
+		"groups get-crm-v3-properties-object-type-get-all",
+		"groups get-crm-v3-properties-object-type-name-get-by-name",
+		"groups patch-crm-v3-properties-object-type-name-update",
+		"groups post-crm-v3-properties-object-type-create",
+		"hubspot-calls-crm",
+		"hubspot-calls-crm delete-v3-objects-calls-call-id-archive",
+		"hubspot-calls-crm get-v3-objects-calls-call-id-get-by-id",
+		"hubspot-calls-crm get-v3-objects-calls-get-page",
+		"hubspot-calls-crm patch-v3-objects-calls-call-id-update",
+		"hubspot-calls-crm post-v3-objects-calls-batch-archive-archive",
+		"hubspot-calls-crm post-v3-objects-calls-batch-create-create",
+		"hubspot-calls-crm post-v3-objects-calls-batch-read-read",
+		"hubspot-calls-crm post-v3-objects-calls-batch-update-update",
+		"hubspot-calls-crm post-v3-objects-calls-batch-upsert-upsert",
+		"hubspot-calls-crm post-v3-objects-calls-create",
+		"hubspot-calls-crm post-v3-objects-calls-search-do-search",
+		"hubspot-companies-crm",
+		"hubspot-companies-crm delete-v3-objects-companies-company-id-archive",
+		"hubspot-companies-crm get-v3-objects-companies-company-id-get-by-id",
+		"hubspot-companies-crm get-v3-objects-companies-get-page",
+		"hubspot-companies-crm patch-v3-objects-companies-company-id-update",
+		"hubspot-companies-crm post-v3-objects-companies-batch-archive-archive",
+		"hubspot-companies-crm post-v3-objects-companies-batch-create-create",
+		"hubspot-companies-crm post-v3-objects-companies-batch-read-read",
+		"hubspot-companies-crm post-v3-objects-companies-batch-update-update",
+		"hubspot-companies-crm post-v3-objects-companies-batch-upsert-upsert",
+		"hubspot-companies-crm post-v3-objects-companies-create",
+		"hubspot-companies-crm post-v3-objects-companies-merge-merge",
+		"hubspot-companies-crm post-v3-objects-companies-search-do-search",
+		"hubspot-contacts-crm",
+		"hubspot-contacts-crm delete-v3-objects-contacts-contact-id",
+		"hubspot-contacts-crm get-v3-objects-contacts",
+		"hubspot-contacts-crm get-v3-objects-contacts-contact-id",
+		"hubspot-contacts-crm patch-v3-objects-contacts-contact-id",
+		"hubspot-contacts-crm post-v3-objects-contacts",
+		"hubspot-contacts-crm post-v3-objects-contacts-batch-archive",
+		"hubspot-contacts-crm post-v3-objects-contacts-batch-create",
+		"hubspot-contacts-crm post-v3-objects-contacts-batch-read",
+		"hubspot-contacts-crm post-v3-objects-contacts-batch-update",
+		"hubspot-contacts-crm post-v3-objects-contacts-gdpr-delete",
+		"hubspot-contacts-crm post-v3-objects-contacts-merge",
+		"hubspot-contacts-crm post-v3-objects-contacts-search",
+		"hubspot-deals-crm",
+		"hubspot-deals-crm delete-v3-objects-0-3-deal-id-archive",
+		"hubspot-deals-crm get-v3-objects-0-3-deal-id-get-by-id",
+		"hubspot-deals-crm get-v3-objects-0-3-get-page",
+		"hubspot-deals-crm patch-v3-objects-0-3-deal-id-update",
+		"hubspot-deals-crm post-v3-objects-0-3-batch-archive-archive",
+		"hubspot-deals-crm post-v3-objects-0-3-batch-create-create",
+		"hubspot-deals-crm post-v3-objects-0-3-batch-read-read",
+		"hubspot-deals-crm post-v3-objects-0-3-batch-update-update",
+		"hubspot-deals-crm post-v3-objects-0-3-batch-upsert-upsert",
+		"hubspot-deals-crm post-v3-objects-0-3-create",
+		"hubspot-deals-crm post-v3-objects-0-3-merge-merge",
+		"hubspot-deals-crm post-v3-objects-0-3-search-do-search",
+		"hubspot-emails-crm",
+		"hubspot-emails-crm delete-v3-objects-emails-email-id-archive",
+		"hubspot-emails-crm get-v3-objects-emails-email-id-get-by-id",
+		"hubspot-emails-crm get-v3-objects-emails-get-page",
+		"hubspot-emails-crm patch-v3-objects-emails-email-id-update",
+		"hubspot-emails-crm post-v3-objects-emails-batch-archive-archive",
+		"hubspot-emails-crm post-v3-objects-emails-batch-create-create",
+		"hubspot-emails-crm post-v3-objects-emails-batch-read-read",
+		"hubspot-emails-crm post-v3-objects-emails-batch-update-update",
+		"hubspot-emails-crm post-v3-objects-emails-batch-upsert-upsert",
+		"hubspot-emails-crm post-v3-objects-emails-create",
+		"hubspot-emails-crm post-v3-objects-emails-search-do-search",
+		"hubspot-imports-crm",
+		"hubspot-imports-crm get-v3-imports-import-id-errors-v3-imports-import-id-errors",
+		"hubspot-imports-crm get-v3-imports-import-id-v3-imports-import-id",
+		"hubspot-imports-crm get-v3-imports-v3-imports",
+		"hubspot-imports-crm post-v3-imports-import-id-cancel-v3-imports-import-id-cancel",
+		"hubspot-imports-crm post-v3-imports-v3-imports",
+		"hubspot-leads-crm",
+		"hubspot-leads-crm delete-v3-objects-leads-leads-id-archive",
+		"hubspot-leads-crm get-v3-objects-leads-get-page",
+		"hubspot-leads-crm get-v3-objects-leads-leads-id-get-by-id",
+		"hubspot-leads-crm patch-v3-objects-leads-leads-id-update",
+		"hubspot-leads-crm post-v3-objects-leads-batch-archive-archive",
+		"hubspot-leads-crm post-v3-objects-leads-batch-create-create",
+		"hubspot-leads-crm post-v3-objects-leads-batch-read-read",
+		"hubspot-leads-crm post-v3-objects-leads-batch-update-update",
+		"hubspot-leads-crm post-v3-objects-leads-batch-upsert-upsert",
+		"hubspot-leads-crm post-v3-objects-leads-create",
+		"hubspot-leads-crm post-v3-objects-leads-search-do-search",
+		"hubspot-line-items-crm",
+		"hubspot-line-items-crm delete-v3-objects-line-items-line-item-id-archive",
+		"hubspot-line-items-crm get-v3-objects-line-items-get-page",
+		"hubspot-line-items-crm get-v3-objects-line-items-line-item-id-get-by-id",
+		"hubspot-line-items-crm patch-v3-objects-line-items-line-item-id-update",
+		"hubspot-line-items-crm post-v3-objects-line-items-batch-archive-archive",
+		"hubspot-line-items-crm post-v3-objects-line-items-batch-create-create",
+		"hubspot-line-items-crm post-v3-objects-line-items-batch-read-read",
+		"hubspot-line-items-crm post-v3-objects-line-items-batch-update-update",
+		"hubspot-line-items-crm post-v3-objects-line-items-batch-upsert-upsert",
+		"hubspot-line-items-crm post-v3-objects-line-items-create",
+		"hubspot-line-items-crm post-v3-objects-line-items-search-do-search",
+		"hubspot-lists-crm",
+		"hubspot-lists-crm delete-v3-lists-folders-folder-id-v3-lists-folders-folder-id",
+		"hubspot-lists-crm delete-v3-lists-list-id-memberships-v3-lists-list-id-memberships",
+		"hubspot-lists-crm delete-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion",
+		"hubspot-lists-crm delete-v3-lists-list-id-v3-lists-list-id",
+		"hubspot-lists-crm get-v3-lists-folders-v3-lists-folders",
+		"hubspot-lists-crm get-v3-lists-idmapping-v3-lists-idmapping",
+		"hubspot-lists-crm get-v3-lists-list-id-memberships-join-order-v3-lists-list-id-memberships-join-order",
+		"hubspot-lists-crm get-v3-lists-list-id-memberships-v3-lists-list-id-memberships",
+		"hubspot-lists-crm get-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion",
+		"hubspot-lists-crm get-v3-lists-list-id-size-and-edits-history-between-v3-lists-list-id-size-and-edits-history-between",
+		"hubspot-lists-crm get-v3-lists-list-id-v3-lists-list-id",
+		"hubspot-lists-crm get-v3-lists-object-type-id-object-type-id-name-list-name-v3-lists-object-type-id-object-type-id-name-list-name",
+		"hubspot-lists-crm get-v3-lists-records-object-type-id-record-id-memberships-v3-lists-records-object-type-id-record-id-memberships",
+		"hubspot-lists-crm get-v3-lists-v3-lists",
+		"hubspot-lists-crm post-v3-lists-folders-v3-lists-folders",
+		"hubspot-lists-crm post-v3-lists-idmapping-v3-lists-idmapping",
+		"hubspot-lists-crm post-v3-lists-records-memberships-batch-read-v3-lists-records-memberships-batch-read",
+		"hubspot-lists-crm post-v3-lists-search-v3-lists-search",
+		"hubspot-lists-crm post-v3-lists-v3-lists",
+		"hubspot-lists-crm put-v3-lists-folders-folder-id-move-new-parent-folder-id-v3-lists-folders-folder-id-move-new-parent-folder-id",
+		"hubspot-lists-crm put-v3-lists-folders-folder-id-rename-v3-lists-folders-folder-id-rename",
+		"hubspot-lists-crm put-v3-lists-folders-move-list-v3-lists-folders-move-list",
+		"hubspot-lists-crm put-v3-lists-list-id-memberships-add-and-remove-v3-lists-list-id-memberships-add-and-remove",
+		"hubspot-lists-crm put-v3-lists-list-id-memberships-add-from-source-list-id-v3-lists-list-id-memberships-add-from-source-list-id",
+		"hubspot-lists-crm put-v3-lists-list-id-memberships-add-v3-lists-list-id-memberships-add",
+		"hubspot-lists-crm put-v3-lists-list-id-memberships-remove-v3-lists-list-id-memberships-remove",
+		"hubspot-lists-crm put-v3-lists-list-id-restore-v3-lists-list-id-restore",
+		"hubspot-lists-crm put-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion",
+		"hubspot-lists-crm put-v3-lists-list-id-update-list-filters-v3-lists-list-id-update-list-filters",
+		"hubspot-lists-crm put-v3-lists-list-id-update-list-name-v3-lists-list-id-update-list-name",
+		"hubspot-meetings-crm",
+		"hubspot-meetings-crm delete-v3-objects-meetings-meeting-id-archive",
+		"hubspot-meetings-crm get-v3-objects-meetings-get-page",
+		"hubspot-meetings-crm get-v3-objects-meetings-meeting-id-get-by-id",
+		"hubspot-meetings-crm patch-v3-objects-meetings-meeting-id-update",
+		"hubspot-meetings-crm post-v3-objects-meetings-batch-archive-archive",
+		"hubspot-meetings-crm post-v3-objects-meetings-batch-create-create",
+		"hubspot-meetings-crm post-v3-objects-meetings-batch-read-read",
+		"hubspot-meetings-crm post-v3-objects-meetings-batch-update-update",
+		"hubspot-meetings-crm post-v3-objects-meetings-batch-upsert-upsert",
+		"hubspot-meetings-crm post-v3-objects-meetings-create",
+		"hubspot-meetings-crm post-v3-objects-meetings-search-do-search",
+		"hubspot-notes-crm",
+		"hubspot-notes-crm delete-v3-objects-notes-note-id-archive",
+		"hubspot-notes-crm get-v3-objects-notes-get-page",
+		"hubspot-notes-crm get-v3-objects-notes-note-id-get-by-id",
+		"hubspot-notes-crm patch-v3-objects-notes-note-id-update",
+		"hubspot-notes-crm post-v3-objects-notes-batch-archive-archive",
+		"hubspot-notes-crm post-v3-objects-notes-batch-create-create",
+		"hubspot-notes-crm post-v3-objects-notes-batch-read-read",
+		"hubspot-notes-crm post-v3-objects-notes-batch-update-update",
+		"hubspot-notes-crm post-v3-objects-notes-batch-upsert-upsert",
+		"hubspot-notes-crm post-v3-objects-notes-create",
+		"hubspot-notes-crm post-v3-objects-notes-search-do-search",
+		"hubspot-objects-crm",
+		"hubspot-objects-crm delete-v3-objects-object-type-object-id-archive",
+		"hubspot-objects-crm get-v3-objects-object-type-get-page",
+		"hubspot-objects-crm get-v3-objects-object-type-object-id-get-by-id",
+		"hubspot-objects-crm patch-v3-objects-object-type-object-id-update",
+		"hubspot-objects-crm post-v3-objects-object-type-create",
+		"hubspot-owners-crm",
+		"hubspot-owners-crm get-v3-owners-owner-id-get-by-id",
+		"hubspot-owners-crm get-v3-owners-v3-owners",
+		"hubspot-pipelines-crm",
+		"hubspot-pipelines-crm delete-v3-pipelines-object-type-pipeline-id-archive",
+		"hubspot-pipelines-crm delete-v3-pipelines-object-type-pipeline-id-stages-stage-id-archive",
+		"hubspot-pipelines-crm get-v3-pipelines-object-type-get-all",
+		"hubspot-pipelines-crm get-v3-pipelines-object-type-pipeline-id-audit-get-audit",
+		"hubspot-pipelines-crm get-v3-pipelines-object-type-pipeline-id-get-by-id",
+		"hubspot-pipelines-crm get-v3-pipelines-object-type-pipeline-id-stages-get-all",
+		"hubspot-pipelines-crm get-v3-pipelines-object-type-pipeline-id-stages-stage-id-audit-get-audit",
+		"hubspot-pipelines-crm get-v3-pipelines-object-type-pipeline-id-stages-stage-id-get-by-id",
+		"hubspot-pipelines-crm patch-v3-pipelines-object-type-pipeline-id-stages-stage-id-update",
+		"hubspot-pipelines-crm patch-v3-pipelines-object-type-pipeline-id-update",
+		"hubspot-pipelines-crm post-v3-pipelines-object-type-create",
+		"hubspot-pipelines-crm post-v3-pipelines-object-type-pipeline-id-stages-create",
+		"hubspot-pipelines-crm put-v3-pipelines-object-type-pipeline-id-replace",
+		"hubspot-pipelines-crm put-v3-pipelines-object-type-pipeline-id-stages-stage-id-replace",
+		"hubspot-products-crm",
+		"hubspot-products-crm delete-v3-objects-products-product-id-archive",
+		"hubspot-products-crm get-v3-objects-products-get-page",
+		"hubspot-products-crm get-v3-objects-products-product-id-get-by-id",
+		"hubspot-products-crm patch-v3-objects-products-product-id-update",
+		"hubspot-products-crm post-v3-objects-products-batch-archive-archive",
+		"hubspot-products-crm post-v3-objects-products-batch-create-create",
+		"hubspot-products-crm post-v3-objects-products-batch-read-read",
+		"hubspot-products-crm post-v3-objects-products-batch-update-update",
+		"hubspot-products-crm post-v3-objects-products-batch-upsert-upsert",
+		"hubspot-products-crm post-v3-objects-products-create",
+		"hubspot-products-crm post-v3-objects-products-search-do-search",
+		"hubspot-properties-batch",
+		"hubspot-properties-batch post-crm-v3-properties-object-type-archive-archive",
+		"hubspot-properties-batch post-crm-v3-properties-object-type-create-create",
+		"hubspot-properties-batch post-crm-v3-properties-object-type-read-read",
+		"hubspot-properties-crm",
+		"hubspot-properties-crm delete-v3-properties-object-type-property-name-archive",
+		"hubspot-properties-crm get-v3-properties-object-type-get-all",
+		"hubspot-properties-crm get-v3-properties-object-type-property-name-get-by-name",
+		"hubspot-properties-crm patch-v3-properties-object-type-property-name-update",
+		"hubspot-properties-crm post-v3-properties-object-type-create",
+		"hubspot-quotes-crm",
+		"hubspot-quotes-crm delete-v3-objects-quotes-quote-id-archive",
+		"hubspot-quotes-crm get-v3-objects-quotes-get-page",
+		"hubspot-quotes-crm get-v3-objects-quotes-quote-id-get-by-id",
+		"hubspot-quotes-crm patch-v3-objects-quotes-quote-id-update",
+		"hubspot-quotes-crm post-v3-objects-quotes-batch-archive-archive",
+		"hubspot-quotes-crm post-v3-objects-quotes-batch-create-create",
+		"hubspot-quotes-crm post-v3-objects-quotes-batch-read-read",
+		"hubspot-quotes-crm post-v3-objects-quotes-batch-update-update",
+		"hubspot-quotes-crm post-v3-objects-quotes-batch-upsert-upsert",
+		"hubspot-quotes-crm post-v3-objects-quotes-create",
+		"hubspot-quotes-crm post-v3-objects-quotes-search-do-search",
+		"hubspot-tasks-crm",
+		"hubspot-tasks-crm delete-v3-objects-tasks-task-id-archive",
+		"hubspot-tasks-crm get-v3-objects-tasks-get-page",
+		"hubspot-tasks-crm get-v3-objects-tasks-task-id-get-by-id",
+		"hubspot-tasks-crm patch-v3-objects-tasks-task-id-update",
+		"hubspot-tasks-crm post-v3-objects-tasks-batch-archive-archive",
+		"hubspot-tasks-crm post-v3-objects-tasks-batch-create-create",
+		"hubspot-tasks-crm post-v3-objects-tasks-batch-read-read",
+		"hubspot-tasks-crm post-v3-objects-tasks-batch-update-update",
+		"hubspot-tasks-crm post-v3-objects-tasks-batch-upsert-upsert",
+		"hubspot-tasks-crm post-v3-objects-tasks-create",
+		"hubspot-tasks-crm post-v3-objects-tasks-search-do-search",
+		"hubspot-tickets-crm",
+		"hubspot-tickets-crm delete-v3-objects-tickets-ticket-id-archive",
+		"hubspot-tickets-crm get-v3-objects-tickets-get-page",
+		"hubspot-tickets-crm get-v3-objects-tickets-ticket-id-get-by-id",
+		"hubspot-tickets-crm patch-v3-objects-tickets-ticket-id-update",
+		"hubspot-tickets-crm post-v3-objects-tickets-batch-archive-archive",
+		"hubspot-tickets-crm post-v3-objects-tickets-batch-create-create",
+		"hubspot-tickets-crm post-v3-objects-tickets-batch-read-read",
+		"hubspot-tickets-crm post-v3-objects-tickets-batch-update-update",
+		"hubspot-tickets-crm post-v3-objects-tickets-batch-upsert-upsert",
+		"hubspot-tickets-crm post-v3-objects-tickets-create",
+		"hubspot-tickets-crm post-v3-objects-tickets-merge-merge",
+		"hubspot-tickets-crm post-v3-objects-tickets-search-do-search",
+		"objects-search",
+	}
+	actual := make(map[string]struct{}, len(expected))
+	type pendingCommand struct {
+		command *cobra.Command
+		path    string
+	}
+	queue := make([]pendingCommand, 0, len(expected))
+	for _, child := range RootCmd().Commands() {
+		queue = append(queue, pendingCommand{command: child, path: child.Name()})
+	}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		actual[current.path] = struct{}{}
+		for _, child := range current.command.Commands() {
+			queue = append(queue, pendingCommand{
+				command: child,
+				path:    strings.TrimSpace(current.path + " " + child.Name()),
+			})
+		}
+	}
+
+	var missing []string
+	for _, commandPath := range expected {
+		if _, ok := actual[commandPath]; !ok {
+			missing = append(missing, commandPath)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("declared API command paths missing from generated Cobra tree: %s", strings.Join(missing, ", "))
+	}
+}
+
+func TestNoDuplicateCommandNames(t *testing.T) {
+	type pendingCommand struct {
+		command *cobra.Command
+		path    string
+	}
+	queue := []pendingCommand{}
+	queue = append(queue, pendingCommand{command: RootCmd(), path: ""})
+	var duplicates []string
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		seen := map[string]struct{}{}
+		for _, child := range current.command.Commands() {
+			childPath := strings.TrimSpace(current.path + " " + child.Name())
+			if _, exists := seen[child.Name()]; exists {
+				duplicates = append(duplicates, childPath)
+			} else {
+				seen[child.Name()] = struct{}{}
+			}
+			queue = append(queue, pendingCommand{command: child, path: childPath})
+		}
+	}
+	if len(duplicates) > 0 {
+		t.Fatalf("generated Cobra tree contains duplicate sibling command names: %s", strings.Join(duplicates, ", "))
+	}
+}
+func TestWriteCredentialSaveErrorEnvelope(t *testing.T) {
+	var out bytes.Buffer
+	cause := &cliutil.CredentialsPermissionError{
+		Path: "/tmp/credentials.toml",
+		Err:  errors.New("unsafe permissions"),
+	}
+	if !writeCredentialSaveErrorEnvelope(&out, &rootFlags{asJSON: true}, fmt.Errorf("saving token: %w", cause)) {
+		t.Fatal("permission failure envelope was not written")
+	}
+
+	var payload struct {
+		Saved               bool   `json:"saved"`
+		CredentialsPath     string `json:"credentials_path"`
+		PermissionsVerified bool   `json:"permissions_verified"`
+		Error               string `json:"error"`
+		Code                int    `json:"code"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("permission failure envelope must be valid JSON: %v\n%s", err, out.String())
+	}
+	if !payload.Saved || payload.CredentialsPath != cause.Path || payload.PermissionsVerified || payload.Error == "" || payload.Code == 0 {
+		t.Fatalf("permission failure envelope = %+v, want saved path, unsafe permissions, error, and non-zero code", payload)
+	}
+}
 
 // TestIsCobraUsageError covers the six pre-RunE error shapes Cobra and
 // pflag can produce before any user RunE runs. Each must be detected so
@@ -135,10 +489,16 @@ func TestFilterFields(t *testing.T) {
 			want:   `{"projects":[{"id":"a"}]}`,
 		},
 		{
-			name:   "flat object no match returns empty (no array fallback)",
+			name:   "flat object no match preserves input",
 			input:  `{"a":1,"b":2}`,
 			fields: "c",
-			want:   `{}`,
+			want:   `{"a":1,"b":2}`,
+		},
+		{
+			name:   "unknown selector preserves nested array objects",
+			input:  `{"items":[{"id":"a","name":"Alpha"},{"id":"b","name":"Beta"}]}`,
+			fields: "missing",
+			want:   `{"items":[{"id":"a","name":"Alpha"},{"id":"b","name":"Beta"}]}`,
 		},
 		{
 			// Null pagination cursors are common envelope metadata.
@@ -152,12 +512,11 @@ func TestFilterFields(t *testing.T) {
 		},
 		{
 			// Without a real array sibling the envelope fallback does not
-			// fire, so a flat object whose only "extra" key is null still
-			// returns {} for a non-matching selector.
-			name:   "flat object with null sibling no match returns empty",
+			// fire, but an invalid selector still preserves the input.
+			name:   "flat object with null sibling no match preserves input",
 			input:  `{"a":1,"b":null}`,
 			fields: "c",
-			want:   `{}`,
+			want:   `{"a":1,"b":null}`,
 		},
 		{
 			// Multiple array siblings at the same level each receive the
@@ -169,16 +528,13 @@ func TestFilterFields(t *testing.T) {
 			want:   `{"events":[{"id":"e1"}],"speakers":[{"id":"s1"}]}`,
 		},
 		{
-			// Envelope fallback is intentionally one level deep. A nested
-			// object envelope like {"data":{"items":[...]}} surfaces no
-			// array at the outer level, so the fallback does not fire and
-			// the result is the empty-object that flat-no-match would
-			// produce. Pins the boundary so a future deeper-walk change
-			// is an explicit decision, not an accident.
-			name:   "nested object envelope returns empty (one-level only)",
+			// Generic object descent supports type-keyed envelopes such as
+			// {"data":{"items":[...]}} while keeping the fail-closed
+			// behavior for objects with no collection below them.
+			name:   "nested object envelope descends into collection",
 			input:  `{"data":{"items":[{"id":"a","other":"y"}]}}`,
 			fields: "id",
-			want:   `{}`,
+			want:   `{"data":{"items":[{"id":"a"}]}}`,
 		},
 	}
 	for _, tc := range cases {

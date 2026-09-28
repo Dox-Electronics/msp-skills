@@ -1,7 +1,9 @@
 .PHONY: build test lint install clean
 
+BIN_EXT := $(if $(filter windows,$(shell go env GOOS)),.exe,)
+
 build:
-	go build -o bin/hubspot-cli ./cmd/hubspot-cli
+	go build -trimpath -o bin/hubspot-cli$(BIN_EXT) ./cmd/hubspot-cli
 
 test:
 	go test ./...
@@ -16,7 +18,7 @@ clean:
 	rm -rf bin/
 
 build-mcp:
-	go build -o bin/hubspot-mcp ./cmd/hubspot-mcp
+	go build -trimpath -o bin/hubspot-mcp$(BIN_EXT) ./cmd/hubspot-mcp
 
 install-mcp:
 	go install ./cmd/hubspot-mcp

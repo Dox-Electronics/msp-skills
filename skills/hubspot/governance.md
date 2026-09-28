@@ -29,6 +29,12 @@ never written to disk, never logged, never sent anywhere except the HubSpot API.
   global is `--yes`, which *skips* prompts for agents - it does not add a gate.
 - **Read commands are always safe to run** (reports, rollups, search); they cannot
   change anything.
+- **Local-store-only writes exist and never reach HubSpot.** `teach`, `teach-pattern`,
+  `teach-lookup`, `teach-playbook`, `playbook amend` and `learnings confirm|forget|reject|purge`
+  write only to the CLI's own SQLite store (the self-learning loop described in AGENTS.md),
+  and `export` writes API data to a local file named with `--output` or to stdout. Over MCP
+  every file-destination flag (`--output`, `--db`, ...) is refused, so an MCP client can only
+  stream `export` into its own result. None of these send a mutation to HubSpot.
 - **Agent mode does not add safety.** `--agent` produces JSON and sets
   `--no-input --yes` for non-interactive use; it relaxes prompts rather than adding a
   confirm step. See AGENTS.md.
@@ -43,6 +49,7 @@ before sending; never run destructive or credential-touching commands unattended
 | Tier | What it does | Examples | Recommended agent policy |
 | --- | --- | --- | --- |
 | **Read** | Reports, rollups, search. No change. | the cross-entity views and any non-mutating command | Allow |
+| **Local store only** | Writes to the CLI's own SQLite/state files; nothing reaches HubSpot. | `teach`, `teach-pattern`, `teach-lookup`, `teach-playbook`, `playbook amend`, `learnings confirm`, `learnings forget`, `learnings reject`, `learnings purge`, `export` | Allow; `learnings forget` / `learnings purge` only discard locally taught shortcuts and are undone by teaching again |
 | **Write (routine)** | Day-to-day mutations. Raw writes send immediately; `contacts bulk-update` gates only above 100 rows. | `batch post-crm-v3-objects-object-type-archive-archive`, `batch post-crm-v3-objects-object-type-create-create`, `batch post-crm-v3-objects-object-type-update-update`, `contacts bulk-update`, `crm post-v4-associations-from-object-type-to-object-type-batch-archive-archive`, `crm post-v4-associations-from-object-type-to-object-type-batch-associate-default-create-default`, `crm post-v4-associations-from-object-type-to-object-type-batch-create-create`, `crm post-v4-associations-from-object-type-to-object-type-batch-labels-archive-archive-labels`, ... (88 total) | Make the agent pass `--dry-run` to preview, then require human approval of the exact command before sending. Do not assume a built-in gate. |
 | **Credential / security** | Touches tokens, keys, MFA. | (none detected) | Human-in-the-loop only |
 | **Destructive** | Irreversible data or config loss. | `crm delete-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-archive`, `groups delete-crm-v3-properties-object-type-name-archive`, `hubspot-calls-crm delete-v3-objects-calls-call-id-archive`, `hubspot-companies-crm delete-v3-objects-companies-company-id-archive`, `hubspot-contacts-crm delete-v3-objects-contacts-contact-id`, `hubspot-contacts-crm post-v3-objects-contacts-gdpr-delete`, `hubspot-deals-crm delete-v3-objects-0-3-deal-id-archive`, `hubspot-emails-crm delete-v3-objects-emails-email-id-archive`, ... (24 total) | Human-in-the-loop only, explicit confirmation |
