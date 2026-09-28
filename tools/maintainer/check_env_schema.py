@@ -222,6 +222,14 @@ def os_reader_names(src: str) -> set[str]:
     return names
 
 
+def file_imports(src: str) -> list[tuple[str | None, str]]:
+    """[(alias or None, import path)] for every import spec in this FILE."""
+    out = [(m.group(1), m.group(2)) for m in RE_IMPORT_ONE.finditer(src)]
+    for group in RE_IMPORT_GROUP.finditer(src):
+        out += [(m.group(1), m.group(2)) for m in RE_IMPORT_SPEC.finditer(group.group(1))]
+    return out
+
+
 def builtin_read_regex(names: set[str]) -> re.Pattern:
     """`<reader>(ident)` for any of this file's reader spellings."""
     if not names:
@@ -604,31 +612,64 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
     return pkg
 
 
-RE_SLICE_DECL_USE = r"(?:(?:const|var)\s+)?\b{n}\s*:?=\s*\[\]string\s*\{{"
-RE_SLICE_RANGE_USE = r"range\s+{n}\b"
+def blank_strings(src: str) -> str:
+    """src with every string/rune literal's CONTENT replaced by spaces (same
+    length), so text inside a literal can never look like code."""
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch in '"\'`':
+            quote = ch
+            i += 1
+            while i < n:
+                c = src[i]
+                if quote != "`" and c == "\\" and i + 1 < n:
+                    out[i] = out[i + 1] = " "
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                if c != "\n":
+                    out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
 
 
 def guard_whole_slices(packages: list[GoPackage]) -> None:
     """Keep a whole-bound []string literal only while nothing can change it.
 
     A literal bound whole says "these are the names", which is only true while
-    the variable is used solely by its declaration and `range` loops. Any other
-    occurrence (`names[0] = x`, `copy(names, ...)`, `mutate(names)`, `&names`,
-    or, for an exported name, any `pkg.Name` reference from another package)
-    gets the bare opener bound as well, which resolves UNRESOLVED - the same
-    verdict origin/main gave every multi-line literal - so the read stays
-    reported instead of resolving to a list that may no longer be true.
+    every occurrence of the variable is its own declaration or the operand of a
+    `range`. Each occurrence is checked individually on string-blanked source.
+    Any other use (`names[0] = x`, `copy(names, ...)`, `mutate(names)`,
+    `&names`, or, for an exported name, any `pkg.Name` from another package)
+    also binds the bare opener, which resolves UNRESOLVED - origin/main's verdict
+    for every multi-line literal - so the read stays reported.
     """
-    all_text = "\n".join(src for pkg in packages for _, src in pkg.sources)
+    blanked = {id(pkg): "\n".join(blank_strings(src) for _, src in pkg.sources)
+               for pkg in packages}
     for pkg in packages:
-        pkg_text = "\n".join(src for _, src in pkg.sources)
+        text = blanked[id(pkg)]
         for name, scope in pkg.whole_slices:
             n = re.escape(name)
-            total = len(re.findall(rf"\b{n}\b", pkg_text))
-            benign = (len(re.findall(RE_SLICE_DECL_USE.format(n=n), pkg_text))
-                      + len(re.findall(RE_SLICE_RANGE_USE.format(n=n), pkg_text)))
-            foreign = name[:1].isupper() and re.search(rf"\.{n}\b", all_text)
-            if total != benign or foreign:
+            unsafe = False
+            for m in re.finditer(rf"(?<![\w.]){n}\b", text):
+                after = text[m.end():]
+                before = text[:m.start()]
+                is_decl = re.match(r"\s*:?=\s*\[\]string\s*\{", after) is not None
+                is_range = (re.search(r"\brange\s+$", before) is not None
+                            and re.match(r"\s*\{", after) is not None)
+                if not (is_decl or is_range):
+                    unsafe = True
+                    break
+            if not unsafe and name[:1].isupper():
+                unsafe = any(re.search(rf"\.{n}\b", blanked[id(other)])
+                             for other in packages)
+            if unsafe:
                 scope.bind(name, "[]string{")
 
 
@@ -1002,16 +1043,18 @@ def scan_packages(packages: list[GoPackage], prefix: str,
     # os.Getenv plus an MCPB-placeholder scrub) is called package-qualified from
     # other packages. Without this table `cliutil.EnvOverride("X_BASE_URL")` is
     # invisible, so X_BASE_URL reads as declared-but-never-read and a new
-    # credential read through the helper would go unnoticed. Keyed by the
-    # callee package's `package` clause name.
-    qualified: dict[str, tuple[list[int], bool]] = {}
+    # credential read through the helper would go unnoticed. Keyed by the callee
+    # package's IMPORT PATH and bound per FILE through that file's own import
+    # specs, so an alias, an unrelated package with the same name, or a package
+    # clause shared by two directories can neither invent nor hide a read.
+    by_import: dict[str, tuple[str, dict[str, tuple[list[int], bool]]]] = {}
     for pkg in packages:
-        pkg_name = go_package_name(pkg)
-        if not pkg_name:
-            continue
-        for fn in pkg.funcs.values():
-            if fn.env_param_idx and fn.name[:1].isupper():
-                qualified[f"{pkg_name}.{fn.name}"] = (sorted(fn.env_param_idx), fn.variadic_env)
+        ipath = go_import_path(pkg)
+        exported = {fn.name: (sorted(fn.env_param_idx), fn.variadic_env)
+                    for fn in pkg.funcs.values()
+                    if fn.env_param_idx and fn.name[:1].isupper()}
+        if ipath and exported:
+            by_import[ipath] = (go_package_name(pkg), exported)
 
     for pkg in packages:
         helpers: dict[str, list[int]] = {}
@@ -1021,13 +1064,6 @@ def scan_packages(packages: list[GoPackage], prefix: str,
                 helpers[fn.name] = sorted(fn.env_param_idx)
                 if fn.variadic_env:
                     variadic.add(fn.name)
-        own = go_package_name(pkg)
-        for qname, (idxs, is_variadic) in qualified.items():
-            if qname.split(".", 1)[0] == own:
-                continue  # same package: called unqualified, already in helpers
-            helpers[qname] = idxs
-            if is_variadic:
-                variadic.add(qname)
 
         for path, src in pkg.sources:
             try:
@@ -1040,6 +1076,18 @@ def scan_packages(packages: list[GoPackage], prefix: str,
                 name: [0] for name in pkg.file_readers.get(path, set())
             }
             readers.update(helpers)
+            for alias, ipath in file_imports(src):
+                if ipath not in by_import or alias in ("_", "."):
+                    continue
+                callee_name, exported = by_import[ipath]
+                local = alias or callee_name
+                for fname, (idxs, is_variadic) in exported.items():
+                    qname = f"{local}.{fname}"
+                    if qname in readers:
+                        continue  # never displace a genuine os reader
+                    readers[qname] = idxs
+                    if is_variadic:
+                        variadic.add(qname)
             decls = pkg.decl_sites.get(path, set())
             for name, idxs in sorted(readers.items()):
                 for start, args in call_sites(src, name):
@@ -1067,6 +1115,24 @@ def scan_packages(packages: list[GoPackage], prefix: str,
 
 
 RE_PACKAGE_CLAUSE = re.compile(r"(?m)^package\s+([A-Za-z_]\w*)")
+
+
+def go_import_path(pkg: GoPackage) -> str:
+    """This package's import path: the enclosing go.mod's module + the relative
+    directory. Self-test fixtures (no go.mod) use "fixture/<dir name>"."""
+    d = pkg.path
+    for parent in [d, *d.parents]:
+        gomod = parent / "go.mod"
+        try:
+            text = gomod.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = re.search(r"(?m)^module\s+(\S+)", text)
+        if not m:
+            return ""
+        rel = d.relative_to(parent).as_posix()
+        return m.group(1) if rel == "." else f"{m.group(1)}/{rel}"
+    return f"fixture/{d.name}"
 
 
 def go_package_name(pkg: GoPackage) -> str:
@@ -1660,7 +1726,7 @@ _fixture(
         "cliutil": 'package cliutil\nimport "os"\n'
                    'func EnvOverride(name string) string { return scrub(os.Getenv(name)) }\n'
                    'func scrub(v string) string { return v }\n',
-        "config": 'package config\nimport "x/internal/cliutil"\n'
+        "config": 'package config\nimport "fixture/cliutil"\n'
                   'func a() string { return cliutil.EnvOverride("COVE_BASE_URL") }\n',
     },
     {"COVE_BASE_URL"}, set(),
@@ -1674,6 +1740,45 @@ _fixture(
                   'func a() string { return other.envOverride("COVE_BASE_URL") }\n',
     },
     set(), set(),
+)
+_fixture(
+    "a string that spells the declaration cannot mask a mutation",
+    'package cli\nimport "os"\n'
+    'func a() {\n\tnames := []string{\n\t\t"CODEX_THREAD_ID",\n\t}\n'
+    '\t_ = "range names := []string{"\n'
+    '\tnames[0] = "COVE_PASSWORD"\n'
+    '\tfor _, name := range names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
+)
+_fixture(
+    "an os alias is never displaced by a same-named connector helper",
+    {
+        "env": 'package env\nimport "os"\n'
+               'func Getenv(unused, name string) string { return os.Getenv(name) }\n',
+        "cli": 'package cli\nimport env "os"\n'
+               'func a() string { return env.Getenv("COVE_PASSWORD") }\n',
+    },
+    {"COVE_PASSWORD"}, set(),
+)
+_fixture(
+    "a qualified call into an UNRELATED import of the same name is not a read",
+    {
+        "cliutil": 'package cliutil\nimport "os"\n'
+                   'func EnvOverride(name string) string { return os.Getenv(name) }\n',
+        "cli": 'package cli\nimport cliutil "example.com/other/cliutil"\n'
+               'func a() string { return cliutil.EnvOverride("COVE_BASE_URL") }\n',
+    },
+    set(), set(),
+)
+_fixture(
+    "an ALIASED import of the helper package is still a read",
+    {
+        "cliutil": 'package cliutil\nimport "os"\n'
+                   'func EnvOverride(name string) string { return os.Getenv(name) }\n',
+        "cli": 'package cli\nimport cu "fixture/cliutil"\n'
+               'func a() string { return cu.EnvOverride("COVE_BASE_URL") }\n',
+    },
+    {"COVE_BASE_URL"}, set(),
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
