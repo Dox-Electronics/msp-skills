@@ -4,7 +4,7 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-09-28
 
 ### Added
 - **Product catalog.** The connector could not read the ConnectWise PSA product catalog: none
