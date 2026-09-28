@@ -401,7 +401,7 @@
   "sentinelone": {
     "state": "up-to-date",
     "version": "0.1.5",
-    "latest_tag": "sentinelone-v0.1.5",
+    "latest_tag": "sentinelone-v0.2.1",
     "current_hash": "sha256:eafa613b1f738f42bb1f3e09fc2d57057638cf52af043f05415c9def2d296748",
     "released_hash": "sha256:eafa613b1f738f42bb1f3e09fc2d57057638cf52af043f05415c9def2d296748"
   },
