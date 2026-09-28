@@ -154,11 +154,11 @@
     "released_hash": "sha256:e514d47e0987ad022c3eded8f7b8d418f871057619c50b7d0f93c7be55ace44a"
   },
   "datto-bcdr": {
-    "state": "up-to-date",
-    "version": "0.1.5",
+    "state": "version-pending",
+    "version": "0.1.6",
     "latest_tag": "datto-bcdr-v0.1.5",
-    "current_hash": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630",
-    "released_hash": "sha256:9bd602d7dc770cb1b81e26c25b7afd97226a880f8db353ad17080b2d8cc1d630"
+    "current_hash": "sha256:78185d7d75fc4ccc769aee40f33c9a0ada09183b60755fa3d8e7e22149b2ac62",
+    "released_hash": "sha256:78185d7d75fc4ccc769aee40f33c9a0ada09183b60755fa3d8e7e22149b2ac62"
   },
   "datto-rmm": {
     "state": "up-to-date",
