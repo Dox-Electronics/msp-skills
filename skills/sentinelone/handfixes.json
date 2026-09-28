@@ -315,6 +315,25 @@
      "code_only": true
     }
    ]
+  },
+  {
+   "id": "login-by-token-example-not-a-token",
+   "summary": "`users login-by-token --token` help text shows `<your-user-token>` instead of the 80-hex-character sample token the vendor spec carries",
+   "why": "The SentinelOne spec's example for the login-by-token `token` parameter is a real-looking 80-character hex user token, and cli-printing-press copies spec examples verbatim into flag usage text. gitleaks (generic-api-key, the CI guards job) fails the build on it, and it teaches operators and agents to paste a token-shaped literal. The 0.1.x tree carried this as an unrecorded hand-edit; the 4.32.5 reprint (2026-09-28) regenerated the file and silently restored the sample, which only the guards job's gitleaks step caught. code_only so the assert is satisfied by the usage string itself.",
+   "status": "active",
+   "spec_encode_followup": "Replace the example in the vendored spec (or have the press redact token-shaped examples on credential parameters); then this entry flips to upstreamed.",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/users_login-by-token.go",
+     "contains": "User token. Example: '<your-user-token>'.",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/users_login-by-token.go",
+     "not_contains": "bfd9070c1afa88516d3cdfd722e62fe433e42bad"
+    }
+   ]
   }
  ]
 }
