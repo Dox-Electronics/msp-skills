@@ -205,7 +205,7 @@
   "hudu": {
     "state": "up-to-date",
     "version": "0.1.10",
-    "latest_tag": "hudu-v0.1.10",
+    "latest_tag": "hudu-v0.1.11",
     "current_hash": "sha256:0b0679ec6aa291ca880a69f26cb9df2ea5bd9382796eadea5a8b177a4b2ae55e",
     "released_hash": "sha256:0b0679ec6aa291ca880a69f26cb9df2ea5bd9382796eadea5a8b177a4b2ae55e"
   },
