@@ -13,7 +13,7 @@ import (
 )
 
 func newResellerSubscriptionCreationParametersCmd(flags *rootFlags) *cobra.Command {
-	var bodyAccountId string
+	var bodyAccountId int
 	var bodyBillingInterval string
 	var bodyMinimum int
 	var bodyProduct string
@@ -24,37 +24,47 @@ func newResellerSubscriptionCreationParametersCmd(flags *rootFlags) *cobra.Comma
 		Use:         "subscription-creation-parameters",
 		Aliases:     []string{"create"},
 		Short:       "Creates a subscription for a product on a reseller-managed account.",
-		Example:     "  huntress-cli reseller subscription-creation-parameters --product edr",
-		Annotations: map[string]string{"pp:endpoint": "reseller.subscription-creation-parameters", "pp:method": "POST", "pp:path": "/v1/reseller/subscriptions"},
+		Annotations: map[string]string{"pp:endpoint": "reseller.subscription-creation-parameters", "pp:method": "POST", "pp:path": "/v1/reseller/subscriptions", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("account-id") && !flags.dryRun {
+				if !cmd.Flags().Changed("account-id") && bodyAccountId == 0 && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "account-id")
 				}
-				if !cmd.Flags().Changed("minimum") && !flags.dryRun {
+				if !cmd.Flags().Changed("minimum") && bodyMinimum == 0 && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "minimum")
 				}
-				if !cmd.Flags().Changed("product") && !flags.dryRun {
+				if !cmd.Flags().Changed("product") && bodyProduct == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "product")
 				}
-				if !cmd.Flags().Changed("purchase-order") && !flags.dryRun {
+				if !cmd.Flags().Changed("purchase-order") && bodyPurchaseOrder == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "purchase-order")
 				}
 			}
+			path := "/v1/reseller/subscriptions"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/v1/reseller/subscriptions"
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -66,26 +76,27 @@ func newResellerSubscriptionCreationParametersCmd(flags *rootFlags) *cobra.Comma
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
-				if bodyAccountId != "" {
-					body["account_id"] = bodyAccountId
+				bodyMap := map[string]any{}
+				body = bodyMap
+				if cmd.Flags().Changed("account-id") || bodyAccountId != 0 {
+					bodyMap["account_id"] = bodyAccountId
 				}
-				if bodyBillingInterval != "" {
-					body["billing_interval"] = bodyBillingInterval
+				if cmd.Flags().Changed("billing-interval") || bodyBillingInterval != "" {
+					bodyMap["billing_interval"] = bodyBillingInterval
 				}
-				if bodyMinimum != 0 {
-					body["minimum"] = bodyMinimum
+				if cmd.Flags().Changed("minimum") || bodyMinimum != 0 {
+					bodyMap["minimum"] = bodyMinimum
 				}
-				if bodyProduct != "" {
-					body["product"] = bodyProduct
+				if cmd.Flags().Changed("product") || bodyProduct != "" {
+					bodyMap["product"] = bodyProduct
 				}
-				if bodyPurchaseOrder != "" {
-					body["purchase_order"] = bodyPurchaseOrder
+				if cmd.Flags().Changed("purchase-order") || bodyPurchaseOrder != "" {
+					bodyMap["purchase_order"] = bodyPurchaseOrder
 				}
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -150,6 +161,9 @@ func newResellerSubscriptionCreationParametersCmd(flags *rootFlags) *cobra.Comma
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -175,51 +189,69 @@ func newResellerSubscriptionCreationParametersCmd(flags *rootFlags) *cobra.Comma
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"ends_at": true, "id": true, "starts_at": true, "status": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "reseller", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"ends_at": true, "id": true, "starts_at": true, "status": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "reseller", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
-	cmd.Flags().StringVar(&bodyAccountId, "account-id", "", "The reseller subaccount ID")
+	cmd.Flags().IntVar(&bodyAccountId, "account-id", 0, "The reseller subaccount ID")
 	cmd.Flags().StringVar(&bodyBillingInterval, "billing-interval", "monthly", "Billing interval")
 	cmd.Flags().IntVar(&bodyMinimum, "minimum", 0, "Minimum usage commitment (must be greater than zero)")
 	cmd.Flags().StringVar(&bodyProduct, "product", "", "Product type")

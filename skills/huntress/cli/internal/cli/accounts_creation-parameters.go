@@ -43,43 +43,53 @@ func newAccountsCreationParametersCmd(flags *rootFlags) *cobra.Command {
 		Use:         "creation-parameters",
 		Aliases:     []string{"create"},
 		Short:       "Create a new account under the reseller associated with the supplied API credential.",
-		Example:     "  huntress-cli accounts creation-parameters --name example-resource",
-		Annotations: map[string]string{"pp:endpoint": "accounts.creation-parameters", "pp:method": "POST", "pp:path": "/v1/accounts"},
+		Annotations: map[string]string{"pp:endpoint": "accounts.creation-parameters", "pp:method": "POST", "pp:path": "/v1/accounts", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("admin-email") && !flags.dryRun {
+				if !cmd.Flags().Changed("admin-email") && bodyAdminEmail == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "admin-email")
 				}
-				if !cmd.Flags().Changed("admin-first-name") && !flags.dryRun {
+				if !cmd.Flags().Changed("admin-first-name") && bodyAdminFirstName == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "admin-first-name")
 				}
-				if !cmd.Flags().Changed("admin-last-name") && !flags.dryRun {
+				if !cmd.Flags().Changed("admin-last-name") && bodyAdminLastName == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "admin-last-name")
 				}
-				if !cmd.Flags().Changed("name") && !flags.dryRun {
+				if !cmd.Flags().Changed("name") && bodyName == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "name")
 				}
-				if !cmd.Flags().Changed("phone-number") && !flags.dryRun {
+				if !cmd.Flags().Changed("phone-number") && bodyPhoneNumber == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "phone-number")
 				}
-				if !cmd.Flags().Changed("subdomain") && !flags.dryRun {
+				if !cmd.Flags().Changed("subdomain") && bodySubdomain == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "subdomain")
 				}
 			}
+			path := "/v1/accounts"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/v1/accounts"
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -91,98 +101,111 @@ func newAccountsCreationParametersCmd(flags *rootFlags) *cobra.Command {
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
-				if bodyAdditionalAdminEmails != "" {
-					body["additional_admin_emails"] = cliutil.SplitCSV(bodyAdditionalAdminEmails)
+				bodyMap := map[string]any{}
+				body = bodyMap
+				if cmd.Flags().Changed("additional-admin-emails") {
+					parsedAdditionalAdminEmails, parseErr := cliutil.ParseStringList(bodyAdditionalAdminEmails)
+					if parseErr != nil {
+						return fmt.Errorf("parsing --additional-admin-emails list: %w", parseErr)
+					}
+					bodyMap["additional_admin_emails"] = parsedAdditionalAdminEmails
 				}
 				{
 					nestedAdmin := map[string]any{}
-					if bodyAdminEmail != "" {
+					if cmd.Flags().Changed("admin-email") || bodyAdminEmail != "" {
 						nestedAdmin["email"] = bodyAdminEmail
 					}
-					if bodyAdminFirstName != "" {
+					if cmd.Flags().Changed("admin-first-name") || bodyAdminFirstName != "" {
 						nestedAdmin["first_name"] = bodyAdminFirstName
 					}
-					if bodyAdminLastName != "" {
+					if cmd.Flags().Changed("admin-last-name") || bodyAdminLastName != "" {
 						nestedAdmin["last_name"] = bodyAdminLastName
 					}
 					if len(nestedAdmin) > 0 {
-						body["admin"] = nestedAdmin
+						bodyMap["admin"] = nestedAdmin
 					}
 				}
 				{
 					nestedBillingAddress := map[string]any{}
-					if bodyBillingAddressCity != "" {
+					if cmd.Flags().Changed("billing-address-city") || bodyBillingAddressCity != "" {
 						nestedBillingAddress["city"] = bodyBillingAddressCity
 					}
-					if bodyBillingAddressCountry != "" {
+					if cmd.Flags().Changed("billing-address-country") || bodyBillingAddressCountry != "" {
 						nestedBillingAddress["country"] = bodyBillingAddressCountry
 					}
-					if bodyBillingAddressLine1 != "" {
+					if cmd.Flags().Changed("billing-address-line1") || bodyBillingAddressLine1 != "" {
 						nestedBillingAddress["line1"] = bodyBillingAddressLine1
 					}
-					if bodyBillingAddressLine2 != "" {
+					if cmd.Flags().Changed("billing-address-line2") || bodyBillingAddressLine2 != "" {
 						nestedBillingAddress["line2"] = bodyBillingAddressLine2
 					}
-					if bodyBillingAddressPostalCode != "" {
+					if cmd.Flags().Changed("billing-address-postal-code") || bodyBillingAddressPostalCode != "" {
 						nestedBillingAddress["postal_code"] = bodyBillingAddressPostalCode
 					}
-					if bodyBillingAddressState != "" {
+					if cmd.Flags().Changed("billing-address-state") || bodyBillingAddressState != "" {
 						nestedBillingAddress["state"] = bodyBillingAddressState
 					}
 					if len(nestedBillingAddress) > 0 {
-						body["billing_address"] = nestedBillingAddress
+						bodyMap["billing_address"] = nestedBillingAddress
 					}
 				}
-				if bodyName != "" {
-					body["name"] = bodyName
+				if cmd.Flags().Changed("name") || bodyName != "" {
+					bodyMap["name"] = bodyName
 				}
-				if bodyPhoneNumber != "" {
-					body["phone_number"] = bodyPhoneNumber
+				if cmd.Flags().Changed("phone-number") || bodyPhoneNumber != "" {
+					bodyMap["phone_number"] = bodyPhoneNumber
 				}
-				if bodyProductTrials != "" {
-					body["product_trials"] = cliutil.SplitCSV(bodyProductTrials)
+				if cmd.Flags().Changed("product-trials") {
+					parsedProductTrials, parseErr := cliutil.ParseStringList(bodyProductTrials)
+					if parseErr != nil {
+						return fmt.Errorf("parsing --product-trials list: %w", parseErr)
+					}
+					bodyMap["product_trials"] = parsedProductTrials
 				}
-				if bodyProductTrialsStartDate != "" {
-					body["product_trials_start_date"] = bodyProductTrialsStartDate
+				if cmd.Flags().Changed("product-trials-start-date") || bodyProductTrialsStartDate != "" {
+					bodyMap["product_trials_start_date"] = bodyProductTrialsStartDate
 				}
-				if bodyProducts != "" {
-					body["products"] = cliutil.SplitCSV(bodyProducts)
+				if cmd.Flags().Changed("products") {
+					parsedProducts, parseErr := cliutil.ParseStringList(bodyProducts)
+					if parseErr != nil {
+						return fmt.Errorf("parsing --products list: %w", parseErr)
+					}
+					bodyMap["products"] = parsedProducts
 				}
 				{
 					nestedShippingAddress := map[string]any{}
-					if bodyShippingAddressCity != "" {
+					if cmd.Flags().Changed("shipping-address-city") || bodyShippingAddressCity != "" {
 						nestedShippingAddress["city"] = bodyShippingAddressCity
 					}
-					if bodyShippingAddressCountry != "" {
+					if cmd.Flags().Changed("shipping-address-country") || bodyShippingAddressCountry != "" {
 						nestedShippingAddress["country"] = bodyShippingAddressCountry
 					}
-					if bodyShippingAddressLine1 != "" {
+					if cmd.Flags().Changed("shipping-address-line1") || bodyShippingAddressLine1 != "" {
 						nestedShippingAddress["line1"] = bodyShippingAddressLine1
 					}
-					if bodyShippingAddressLine2 != "" {
+					if cmd.Flags().Changed("shipping-address-line2") || bodyShippingAddressLine2 != "" {
 						nestedShippingAddress["line2"] = bodyShippingAddressLine2
 					}
-					if bodyShippingAddressPostalCode != "" {
+					if cmd.Flags().Changed("shipping-address-postal-code") || bodyShippingAddressPostalCode != "" {
 						nestedShippingAddress["postal_code"] = bodyShippingAddressPostalCode
 					}
-					if bodyShippingAddressState != "" {
+					if cmd.Flags().Changed("shipping-address-state") || bodyShippingAddressState != "" {
 						nestedShippingAddress["state"] = bodyShippingAddressState
 					}
 					if len(nestedShippingAddress) > 0 {
-						body["shipping_address"] = nestedShippingAddress
+						bodyMap["shipping_address"] = nestedShippingAddress
 					}
 				}
-				if bodySubdomain != "" {
-					body["subdomain"] = bodySubdomain
+				if cmd.Flags().Changed("subdomain") || bodySubdomain != "" {
+					bodyMap["subdomain"] = bodySubdomain
 				}
-				if bodySupportType != "" {
-					body["support_type"] = bodySupportType
+				if cmd.Flags().Changed("support-type") || bodySupportType != "" {
+					bodyMap["support_type"] = bodySupportType
 				}
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -247,6 +270,9 @@ func newAccountsCreationParametersCmd(flags *rootFlags) *cobra.Command {
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -272,48 +298,66 @@ func newAccountsCreationParametersCmd(flags *rootFlags) *cobra.Command {
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"id": true, "name": true, "status": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "accounts", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"id": true, "name": true, "status": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "accounts", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyAdditionalAdminEmails, "additional-admin-emails", "", "Email addresses of additional admin users to invite to this account")
