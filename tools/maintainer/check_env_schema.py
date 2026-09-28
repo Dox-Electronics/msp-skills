@@ -435,7 +435,7 @@ class GoPackage(Scope):
         super().__init__()
         # (name, scope) of every multi-line []string literal bound whole; see
         # guard_whole_slices().
-        self.whole_slices: list[tuple[str, Scope]] = []
+        self.whole_slices: list[tuple[str, Scope, Path, int]] = []
         self.path = path
         self.funcs: dict[str, GoFunc] = {}
         self.sources: list[tuple[Path, str]] = []
@@ -593,7 +593,7 @@ def parse_sources(dirpath: Path, sources: list[tuple[Path, str]]) -> GoPackage:
         for start, name, literal in slices:
             scope = pkg.func_at(path, start) or pkg
             scope.bind(name, literal)
-            pkg.whole_slices.append((name, scope))
+            pkg.whole_slices.append((name, scope, path, start))
         for regex, group in ((RE_ASSIGN, 2), (RE_RANGE_LIT, 2)):
             for m in regex.finditer(src):
                 rhs = m.group(group)
@@ -643,32 +643,43 @@ def guard_whole_slices(packages: list[GoPackage]) -> None:
     """Keep a whole-bound []string literal only while nothing can change it.
 
     A literal bound whole says "these are the names", which is only true while
-    every occurrence of the variable is its own declaration or the operand of a
-    `range`. Each occurrence is checked individually on string-blanked source.
-    Any other use (`names[0] = x`, `copy(names, ...)`, `mutate(names)`,
-    `&names`, or, for an exported name, any `pkg.Name` from another package)
-    also binds the bare opener, which resolves UNRESOLVED - origin/main's verdict
-    for every multi-line literal - so the read stays reported.
+    every occurrence of the variable is THE declaration that was bound (by file
+    and offset - a second `names = []string{...}` elsewhere is a reassignment,
+    not the declaration) or the operand of a `range`. Each occurrence is checked
+    individually on string-blanked source. Any other use (`names[0] = x`,
+    `names = []string{...}` in another function, `copy(names, ...)`,
+    `mutate(names)`, `&names`, or, for an exported name, any `pkg.Name` from
+    another package) also binds the bare opener, which resolves UNRESOLVED -
+    origin/main's verdict for every multi-line literal - so the read stays
+    reported.
     """
-    blanked = {id(pkg): "\n".join(blank_strings(src) for _, src in pkg.sources)
+    blanked = {id(pkg): [(path, blank_strings(src)) for path, src in pkg.sources]
                for pkg in packages}
     for pkg in packages:
-        text = blanked[id(pkg)]
-        for name, scope in pkg.whole_slices:
+        for name, scope, decl_path, decl_start in pkg.whole_slices:
             n = re.escape(name)
+            occ = re.compile(rf"(?<![\w.]){n}\b")
             unsafe = False
-            for m in re.finditer(rf"(?<![\w.]){n}\b", text):
-                after = text[m.end():]
-                before = text[:m.start()]
-                is_decl = re.match(r"\s*:?=\s*\[\]string\s*\{", after) is not None
-                is_range = (re.search(r"\brange\s+$", before) is not None
-                            and re.match(r"\s*\{", after) is not None)
-                if not (is_decl or is_range):
-                    unsafe = True
+            for path, text in blanked[id(pkg)]:
+                decl_at = -1
+                if path == decl_path:
+                    first = occ.search(text, decl_start)
+                    decl_at = first.start() if first else -1
+                for m in occ.finditer(text):
+                    if m.start() == decl_at:
+                        continue
+                    before = text[:m.start()]
+                    after = text[m.end():]
+                    is_range = (re.search(r"\brange\s+$", before) is not None
+                                and re.match(r"\s*\{", after) is not None)
+                    if not is_range:
+                        unsafe = True
+                        break
+                if unsafe:
                     break
             if not unsafe and name[:1].isupper():
-                unsafe = any(re.search(rf"\.{n}\b", blanked[id(other)])
-                             for other in packages)
+                unsafe = any(re.search(rf"\.{n}\b", text)
+                             for other in packages for _, text in blanked[id(other)])
             if unsafe:
                 scope.bind(name, "[]string{")
 
@@ -1790,6 +1801,15 @@ _fixture(
     'var example = `os.Getenv("COVE_PASSWORD")`\n'
     'func a() string { return os.Getenv("COVE_USERNAME") }\n',
     {"COVE_USERNAME"}, set(),
+)
+_fixture(
+    "a []string literal REASSIGNED in another function keeps the read reported",
+    'package cli\nimport "os"\n'
+    'var names = []string{\n\t"CODEX_THREAD_ID",\n}\n'
+    'func mutate() {\n\tnames = []string{"COVE_PASSWORD"}\n}\n'
+    'func a() {\n\tmutate()\n'
+    '\tfor _, name := range names {\n\t\tos.Getenv(name)\n\t}\n}\n',
+    {"CODEX_THREAD_ID"}, {"name"},
 )
 _fixture(
     "name-as-parameter helper: definition explained, call sites resolved",
