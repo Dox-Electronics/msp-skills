@@ -21,33 +21,42 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 	var bodySorts string
 
 	cmd := &cobra.Command{
-		Use:   "objects-search <objectType>",
-		Short: "Post crm v3 objects object type search do search",
-		Long:  "Post crm v3 objects object type search do search",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  hubspot-cli objects-search example-value --after example-value",
-		Annotations: map[string]string{"pp:endpoint": "objects_search.post-crm-v3-objects-object-type-search-do-search", "pp:method": "POST", "pp:path": "/crm/v3/objects/{objectType}/search"},
+		Use:         "objects-search <objectType>",
+		Short:       "Post crm v3 objects object type search do search",
+		Long:        "Post crm v3 objects object type search do search",
+		Annotations: map[string]string{"pp:endpoint": "objects_search.post-crm-v3-objects-object-type-search-do-search", "pp:method": "POST", "pp:path": "/crm/v3/objects/{objectType}/search", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with a required flag/body prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only reads fall through so a bare call still executes; positional
 			// commands keep their existing usageErr (exit 2 + JSON envelope).
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
-			if !cmd.Flags().Changed("after") && !flags.dryRun {
+			if !cmd.Flags().Changed("after") && bodyAfter == "" && !flags.dryRun {
 				return fmt.Errorf("required flag \"%s\" not set", "after")
 			}
-			if !cmd.Flags().Changed("filter-groups") && !flags.dryRun {
+			if !cmd.Flags().Changed("filter-groups") && bodyFilterGroups == "" && !flags.dryRun {
 				return fmt.Errorf("required flag \"%s\" not set", "filter-groups")
 			}
-			if !cmd.Flags().Changed("limit") && !flags.dryRun {
+			if !cmd.Flags().Changed("limit") && bodyLimit == 0 && !flags.dryRun {
 				return fmt.Errorf("required flag \"%s\" not set", "limit")
 			}
-			if !cmd.Flags().Changed("properties") && !flags.dryRun {
+			if !cmd.Flags().Changed("properties") && bodyProperties == "" && !flags.dryRun {
 				return fmt.Errorf("required flag \"%s\" not set", "properties")
 			}
-			if !cmd.Flags().Changed("sorts") && !flags.dryRun {
+			if !cmd.Flags().Changed("sorts") && bodySorts == "" && !flags.dryRun {
 				return fmt.Errorf("required flag \"%s\" not set", "sorts")
 			}
 			c, err := flags.newClient()
@@ -56,7 +65,7 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 			}
 
 			path := "/crm/v3/objects/{objectType}/search"
-			if len(args) < 1 {
+			if len(args) < 1 || args[0] == "" {
 				// JSON envelope: {error, usage}. Written first; the
 				// usageErr return preserves exit code 2 across modes.
 				if flags.asJSON {
@@ -75,33 +84,46 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 			// rather than through resolveRead (GET-only internally); a
 			// body-aware cached read helper is filed as #425 for when a
 			// second store-backed POST-search consumer ships.
-			body := map[string]any{}
-			if bodyAfter != "" {
-				body["after"] = bodyAfter
+			bodyMap := map[string]any{}
+			var body any = bodyMap
+			if cmd.Flags().Changed("after") || bodyAfter != "" {
+				bodyMap["after"] = bodyAfter
 			}
-			if bodyFilterGroups != "" {
+			if cmd.Flags().Changed("filter-groups") || bodyFilterGroups != "" {
 				var parsedFilterGroups any
 				if err := json.Unmarshal([]byte(bodyFilterGroups), &parsedFilterGroups); err != nil {
 					return fmt.Errorf("parsing --filter-groups JSON: %w", err)
 				}
-				body["filterGroups"] = parsedFilterGroups
+				asArray, ok := parsedFilterGroups.([]any)
+				if !ok {
+					return fmt.Errorf("--filter-groups must be a JSON array, got JSON %T", parsedFilterGroups)
+				}
+				bodyMap["filterGroups"] = asArray
 			}
-			if bodyLimit != 0 {
-				body["limit"] = bodyLimit
+			if cmd.Flags().Changed("limit") || bodyLimit != 0 {
+				bodyMap["limit"] = bodyLimit
 			}
-			if bodyProperties != "" {
-				body["properties"] = cliutil.SplitCSV(bodyProperties)
+			if cmd.Flags().Changed("properties") {
+				parsedProperties, parseErr := cliutil.ParseStringList(bodyProperties)
+				if parseErr != nil {
+					return fmt.Errorf("parsing --properties list: %w", parseErr)
+				}
+				bodyMap["properties"] = parsedProperties
 			}
-			if bodyQuery != "" {
-				body["query"] = bodyQuery
+			if cmd.Flags().Changed("query") || bodyQuery != "" {
+				bodyMap["query"] = bodyQuery
 			}
-			if bodySorts != "" {
-				body["sorts"] = cliutil.SplitCSV(bodySorts)
+			if cmd.Flags().Changed("sorts") {
+				parsedSorts, parseErr := cliutil.ParseStringList(bodySorts)
+				if parseErr != nil {
+					return fmt.Errorf("parsing --sorts list: %w", parseErr)
+				}
+				bodyMap["sorts"] = parsedSorts
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			prov := attachFreshness(DataProvenance{Source: "live"}, flags)
 			var partialFailure *partialFailureReport
@@ -111,6 +133,7 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 			if !flags.dryRun && statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure) {
 				writeMutationResponseToStore(cmd.Context(), "objects_search", data, "")
 			}
+			outputData := data
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -118,9 +141,9 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_endpoint.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				if json.Unmarshal(data, &countItems) != nil {
+				if json.Unmarshal(outputData, &countItems) != nil {
 					// Single object, not an array
-					countItems = []json.RawMessage{data}
+					countItems = []json.RawMessage{outputData}
 				}
 				printProvenance(cmd, len(countItems), prov)
 			}
@@ -130,21 +153,30 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 			// opt out of the auto-JSON path so piped consumers that asked for a
 			// non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, nil)
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -154,7 +186,11 @@ func newObjectsSearchPromotedCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, nil)
 		},
 	}
 	cmd.Flags().StringVar(&bodyAfter, "after", "", "A paging cursor token for retrieving subsequent pages.")

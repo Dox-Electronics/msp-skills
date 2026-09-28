@@ -34,47 +34,71 @@ func newHubspotPropertiesCrmPostV3PropertiesObjectTypeCreateCmd(flags *rootFlags
 	var stdinBody bool
 
 	cmd := &cobra.Command{
-		Use:   "post-v3-properties-object-type-create <objectType>",
-		Short: "Create and return a copy of a new property for the specified object type.",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  hubspot-cli hubspot-properties-crm post-v3-properties-object-type-create example-value --field-type booleancheckbox",
-		Annotations: map[string]string{"pp:endpoint": "hubspot-properties-crm.post-v3-properties-object-type-create", "pp:method": "POST", "pp:path": "/crm/v3/properties/{objectType}"},
+		Use:         "post-v3-properties-object-type-create <objectType>",
+		Short:       "Create and return a copy of a new property for the specified object type.",
+		Annotations: map[string]string{"pp:endpoint": "hubspot-properties-crm.post-v3-properties-object-type-create", "pp:method": "POST", "pp:path": "/crm/v3/properties/{objectType}", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <objectType>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <objectType>"))
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("field-type") && !flags.dryRun {
+				if !cmd.Flags().Changed("field-type") && bodyFieldType == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "field-type")
 				}
-				if !cmd.Flags().Changed("group-name") && !flags.dryRun {
+				if !cmd.Flags().Changed("group-name") && bodyGroupName == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "group-name")
 				}
-				if !cmd.Flags().Changed("label") && !flags.dryRun {
+				if !cmd.Flags().Changed("label") && bodyLabel == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "label")
 				}
-				if !cmd.Flags().Changed("name") && !flags.dryRun {
+				if !cmd.Flags().Changed("name") && bodyName == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "name")
 				}
-				if !cmd.Flags().Changed("type") && !flags.dryRun {
+				if !cmd.Flags().Changed("type") && bodyType == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "type")
 				}
 			}
+			path := "/crm/v3/properties/{objectType}"
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("objectType is required\nUsage: %s <%s>", cmd.CommandPath(), "objectType"))
+			}
+			path = replacePathParam(path, "objectType", args[0])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/properties/{objectType}"
-			path = replacePathParam(path, "objectType", args[0])
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -86,69 +110,74 @@ func newHubspotPropertiesCrmPostV3PropertiesObjectTypeCreateCmd(flags *rootFlags
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
-				if bodyCalculationFormula != "" {
-					body["calculationFormula"] = bodyCalculationFormula
+				bodyMap := map[string]any{}
+				body = bodyMap
+				if cmd.Flags().Changed("calculation-formula") || bodyCalculationFormula != "" {
+					bodyMap["calculationFormula"] = bodyCalculationFormula
 				}
-				if bodyCurrencyPropertyName != "" {
-					body["currencyPropertyName"] = bodyCurrencyPropertyName
+				if cmd.Flags().Changed("currency-property-name") || bodyCurrencyPropertyName != "" {
+					bodyMap["currencyPropertyName"] = bodyCurrencyPropertyName
 				}
-				if bodyDataSensitivity != "" {
-					body["dataSensitivity"] = bodyDataSensitivity
+				if cmd.Flags().Changed("data-sensitivity") || bodyDataSensitivity != "" {
+					bodyMap["dataSensitivity"] = bodyDataSensitivity
 				}
-				if bodyDescription != "" {
-					body["description"] = bodyDescription
+				if cmd.Flags().Changed("description") || bodyDescription != "" {
+					bodyMap["description"] = bodyDescription
 				}
-				if bodyDisplayOrder != 0 {
-					body["displayOrder"] = bodyDisplayOrder
+				if cmd.Flags().Changed("display-order") || bodyDisplayOrder != 0 {
+					bodyMap["displayOrder"] = bodyDisplayOrder
 				}
 				if cmd.Flags().Changed("external-options") {
-					body["externalOptions"] = bodyExternalOptions
+					bodyMap["externalOptions"] = bodyExternalOptions
 				}
-				if bodyFieldType != "" {
-					body["fieldType"] = bodyFieldType
+				if cmd.Flags().Changed("field-type") || bodyFieldType != "" {
+					bodyMap["fieldType"] = bodyFieldType
 				}
 				if cmd.Flags().Changed("form-field") {
-					body["formField"] = bodyFormField
+					bodyMap["formField"] = bodyFormField
 				}
-				if bodyGroupName != "" {
-					body["groupName"] = bodyGroupName
+				if cmd.Flags().Changed("group-name") || bodyGroupName != "" {
+					bodyMap["groupName"] = bodyGroupName
 				}
 				if cmd.Flags().Changed("has-unique-value") {
-					body["hasUniqueValue"] = bodyHasUniqueValue
+					bodyMap["hasUniqueValue"] = bodyHasUniqueValue
 				}
 				if cmd.Flags().Changed("hidden") {
-					body["hidden"] = bodyHidden
+					bodyMap["hidden"] = bodyHidden
 				}
-				if bodyLabel != "" {
-					body["label"] = bodyLabel
+				if cmd.Flags().Changed("label") || bodyLabel != "" {
+					bodyMap["label"] = bodyLabel
 				}
-				if bodyName != "" {
-					body["name"] = bodyName
+				if cmd.Flags().Changed("name") || bodyName != "" {
+					bodyMap["name"] = bodyName
 				}
-				if bodyNumberDisplayHint != "" {
-					body["numberDisplayHint"] = bodyNumberDisplayHint
+				if cmd.Flags().Changed("number-display-hint") || bodyNumberDisplayHint != "" {
+					bodyMap["numberDisplayHint"] = bodyNumberDisplayHint
 				}
-				if bodyOptions != "" {
+				if cmd.Flags().Changed("options") || bodyOptions != "" {
 					var parsedOptions any
 					if err := json.Unmarshal([]byte(bodyOptions), &parsedOptions); err != nil {
 						return fmt.Errorf("parsing --options JSON: %w", err)
 					}
-					body["options"] = parsedOptions
+					asArray, ok := parsedOptions.([]any)
+					if !ok {
+						return fmt.Errorf("--options must be a JSON array, got JSON %T", parsedOptions)
+					}
+					bodyMap["options"] = asArray
 				}
-				if bodyReferencedObjectType != "" {
-					body["referencedObjectType"] = bodyReferencedObjectType
+				if cmd.Flags().Changed("referenced-object-type") || bodyReferencedObjectType != "" {
+					bodyMap["referencedObjectType"] = bodyReferencedObjectType
 				}
 				if cmd.Flags().Changed("show-currency-symbol") {
-					body["showCurrencySymbol"] = bodyShowCurrencySymbol
+					bodyMap["showCurrencySymbol"] = bodyShowCurrencySymbol
 				}
-				if bodyType != "" {
-					body["type"] = bodyType
+				if cmd.Flags().Changed("type") || bodyType != "" {
+					bodyMap["type"] = bodyType
 				}
 			}
 			data, statusCode, err := c.PostWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -213,6 +242,9 @@ func newHubspotPropertiesCrmPostV3PropertiesObjectTypeCreateCmd(flags *rootFlags
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -238,48 +270,66 @@ func newHubspotPropertiesCrmPostV3PropertiesObjectTypeCreateCmd(flags *rootFlags
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"archivedAt": true, "createdAt": true, "createdUserId": true, "currencyPropertyName": true, "groupName": true, "name": true, "type": true, "updatedAt": true, "updatedUserId": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-properties-crm", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"archivedAt": true, "createdAt": true, "createdUserId": true, "currencyPropertyName": true, "groupName": true, "name": true, "type": true, "updatedAt": true, "updatedUserId": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-properties-crm", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyCalculationFormula, "calculation-formula", "", "Represents a formula that is used to compute a calculated property.")

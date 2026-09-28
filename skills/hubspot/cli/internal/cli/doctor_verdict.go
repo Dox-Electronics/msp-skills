@@ -25,6 +25,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -46,31 +47,20 @@ const doctorBaseURLEnv = "HUBSPOT_BASE_URL"
 // placeholder and doctor would never dial it. Refusing to check a healthy
 // install is the same class of defect as blessing a broken one, pointed the
 // other way.
-const doctorShippedBaseURL = "https://api.hubapi.com"
+//
+// HubSpot has ONE public API root for every portal (https://api.hubapi.com);
+// the shipped default is the operator's real endpoint, not a stand-in, so it
+// must not be treated as a placeholder. Empty disables the exact-match rule;
+// the template / YOUR_ / reserved-domain rules below still apply.
+const doctorShippedBaseURL = ""
 
 // doctorInfoKeys are report entries rendered without a status indicator:
 // paths, versions, and the free-text hints that tell an operator how to get a
 // credential. They are NOT health checks.
 //
-// doctorExitForFailOn used to scan every value in the report for the substrings
-// "error", "missing", "invalid" and "unreachable". That made --fail-on=error
-// trip on a perfectly healthy connector whose auth hint happened to contain the
-// word "missing", or whose suggested read command was named something like
-// `errors list`. Excluding the informational keys keeps --fail-on keyed to the
-// checks and nothing else.
-var doctorInfoKeys = map[string]bool{
-	"config_path":       true,
-	"base_url":          true,
-	"auth_source":       true,
-	"version":           true,
-	"auth_hint":         true,
-	"auth_key_url":      true,
-	"auth_instructions": true,
-	"agentcookie":       true,
-	"db_path":           true,
-}
-
-func doctorIsInfoKey(key string) bool { return doctorInfoKeys[key] }
+// doctorInfoKeys / doctorIsInfoKey: emitted natively by cli-printing-press
+// >= 4.32 (doctor.go); this file only adds "db_path" to that map via a
+// one-line body edit recorded in handfixes.json.
 
 // doctorBaseURLIsPlaceholder reports whether base is still the value this
 // connector shipped with rather than the operator's own instance.
@@ -269,4 +259,16 @@ func doctorUnexpectedStatus(status int, path string, report map[string]any) {
 		return
 	}
 	report["credentials"] = fmt.Sprintf("WARN not verified (HTTP %d from %s) - the endpoint did not confirm the credential.", status, path)
+}
+
+// doctorReachIsRefusedRedirect reports whether the reachability probe failed
+// only because the server answered with a redirect the client deliberately
+// refuses to follow (https->http downgrade, unsupported scheme, private
+// destination). The server responded, so the host is reachable; treating it as
+// "unreachable" skipped the credential probe and told every operator of a
+// working install that the API was down.
+func doctorReachIsRefusedRedirect(err error) bool {
+	return errors.Is(err, client.ErrRedirectProtocolDowngrade) ||
+		errors.Is(err, client.ErrRedirectUnsupportedScheme) ||
+		errors.Is(err, client.ErrRedirectPrivateDestination)
 }

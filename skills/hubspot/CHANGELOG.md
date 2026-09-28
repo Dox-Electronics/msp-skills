@@ -4,6 +4,55 @@ All notable changes to this skill are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.2.0] - 2026-09-28
+
+Reprinted on cli-printing-press **4.32.5** (from 4.24.0). Every command, flag and
+MCP tool that shipped in 0.1.6 is still here except one no-op parent tool (below);
+the list is what changed for an operator or an agent.
+
+### Fixed
+- **`doctor` told every HubSpot operator their install was broken.** It treated
+  `https://api.hubapi.com`, HubSpot's one real API root, as an unset placeholder and
+  answered `FAIL API: base_url is still the shipped placeholder; set HUBSPOT_BASE_URL`
+  without ever checking the token. It now dials the real root and verifies the token
+  against a live read (`OK Credentials: valid (verified with GET /crm/v3/objects/calls)`),
+  and a rejected token reports the HTTP 401. `HUBSPOT_BASE_URL` stays optional.
+
+### Changed
+- **Engine 4.32.5.** Runtime and MCP layers regenerated on the current press. The
+  0.1.6 security fix (every MCP tool-call value joined to its flag as one word,
+  `--flag=value`, press #4647) is now generated code, and the MCP server refuses the
+  local-store destination flags (`--db`, `--output`, `--audit-dir`, ...) at the tool
+  schema as well as at run time.
+- **`sync --full` now prunes** local rows HubSpot no longer returns, after a complete
+  walk (`--no-prune` turns it off). A walk narrowed by `--param`, `--resource-param` or
+  `--global-param` never prunes, so a filtered sync cannot delete rows outside its filter.
+- **Local store schema 4 -> 11.** The first run of 0.2.0 migrates the local database in
+  place; a 0.1.x binary cannot open the migrated file afterwards (it reports the schema
+  is newer than it supports). Re-run `sync` if you ever go back to 0.1.x.
+- **`--agent` no longer implies `--yes`.** `--agent` still sets `--json --compact
+  --no-input --no-color`; a command that asks for confirmation now needs an explicit
+  `--yes`. Scripts that relied on `--agent` to auto-confirm a write must add `--yes`.
+- **New commands:** `teach`, `teach-lookup`, `teach-pattern`, `teach-playbook`, `recall`,
+  `learnings` (`list`, `candidates`, `confirm`, `reject`, `forget`, `purge`, `stats`),
+  `playbook` (`list`, `amend`) and `export`, the press's local learning loop; all but
+  `learnings purge` are also MCP tools, plus a generic `hubspot_get` read tool. `--no-learn` turns the loop off.
+- **New global flags:** `--receipt` / `--receipt-file` / `--audit-dir` write a private run
+  receipt; `--client-profile` selects a client profile; `--home` relocates config, data,
+  state; `--rate-limit` now defaults to `auto` (paces to HubSpot's rate-limit headers).
+- **MCP over HTTP:** `hubspot-mcp --transport http` serves Streamable HTTP on
+  `127.0.0.1:7777` and requires `Authorization: Bearer <HUBSPOT_MCP_HTTP_TOKEN>`. The
+  no-op `workflow` parent tool, which only returned its own help text, is gone;
+  `workflow_archive` and `workflow_status` are unchanged.
+- **Three new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+  `mcp-install.md`): `HUBSPOT_MCP_HTTP_TOKEN` (only for `--transport http`),
+  `HUBSPOT_USER_AGENT` (overrides the request User-Agent) and
+  `PRINTING_PRESS_CLIENT_PROFILE`. `HUBSPOT_ACCESS_TOKEN`, `HUBSPOT_BASE_URL` and
+  `HUBSPOT_OWNER_EMAIL` are unchanged.
+- **Release artifacts:** first hubspot release cut after the 2026-09-18 pipeline change,
+  so the `.mcpb` bundle carries the companion `hubspot-cli` and `hubspot-mcp` reports its
+  real version (`0.2.0`) instead of `0.0.0-dev`.
+
 ## [0.1.6] - 2026-09-10
 
 ### Fixed
