@@ -10,6 +10,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"wordpress-pp-cli/internal/cliutil"
@@ -86,5 +87,43 @@ func TestDefaultConfigStillUsesTheGlobalCredentialsFile(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("default config credentials path = %q, want global %q", got, want)
+	}
+}
+
+func TestSymlinkedExplicitConfigKeepsOneCredentialsFileAcrossSave(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink test")
+	}
+	isolateCredentials(t)
+	t.Setenv("WORDPRESS_BASE_URL", "")
+	linkDir := t.TempDir()
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "config.toml")
+	if err := os.WriteFile(target, []byte("base_url = \"https://site.test/wp-json/wp/v2\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(linkDir, "config.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(link)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := cfg.SaveCredential("fresh-token"); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("save replaced the config symlink with a regular file (err=%v)", err)
+	}
+	reloaded, err := Load(link)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.WordpressBasicAuth != "fresh-token" {
+		t.Fatalf("after set-token through a symlinked config, Load returned %q; want fresh-token", reloaded.WordpressBasicAuth)
+	}
+	if reloaded.BaseURL != "https://site.test/wp-json/wp/v2" {
+		t.Fatalf("config written through the link lost base_url: %q", reloaded.BaseURL)
 	}
 }

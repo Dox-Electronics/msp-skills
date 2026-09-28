@@ -49,6 +49,23 @@ type Config struct {
 	credentialsFile string `toml:"-"`
 }
 
+// configWritePath is where save() writes the config. For an explicit config
+// that is a symlink, write through to the link's target instead of replacing
+// the link: Load resolves the credentials file beside the TARGET, so replacing
+// the link with a regular file would move that sibling on the next Load and
+// strand the token just saved (hand-fix explicit-config-credentials-one-path).
+func (c *Config) configWritePath() string {
+	if c.credentialsFile == "" {
+		return c.Path
+	}
+	if info, err := os.Lstat(c.Path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if real, err := filepath.EvalSymlinks(c.Path); err == nil {
+			return real
+		}
+	}
+	return c.Path
+}
+
 // CredentialsFilePath is the credentials file this config reads and writes:
 // the explicit config's sibling data/credentials.toml, else the global one.
 func (c *Config) CredentialsFilePath() (string, error) {
@@ -805,7 +822,7 @@ func (c *Config) save() error {
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
-	if err := cliutil.AtomicWritePrivateFile(c.Path, data, 0o600, 0o700); err != nil {
+	if err := cliutil.AtomicWritePrivateFile(c.configWritePath(), data, 0o600, 0o700); err != nil {
 		return err
 	}
 	c.scrubLegacyCredentials()

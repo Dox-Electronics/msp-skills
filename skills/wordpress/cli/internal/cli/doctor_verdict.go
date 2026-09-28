@@ -97,6 +97,18 @@ func doctorBaseURLIsPlaceholder(base string) bool {
 	return false
 }
 
+// doctorAuthProbePath overrides the tree walk with an endpoint that REQUIRES
+// authentication. The walk picks the first argument-free GET, which on
+// WordPress is /categories: a public route that answers 200 to an anonymous
+// request. A web server that strips the Authorization header (the most common
+// Application Password failure) therefore produced "valid". /users/me answers
+// 401 rest_not_logged_in unless the request authenticated, so a 200 here means
+// the credential really was accepted (hand-fix doctor-probe-requires-auth).
+const (
+	doctorAuthProbePath = "/users/me"
+	doctorAuthProbeCmd  = "users get me"
+)
+
 // doctorReadProbe walks the Cobra tree for an endpoint-mirror command that is
 // safe and complete to call with no arguments, and returns the API path to
 // probe plus the dotted command path to name in a remedy.
@@ -201,6 +213,9 @@ func doctorProbeCredentials(ctx context.Context, c *client.Client, root *cobra.C
 		return
 	}
 	apiPath, cmdPath := doctorReadProbe(root)
+	if doctorAuthProbePath != "" {
+		apiPath, cmdPath = doctorAuthProbePath, doctorAuthProbeCmd
+	}
 	if apiPath == "" {
 		report["credentials"] = "WARN not verified: this API exposes no argument-free GET endpoint to probe. Run any read command to confirm the credential works end-to-end."
 		// The api row was decided by a bare request to the host, which a vendor's

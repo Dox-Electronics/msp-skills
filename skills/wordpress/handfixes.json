@@ -284,7 +284,7 @@
   {
    "id": "explicit-config-credentials-one-path",
    "summary": "under an explicit --config / WORDPRESS_CONFIG file, auth set-token saves to and auth logout clears the same sibling data/credentials.toml that Load reads first",
-   "why": "printing-press 4.32.5 made Load read the explicit config's sibling data/credentials.toml (CredentialsFilePathForConfig) before the global credentials file, but left saveCredentialsFirst/saveCredentialsThenConfig on cliutil.SaveCredentials and ClearTokens on cliutil.RemoveCredentials, both of which only touch the global file. So with a sibling store present, `--config X auth set-token` wrote the global file while the next Load kept returning the stale sibling token, and `--config X auth logout` left the sibling token active. Found by the Codex review of the 4.32.5 reprint (P1). The fix gives Config one credentials path (credentialsFile, set in Load from CredentialsFilePathForConfig when the config is explicit), adds cliutil.SaveCredentialsTo / RemoveCredentialsAt, saves and locks against that path, and on logout removes the global file (the pre-4.32 behaviour) plus the sibling. explicit_credentials_test.go proves both directions: it fails against the unpatched tree (Load returns stale-token after set-token) and passes with the fix; the default-config test pins that a non-explicit config still uses the global file.",
+   "why": "printing-press 4.32.5 made Load read the explicit config's sibling data/credentials.toml (CredentialsFilePathForConfig) before the global credentials file, but left saveCredentialsFirst/saveCredentialsThenConfig on cliutil.SaveCredentials and ClearTokens on cliutil.RemoveCredentials, both of which only touch the global file. So with a sibling store present, `--config X auth set-token` wrote the global file while the next Load kept returning the stale sibling token, and `--config X auth logout` left the sibling token active. Found by the Codex review of the 4.32.5 reprint (P1). The fix gives Config one credentials path (credentialsFile, set in Load from CredentialsFilePathForConfig when the config is explicit), adds cliutil.SaveCredentialsTo / RemoveCredentialsAt, saves and locks against that path, and on logout removes the global file (the pre-4.32 behaviour) plus the sibling. explicit_credentials_test.go proves both directions: it fails against the unpatched tree (Load returns stale-token after set-token) and passes with the fix; the default-config test pins that a non-explicit config still uses the global file. Codex round 2 found the symlink case: save() atomically replaced a symlinked config with a regular file, which moved the resolved sibling on the next Load and stranded the saved token; configWritePath now writes an explicit config through its symlink (the link is kept), pinned by TestSymlinkedExplicitConfigKeepsOneCredentialsFileAcrossSave, which fails with the link-replacing write.",
    "status": "active",
    "spec_encode_followup": "cli-printing-press config template: resolve the credentials path once in Load and use it for load, save and clear (the press already has CredentialsFilePathForConfig for load).",
    "asserts": [
@@ -323,6 +323,17 @@
     {
      "file": "cli/internal/config/explicit_credentials_test.go",
      "contains": "func TestExplicitConfigSavesAndClearsItsOwnCredentialsFile(",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/config/config.go",
+     "contains": "cliutil.AtomicWritePrivateFile(c.configWritePath(), data",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/config/explicit_credentials_test.go",
+     "contains": "func TestSymlinkedExplicitConfigKeepsOneCredentialsFileAcrossSave(",
      "min_count": 1
     }
    ]
@@ -413,6 +424,32 @@
     {
      "file": "cli/internal/config/config.go",
      "not_contains": "cliutil.EnvOverride(\"WORDPRESS_BASE_URL\")"
+    }
+   ]
+  },
+  {
+   "id": "doctor-probe-requires-auth",
+   "summary": "doctor verifies the credential against /users/me (auth-required) instead of the first argument-free GET the tree walk finds (/categories, a public route)",
+   "why": "The doctor-verdict-tracks-reality probe walks the command tree for the first argument-free GET. On WordPress that is /categories, which answers 200 to an anonymous request, so when the web server strips the Authorization header (the most common Application Password failure: Apache/CGI and some hosts drop it) doctor reported the credential 'valid' while every write would fail. /users/me answers 401 rest_not_logged_in unless the request authenticated, so a 200 there proves the credential was accepted. Found by the Codex review of the 4.32.5 reprint (P1, inherited from the 4.26.1 hand-fix, not introduced by the reprint). doctor_auth_probe_test.go uses a server that ignores Authorization: it fails with the override removed (doctor says valid) and passes with it; its twin pins that an honoured credential still reads valid.",
+   "status": "active",
+   "spec_encode_followup": "Let the spec name an auth-required probe endpoint (e.g. x-doctor-probe: /users/me) so the generated doctor does not have to guess from the tree walk.",
+   "asserts": [
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "doctorAuthProbePath = \"/users/me\"",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "apiPath, cmdPath = doctorAuthProbePath, doctorAuthProbeCmd",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/doctor_auth_probe_test.go",
+     "contains": "func TestDoctorDoesNotCallAnAnonymousAnswerValid(",
+     "min_count": 1
     }
    ]
   }
