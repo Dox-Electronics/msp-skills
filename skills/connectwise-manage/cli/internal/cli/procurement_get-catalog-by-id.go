@@ -17,10 +17,6 @@ func newProcurementGetCatalogByIdCmd(flags *rootFlags) *cobra.Command {
 	var flagCustomFieldConditions string
 	var flagOrderBy string
 	var flagFields string
-	var flagPage string
-	var flagPageSize int
-	var flagPageId string
-	var flagAll bool
 
 	cmd := &cobra.Command{
 		Use:         "get-catalog-by-id <id>",
@@ -38,16 +34,14 @@ func newProcurementGetCatalogByIdCmd(flags *rootFlags) *cobra.Command {
 
 			path := "/procurement/catalog/{id}"
 			path = replacePathParam(path, "id", args[0])
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "procurement-catalog", path, map[string]string{
-				"conditions":            formatCLIParamValue(flagConditions),
-				"childConditions":       formatCLIParamValue(flagChildConditions),
-				"customFieldConditions": formatCLIParamValue(flagCustomFieldConditions),
-				"orderBy":               formatCLIParamValue(flagOrderBy),
-				"fields":                formatCLIParamValue(flagFields),
-				"page":                  formatCLIParamValue(flagPage),
-				"pageSize":              formatCLIParamValue(flagPageSize),
-				"pageId":                formatCLIParamValue(flagPageId),
-			}, nil, flagAll, "page", "page", "pageSize", "", "", cmd.ErrOrStderr())
+			data, prov, err := resolveReadWithStrategy(cmd.Context(), c, flags, "auto", "procurement-catalog", false, // single-record: a local read returns only this id (#335)
+				path, map[string]string{
+					"conditions":            formatCLIParamValue(flagConditions),
+					"childConditions":       formatCLIParamValue(flagChildConditions),
+					"customFieldConditions": formatCLIParamValue(flagCustomFieldConditions),
+					"orderBy":               formatCLIParamValue(flagOrderBy),
+					"fields":                formatCLIParamValue(flagFields),
+				}, nil, cmd.ErrOrStderr())
 			if err != nil {
 				return classifyAPIError(err, flags)
 			}
@@ -100,10 +94,6 @@ func newProcurementGetCatalogByIdCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().StringVar(&flagCustomFieldConditions, "custom-field-conditions", "", "Custom field conditions")
 	cmd.Flags().StringVar(&flagOrderBy, "order-by", "", "Order by")
 	cmd.Flags().StringVar(&flagFields, "fields", "", "Fields")
-	cmd.Flags().StringVar(&flagPage, "page", "", "Page")
-	cmd.Flags().IntVar(&flagPageSize, "page-size", 0, "Page size")
-	cmd.Flags().StringVar(&flagPageId, "page-id", "", "Page id")
-	cmd.Flags().BoolVar(&flagAll, "all", false, "Fetch all pages")
 
 	return cmd
 }
