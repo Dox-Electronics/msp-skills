@@ -4,6 +4,9 @@
 
 huntress-cli absorbs the full Huntress API  -  organizations, agents, incident reports, remediations, signals, escalations, identities, external recon, reports, invoices, reseller subscriptions, and SIEM ES|QL  -  with agent-native output (--json, --select, typed exit codes). Then it transcends the read-mostly, per-org API: fleet-incidents gives one age-sorted queue across every client org, coverage-gaps rolls up posture exposure, blast-radius correlates an indicator across the whole fleet, and drift/mttr/handoff turn repeated syncs into history the live API throws away.
 
+Created by [@dstevens](https://github.com/dstevens) (Damien Stevens).
+Contributors: [@DamienStevens](https://github.com/DamienStevens) (Damien Stevens).
+
 ## Install
 
 This CLI ships as a Claude Code Skill and MCP server in [Servosity/msp-skills](https://github.com/Servosity/msp-skills). The installer downloads the `huntress-cli` and `huntress-mcp` binaries into `~/.local/bin` (macOS / Linux) or `%LOCALAPPDATA%\Programs\msp-skills` (Windows). It does not register the skill with your agent and writes no MCP client config - see [mcp-install.md](./mcp-install.md) for that wire-up.
@@ -104,11 +107,14 @@ Huntress uses HTTP Basic auth: set HUNTRESS_API_KEY and HUNTRESS_API_SECRET (min
 # Confirm auth works and see which account you're keyed into.
 huntress-cli account --json
 
+
 # Mirror every entity into the local store so the fleet commands have data to join.
 huntress-cli sync
 
+
 # The morning sweep: every open critical across all client orgs, oldest first.
 huntress-cli fleet-incidents --severity critical --status sent --sort age --json
+
 
 # Where are agents stale or unhealthy across the fleet.
 huntress-cli coverage-gaps --stale-days 7 --json
@@ -120,6 +126,7 @@ huntress-cli coverage-gaps --stale-days 7 --json
 These capabilities aren't available in any other tool for this API.
 
 ### Fleet rollups across every org
+
 - **`fleet-incidents`**  -  One unified, age-sorted incident queue across every client organization, with org names joined in  -  the morning-sweep view the dashboard can't give.
 
   _Reach for this when an agent needs the single cross-tenant 'what's on fire everywhere' queue instead of paging org-by-org._
@@ -157,6 +164,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Cross-entity correlation
+
 - **`blast-radius`**  -  Given an indicator (external IP, file hash, or foothold signature), finds every agent, org, and incident that matches it  -  instant correlation during incident response.
 
   _Reach for this mid-incident to answer 'where else does this indicator appear across my whole fleet' in one call._
@@ -187,6 +195,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Partner ops and billing
+
 - **`billing-reconcile`**  -  Compares invoiced and subscribed seat counts against actually deployed agent counts per org and surfaces the delta.
 
   _Run at monthly close to catch decommissioned-but-billed seats and under-billed new deployments._
@@ -203,6 +212,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Local history that compounds
+
 - **`drift`**  -  Diffs the current sync against the prior snapshot: new and removed agents, status flips, new criticals, and version changes.
 
   _Use after each sync to see what changed across the fleet without re-reading every record._
@@ -271,6 +281,55 @@ Invoiced/subscribed seats versus actually deployed agents per org, with the delt
 ## Usage
 
 Run `huntress-cli --help` for the full command reference and flag list.
+
+## Paths & environment variables
+
+This CLI separates local files into four path kinds:
+
+| Kind | Contents |
+|------|----------|
+| `config` | User-editable settings such as `config.toml` and saved profiles |
+| `data` | Durable local data: `credentials.toml`, `data.db`, cookies, browser-session proof files, and other auth sidecars |
+| `state` | Runtime state such as persisted queries, jobs, and `teach.log` |
+| `cache` | Regenerable HTTP/cache files |
+
+Each kind resolves independently. The ladder is:
+
+1. Per-kind env var: `HUNTRESS_CONFIG_DIR`, `HUNTRESS_DATA_DIR`, `HUNTRESS_STATE_DIR`, or `HUNTRESS_CACHE_DIR`
+2. `--home <dir>` for this invocation
+3. `HUNTRESS_HOME` for a flat relocated root
+4. XDG env vars: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+5. Platform defaults matching existing installs
+
+For containers and agent sandboxes, prefer a single relocated root:
+
+```bash
+export HUNTRESS_HOME=/srv/huntress
+huntress-cli doctor
+```
+
+Under `HUNTRESS_HOME=/srv/huntress`, the four dirs resolve to `/srv/huntress/config`, `/srv/huntress/data`, `/srv/huntress/state`, and `/srv/huntress/cache`.
+
+MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
+
+```json
+{
+  "mcpServers": {
+    "huntress": {
+      "command": "huntress-mcp",
+      "env": {
+        "HUNTRESS_HOME": "/srv/huntress"
+      }
+    }
+  }
+}
+```
+
+Precedence matters in fleets: an ambient per-kind variable such as `HUNTRESS_DATA_DIR` overrides an explicit `--home` for that kind. Use `HUNTRESS_HOME` or the per-kind variables for durable fleet relocation; treat `--home` as the weaker per-invocation lever.
+
+Relocation is one-way. Unsetting `HUNTRESS_HOME` does not move files back to platform defaults, and `doctor` cannot find credentials left under a former root. Move the files manually before unsetting relocation variables.
+
+Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `huntress-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
 
 ## Commands
 
@@ -558,6 +617,23 @@ Please refer to the [pagination section](https://api.huntress.io/docs#pagination
 Standard, catchall, and catchall exception rules can all be updated, but catchall and catchall exception rules must keep `starts_at` and `expires_at` nil. Passing a value for those fields on those rules will return a 422.
 
 
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`huntress-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`huntress-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`huntress-cli learnings list`** - Inspect taught rows
+- **`huntress-cli learnings forget <query>`** - Undo a teach
+- **`huntress-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`huntress-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`huntress-cli teach-pattern`** - Install a query/resource template up front
+- **`huntress-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `HUNTRESS_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `huntress-cli` opens the database, older binaries refuse it with a version error  -  upgrade the binary rather than downgrading.
+
 ## Output Formats
 
 ```bash
@@ -566,9 +642,8 @@ huntress-cli account
 
 # JSON for scripting and agents
 huntress-cli account --json
-
 # Filter to specific fields
-huntress-cli account --json --select id,name,status
+huntress-cli account --json --select billing_address,id,name
 
 # Dry run  -  show the request without sending
 huntress-cli account --dry-run
@@ -583,15 +658,15 @@ This CLI is designed for AI agent consumption:
 
 - **Non-interactive** - never prompts, every input is a flag
 - **Pipeable** - `--json` output to stdout, errors to stderr
-- **Filterable** - `--select id,name` returns only fields you need
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
 - **Previewable** - `--dry-run` shows the request without sending
-- **Explicit retries** - add `--idempotent` to create retries and `--ignore-missing` to delete retries when a no-op success is acceptable
-- **Confirmable** - `--yes` for explicit confirmation of destructive actions
+- **Explicit retries** - add `--idempotent` to create retries and add `--ignore-missing` to delete retries when a no-op success is acceptable
+- **Explicit confirmation** - `--agent` does not imply `--yes`; pass `--yes` separately only after the target, arguments, and side effects are clear
 - **Piped input** - write commands can accept structured input when their help lists `--stdin`
 - **Offline-friendly** - sync/search commands can use the local SQLite store when available
 - **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
 
-Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `7` rate limited, `10` config error.
+Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `6` partial failure, `7` rate limited, `10` config error.
 
 ## Health Check
 
@@ -603,7 +678,7 @@ Verifies configuration, credentials, and connectivity to the API.
 
 ## Configuration
 
-Config file: `~/.config/huntress-reference-pp-cli/config.toml`
+Run `huntress-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/huntress-reference-pp-cli/config.toml`; `--home`, `HUNTRESS_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
 
@@ -627,10 +702,13 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 - Run the `list` command to see available items
 
 ### API-specific
+
 - **401 Unauthorized on every call**  -  Set both HUNTRESS_API_KEY and HUNTRESS_API_SECRET; the header is Base64(key:secret). Run `huntress-cli doctor`.
 - **Fleet commands return empty**  -  Run `huntress-cli sync` first  -  fleet-incidents/coverage-gaps/drift read the local store, not the live API.
 - **drift or mttr shows nothing**  -  These need at least two syncs of history; run `sync` again after some time has passed.
 - **List truncates at 10 rows**  -  Default page is 10; pass `--limit 500` or `--all` to walk every page via next_page_token.
+
+---
 
 ## Sources & Inspiration
 

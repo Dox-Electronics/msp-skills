@@ -8,8 +8,9 @@
 ## What it authenticates as
 
 The skill drives the `huntress-cli` binary (and `huntress-mcp`),
-authenticating with `HUNTRESS_API_KEY`, `HUNTRESS_API_SECRET`. Credentials are read from the environment only -
-never written to disk, never logged, never sent anywhere except the Huntress API.
+authenticating with `HUNTRESS_API_KEY`, `HUNTRESS_API_SECRET`. Credentials come from the environment, or from
+`huntress-cli auth set-credentials`, which saves them to an owner-only (0600) credentials file in the CLI's
+config directory. They are never logged and never sent anywhere except the Huntress API.
 
 ## Default-safe behavior
 
@@ -32,6 +33,19 @@ require a human for anything below the line.
 | **Credential / security** | Touches tokens, keys, MFA. | (none detected) | Human-in-the-loop only |
 | **Destructive** | Irreversible data or config loss. | `accounts delete-v1-id`, `accounts memberships delete-v1-accounts-account-id-id`, `accounts organizations delete-v1-accounts-account-id-id`, `memberships delete-v1-id`, `organizations delete-v1-id`, `unwanted-access-rules delete-v1-id` | Human-in-the-loop only, explicit confirmation |
 | **Admin** | Back-office administration. | (none detected) | Operator-only, not for agents |
+
+## Local learning loop (engine 4.32 and later)
+
+The `teach`, `recall`, `learnings`, `playbook`, `teach-pattern`, `teach-lookup`,
+and `teach-playbook` commands belong to the CLI's self-learning loop. They read
+and write ONLY the local SQLite store (`data.db` under the data directory);
+nothing in this loop sends data to the Huntress API or anywhere else. Treat them
+as Read tier for the vendor account, with two local caveats: `learnings purge`
+and `learnings forget` delete locally taught rows (recoverable only by teaching
+again), and the loop journals every invocation locally. Disable it per call with
+`--no-learn` or for a session with `HUNTRESS_NO_LEARN=true` when you want
+deterministic agent runs. `export` writes a local file and, over MCP, cannot be
+pointed at an arbitrary path (the filesystem-destination gate refuses `--output`).
 
 ## How to lock it down
 

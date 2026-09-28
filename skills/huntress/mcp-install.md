@@ -38,8 +38,11 @@ Add (or merge with your existing `mcpServers` block):
       "command": "huntress-mcp",
       "env": {
         "HUNTRESS_API_KEY": "<your-huntress_api_key>",
+        "PRINTING_PRESS_CLIENT_PROFILE": "",
         "HUNTRESS_API_SECRET": "<your-huntress_api_secret>",
-        "HUNTRESS_BASE_URL": "https://api.huntress.io"
+        "HUNTRESS_BASE_URL": "https://api.huntress.io",
+        "HUNTRESS_USER_AGENT": "",
+        "HUNTRESS_MCP_HTTP_TOKEN": ""
       }
     }
   }
@@ -65,8 +68,11 @@ Configuration**) and add:
       "command": "huntress-mcp",
       "env": {
         "HUNTRESS_API_KEY": "<your-huntress_api_key>",
+        "PRINTING_PRESS_CLIENT_PROFILE": "",
         "HUNTRESS_API_SECRET": "<your-huntress_api_secret>",
-        "HUNTRESS_BASE_URL": "https://api.huntress.io"
+        "HUNTRESS_BASE_URL": "https://api.huntress.io",
+        "HUNTRESS_USER_AGENT": "",
+        "HUNTRESS_MCP_HTTP_TOKEN": ""
       }
     }
   }
@@ -88,8 +94,11 @@ Claude Desktop:
       "command": "huntress-mcp",
       "env": {
         "HUNTRESS_API_KEY": "<your-huntress_api_key>",
+        "PRINTING_PRESS_CLIENT_PROFILE": "",
         "HUNTRESS_API_SECRET": "<your-huntress_api_secret>",
-        "HUNTRESS_BASE_URL": "https://api.huntress.io"
+        "HUNTRESS_BASE_URL": "https://api.huntress.io",
+        "HUNTRESS_USER_AGENT": "",
+        "HUNTRESS_MCP_HTTP_TOKEN": ""
       }
     }
   }
@@ -107,7 +116,7 @@ All remote agents need `huntress-mcp` reachable as a public **HTTPS** endpoint. 
 in HTTP mode with your credentials in the environment:
 
 ```bash
-HUNTRESS_API_KEY=<value> HUNTRESS_API_SECRET=<value> HUNTRESS_BASE_URL=<value> huntress-mcp --transport http --addr :7777
+HUNTRESS_API_KEY=<value> HUNTRESS_API_SECRET=<value> HUNTRESS_BASE_URL=<value> HUNTRESS_MCP_HTTP_TOKEN=<value> PRINTING_PRESS_CLIENT_PROFILE=<value> huntress-mcp --transport http
 ```
 
 Then expose `http://localhost:7777/mcp` as a public HTTPS URL via a secure tunnel

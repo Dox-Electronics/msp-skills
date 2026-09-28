@@ -29,6 +29,12 @@
       },
       "environmentVariables": [
         {
+          "name": "PRINTING_PRESS_CLIENT_PROFILE",
+          "description": "Optional: binds the MCP server to an existing tenant-gated Printing Press client profile. Leave unset for a single-tenant install.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
           "name": "HUNTRESS_API_KEY",
           "description": "Set the HUNTRESS_API_KEY credential for the Huntress MCP server.",
           "isRequired": true,
@@ -46,6 +52,18 @@
           "isRequired": false,
           "isSecret": false,
           "default": "https://api.huntress.io"
+        },
+        {
+          "name": "HUNTRESS_USER_AGENT",
+          "description": "Overrides the User-Agent the CLI sends on Huntress requests.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "HUNTRESS_MCP_HTTP_TOKEN",
+          "description": "Required only when running the MCP server with --transport http. Not needed for the default local stdio transport.",
+          "isRequired": false,
+          "isSecret": true
         }
       ]
     }
