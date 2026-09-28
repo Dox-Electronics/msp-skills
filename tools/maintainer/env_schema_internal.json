@@ -10,8 +10,15 @@
     "PP_MCP_TRANSPORT",
     "TERM",
     "USERNAME",
-    "USERPROFILE"
+    "USERPROFILE",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CODE_SESSION",
+    "CURSOR_SESSION_ID",
+    "CURSOR_TRACE_ID"
   ],
+  "_internal_exact_harness_comment": "CODEX_* / CLAUDE_* / CURSOR_* session identifiers are set by the AI harness that launched the CLI, never by an operator: printing-press 4.32.5+ internal/learn/journal.go (JournalHarnessSessionEnvVars) reads the first non-empty one and persists only a bounded hash so sibling tool calls share a journal session key. Prompting an operator for them in a bundle install would be nonsense.",
 
   "internal_prefixes": [
     "PP_",
