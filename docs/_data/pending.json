@@ -450,7 +450,7 @@
   "threatlocker": {
     "state": "up-to-date",
     "version": "0.3.5",
-    "latest_tag": "threatlocker-v0.3.5",
+    "latest_tag": "threatlocker-v0.3.6",
     "current_hash": "sha256:b3b2198cf35faf1dcab00dfa28ae5b38227eb7635b78bf490b8eaeb7613dc049",
     "released_hash": "sha256:b3b2198cf35faf1dcab00dfa28ae5b38227eb7635b78bf490b8eaeb7613dc049"
   },
