@@ -46,6 +46,18 @@
           "description": "Set the DATTO_BCDR_SECRET_KEY credential for the Datto BCDR MCP server.",
           "isRequired": true,
           "isSecret": true
+        },
+        {
+          "name": "DATTO_BCDR_MCP_HTTP_TOKEN",
+          "description": "Required only when running the MCP server with --transport http. Not needed for the default local stdio transport.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PRINTING_PRESS_CLIENT_PROFILE",
+          "description": "Only used when the MCP server is bound to a tenant-gated Printing Press client profile; leave blank otherwise.",
+          "isRequired": false,
+          "isSecret": true
         }
       ]
     }
