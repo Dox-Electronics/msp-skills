@@ -46,6 +46,12 @@ flags that `credstore.py` imports. The `connect-tool` module of the same name al
 carries browser and process helpers that this Skill does not use, so only the
 flag is shipped here.
 
+`references/security-model.md` is adapted from the sibling `connect-tool`
+Skill's `references/security-model.md` (same copyright and license as above),
+rewritten for grab-cookie's two capture lanes, its `credgrab/` namespace, and
+its residual surfaces. It exists so the citation in `credstore.py` resolves
+after a plugin install, where `../connect-tool/` is not present.
+
 Maintainers: if you would rather these two Skills share one copy of
 `credstore.py` than carry near-duplicates, say so on the pull request and it
 will be reworked. The duplicate is here only so the Skill stays self-contained

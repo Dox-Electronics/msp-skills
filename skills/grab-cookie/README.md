@@ -48,7 +48,9 @@ It is forked from `connect-tool`'s credential-store backend rather than reused
 unmodified: the namespace differs (`credgrab/...`, so the two Skills never
 collide in the OS credential store), the live self-check is opt-in here, the
 receipt withholds more for a short secret, and there are several further
-behavioural differences. NOTICE enumerates all of them.
+behavioural differences. NOTICE enumerates all of them. The threat model, the
+two capture lanes, and the accepted residual surfaces are written down in
+[references/security-model.md](references/security-model.md).
 
 ## What ships
 
