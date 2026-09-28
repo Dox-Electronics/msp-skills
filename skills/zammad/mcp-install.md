@@ -39,7 +39,9 @@ Add (or merge with your existing `mcpServers` block):
       "env": {
         "ZAMMAD_API_TOKEN": "<your-zammad_api_token>",
         "ZAMMAD_BASE_URL": "",
-        "ZAMMAD_URL": "<your-zammad_url>"
+        "ZAMMAD_URL": "<your-zammad_url>",
+        "ZAMMAD_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -66,7 +68,9 @@ Configuration**) and add:
       "env": {
         "ZAMMAD_API_TOKEN": "<your-zammad_api_token>",
         "ZAMMAD_BASE_URL": "",
-        "ZAMMAD_URL": "<your-zammad_url>"
+        "ZAMMAD_URL": "<your-zammad_url>",
+        "ZAMMAD_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }
@@ -89,7 +93,9 @@ Claude Desktop:
       "env": {
         "ZAMMAD_API_TOKEN": "<your-zammad_api_token>",
         "ZAMMAD_BASE_URL": "",
-        "ZAMMAD_URL": "<your-zammad_url>"
+        "ZAMMAD_URL": "<your-zammad_url>",
+        "ZAMMAD_MCP_HTTP_TOKEN": "",
+        "PRINTING_PRESS_CLIENT_PROFILE": ""
       }
     }
   }

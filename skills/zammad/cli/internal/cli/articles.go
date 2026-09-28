@@ -11,14 +11,12 @@ func newArticlesCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "articles",
 		Short:       "Read and add ticket articles (notes and emails)",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true", "pp:typed-exit-codes": "0,2"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
 	cmd.AddCommand(newArticlesByTicketCmd(flags))
 	cmd.AddCommand(newArticlesCreateCmd(flags))
 	cmd.AddCommand(newArticlesGetCmd(flags))
-	cmd.AddCommand(newNovelArticlesSyncCmd(flags))
 	return cmd
 }

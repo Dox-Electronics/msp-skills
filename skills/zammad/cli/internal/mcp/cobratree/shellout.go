@@ -4,7 +4,6 @@
 package cobratree
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -19,36 +18,67 @@ import (
 	"zammad-pp-cli/internal/mcp/bound"
 )
 
+func boundedToolResultError(message string) *mcplib.CallToolResult {
+	return mcplib.NewToolResultError(bound.Text(message))
+}
+
+const shelloutCaptureLimit = bound.MaxBytes + 1
+
+// cappedCapture drains a child-process stream while retaining enough bytes for
+// bound.Text to render an oversized result as a truncated preview.
+type cappedCapture struct {
+	data []byte
+}
+
+func newCappedCapture() *cappedCapture {
+	return &cappedCapture{data: make([]byte, 0, shelloutCaptureLimit)}
+}
+
+func (c *cappedCapture) Write(p []byte) (int, error) {
+	remaining := shelloutCaptureLimit - len(c.data)
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		c.data = append(c.data, p[:remaining]...)
+	}
+	return len(p), nil
+}
+
+func (c *cappedCapture) String() string {
+	return string(c.data)
+}
+
 func shellOutToCLI(cliPath func() (string, error), commandPath []string, blockedStructuredArgs map[string]bool, allowedStructuredArgs map[string]bool, positionals []positionalArg, readOnly bool, positionalWriteSinks map[int]bool) server.ToolHandlerFunc {
 	lookupPath, lookupErr := cliPath()
 	prefixArgs := append([]string{}, commandPath...)
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		if lookupErr != nil {
-			return mcplib.NewToolResultError(fmt.Sprintf("companion CLI binary not found: %v\nTried sibling lookup, ZAMMAD_CLI_PATH env var, and PATH.", lookupErr)), nil
+			return boundedToolResultError(fmt.Sprintf("companion CLI binary not found: %v\nTried sibling lookup, ZAMMAD_CLI_PATH env var, and PATH.", lookupErr)), nil
 		}
 		args := req.GetArguments()
 		if err := validateMCPArgumentNames(args, allowedStructuredArgs); err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return boundedToolResultError(err.Error()), nil
 		}
 		finalArgs := append([]string{}, prefixArgs...)
 		finalArgs = append(finalArgs, cliArgsFromMCP(args, blockedStructuredArgs)...)
 		positionalArgs, err := positionalArgsFromMCP(args, positionals, readOnly, positionalWriteSinks)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return boundedToolResultError(err.Error()), nil
 		}
 		finalArgs = append(finalArgs, positionalArgs...)
 		if raw, _ := args["args"].(string); strings.TrimSpace(raw) != "" {
 			rawPositionals := positionalArgsFromRawArgsField(raw, positionals, len(positionalArgs))
 			if err := validatePositionalArgsForMCPAtOffset(rawPositionals, readOnly, positionalWriteSinks, len(positionalArgs)); err != nil {
-				return mcplib.NewToolResultError(err.Error()), nil
+				return boundedToolResultError(err.Error()), nil
 			}
 			finalArgs = append(finalArgs, rawPositionals...)
 		}
 		out, err := RunCLICommand(ctx, lookupPath, finalArgs)
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			return boundedToolResultError(err.Error()), nil
 		}
-		return mcplib.NewToolResultText(bound.Text(out)), nil
+		return ToolResultFromCLICommand(out), nil
 	}
 }
 
@@ -123,7 +153,9 @@ func positionalArgsFromRawArgsField(raw string, positionals []positionalArg, str
 	if text == "" {
 		return nil
 	}
-	if len(positionals) == 1 && structuredCount == 0 {
+	// One descriptor is not necessarily scalar: [id...] is a single
+	// positional but still needs shell-word splitting.
+	if len(positionals) == 1 && structuredCount == 0 && !positionals[0].Variadic {
 		return []string{text}
 	}
 	return SplitShellArgs(raw)
@@ -161,19 +193,9 @@ var reservedStructuredArgs = map[string]bool{
 	"args": true,
 }
 
-// MCP runs commands as the server account, so letting a tool caller choose a
-// filesystem location lets it choose where that account writes, truncates or
-// reads. The concrete case this closes: the local-store commands expose --db,
-// the MCP layer forwards command-local flags straight through as CLI arguments,
-// and the store's migration runs `DROP TABLE IF EXISTS resources_fts` plus a
-// resources rebuild against whatever file it is handed. One tool call carrying
-// {"db": "/path/to/someone-elses.sqlite"} therefore rewrote an unrelated
-// database owned by the account running the MCP server.
-//
-// This map is the runtime floor. isFilesystemPathFlag below is the general
-// rule, and UnblockedFilesystemPathFlags applies that rule to the live command
-// tree so the package test fails the build when a regenerated CLI grows a
-// local-path flag the floor does not already name.
+// MCP runs commands as the server account. Letting clients choose filesystem
+// destinations would let a tool write or truncate anything that account can
+// reach.
 var blockedDestinationFlags = map[string]bool{
 	"audit-dir":           true,
 	"db":                  true,
@@ -252,7 +274,9 @@ func UnblockedFilesystemPathFlags(root *cobra.Command) []string {
 	found := map[string]bool{}
 	walk(root, nil, func(cmd *cobra.Command, path []string) {
 		switch classify(cmd) {
-		case commandHidden, commandEndpoint, commandFramework:
+		case commandHidden, commandEndpoint, commandGroup, commandFramework:
+			// The same set RegisterAll skips (walker.go): a help-only parent
+			// group never becomes a tool, so its flags are out of scope.
 			return
 		}
 		if !cmd.Runnable() {
@@ -289,16 +313,20 @@ func UnblockedFilesystemPathFlags(root *cobra.Command) []string {
 // able to override via structured tool parameters. Allowing them lets a
 // caller swap auth credentials, redirect the API base URL, select a different
 // per-client filesystem, relocate the config/data/state/cache roots, load a
-// malicious config file, or change the delivery target, all of which sit
-// outside the per-command surface the agent is supposed to be calling.
+// malicious config file, change receipt destinations, or change the delivery
+// target, all of which sit outside the per-command surface the agent is
+// supposed to be calling.
 var blockedRootFlags = map[string]bool{
-	"base-url": true,
-	"client":   true,
-	"config":   true,
-	"deliver":  true,
-	"home":     true,
-	"profile":  true,
-	"token":    true,
+	"audit-dir":    true,
+	"base-url":     true,
+	"client":       true,
+	"config":       true,
+	"deliver":      true,
+	"home":         true,
+	"insecure":     true,
+	"profile":      true,
+	"receipt-file": true,
+	"token":        true,
 }
 
 func cliArgsFromMCP(args map[string]any, blocked map[string]bool) []string {
@@ -314,16 +342,11 @@ func cliArgsFromMCP(args map[string]any, blocked map[string]bool) []string {
 	}
 	sort.Strings(keys)
 
-	// Hand-wired (handfixes.json: mcp-argv-value-joined): every value is
-	// joined to its flag as ONE argv element. Emitted as a separate element,
-	// a value beginning with "--" is parsed by pflag as its own flag whenever
-	// the preceding flag is a bool (NoOptDefVal does not consume the next
-	// token), which let a tool-call VALUE smuggle a denylisted root flag past
-	// the key-only filter above. Joined, pflag rejects it on a bool flag and
-	// contains it as the literal value on a string flag.
 	var out []string
 	for _, k := range keys {
 		v := args[k]
+		// Join values onto the flag so a value starting with -- cannot be
+		// re-parsed as its own flag (bool flags do not consume the next token).
 		switch tv := v.(type) {
 		case bool:
 			if tv {
@@ -388,27 +411,67 @@ func SplitShellArgs(s string) []string {
 	return tokens
 }
 
+// CLICommandResult carries the machine-readable stdout separately from
+// operator-facing stderr hints.
+type CLICommandResult struct {
+	Stdout      string
+	StderrHints []string
+}
+
+// ToolResultFromCLICommand keeps stdout in the first content block and places
+// filtered CLI hints in a separate block for clients that display auxiliary
+// content.
+func ToolResultFromCLICommand(result CLICommandResult) *mcplib.CallToolResult {
+	toolResult := mcplib.NewToolResultText(bound.Text(result.Stdout))
+	if len(result.StderrHints) > 0 {
+		toolResult.Content = append(toolResult.Content, mcplib.NewTextContent(bound.Text(strings.Join(result.StderrHints, "\n"))))
+	}
+	return toolResult
+}
+
 // RunCLICommand executes the companion CLI while preserving stdout as the
-// machine-readable channel. Stderr is included only in error text so post-run
-// telemetry or quota output cannot corrupt JSON results.
-func RunCLICommand(ctx context.Context, binPath string, args []string) (string, error) {
+// machine-readable channel. Hint and warning stderr lines are returned
+// separately on success so they cannot corrupt JSON results.
+func RunCLICommand(ctx context.Context, binPath string, args []string) (CLICommandResult, error) {
 	cmd := exec.CommandContext(ctx, binPath, args...) // #nosec G204 -- trusted companion CLI path, args pre-tokenized.
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+	stdout := newCappedCapture()
+	stderr := newCappedCapture()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	stdoutText := stdout.String()
+	result := CLICommandResult{
+		Stdout:      stdoutText,
+		StderrHints: stderrHintLines(stderr.String()),
+	}
+	if err != nil {
+		stderrText := strings.TrimSpace(stderr.String())
+		msg := stderrText
 		if msg == "" {
-			msg = strings.TrimSpace(stdout.String())
+			msg = strings.TrimSpace(stdoutText)
 		}
 		if msg != "" {
 			label := "stderr"
-			if strings.TrimSpace(stderr.String()) == "" {
+			if stderrText == "" {
 				label = "output"
 			}
-			return stdout.String(), fmt.Errorf("cli %s: %w (%s: %s)", binPath, err, label, msg)
+			return result, fmt.Errorf("cli %s: %w (%s: %s)", binPath, err, label, bound.Text(msg))
 		}
-		return stdout.String(), fmt.Errorf("cli %s: %w", binPath, err)
+		return result, fmt.Errorf("cli %s: %w", binPath, err)
 	}
-	return stdout.String(), nil
+	return result, nil
+}
+
+func stderrHintLines(stderr string) []string {
+	var hints []string
+	for _, rawLine := range strings.Split(stderr, "\n") {
+		for _, segment := range strings.Split(rawLine, "\r") {
+			line := strings.TrimSpace(segment)
+			lower := strings.ToLower(line)
+			if strings.HasPrefix(lower, "hint:") || strings.HasPrefix(lower, "warning:") {
+				hints = append(hints, line)
+			}
+		}
+	}
+	return hints
 }

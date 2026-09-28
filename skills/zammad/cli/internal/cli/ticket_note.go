@@ -67,7 +67,7 @@ func newNovelTicketNoteCmd(flags *rootFlags) *cobra.Command {
 			}
 			data, status, err := c.Post(cmd.Context(), "/ticket_articles", body.toMap())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			if status < 200 || status >= 300 {
 				return fmt.Errorf("POST /ticket_articles returned HTTP %d", status)

@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "zammad-pp-mcp",
   "display_name": "Zammad",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Every Zammad ticket, article, and Knowledge Base operation as one CLI and MCP server  -  plus a team-management layer (agent load, customer health, aging backlog, escalation triage, churn risk, feedback mining) the Zammad API can't answer in a single call.",
   "author": {
     "name": "Servosity Inc."
@@ -17,7 +17,9 @@
       "env": {
         "ZAMMAD_API_TOKEN": "${user_config.zammad_api_token}",
         "ZAMMAD_BASE_URL": "${user_config.zammad_base_url}",
-        "ZAMMAD_URL": "${user_config.zammad_url}"
+        "ZAMMAD_URL": "${user_config.zammad_url}",
+        "ZAMMAD_MCP_HTTP_TOKEN": "${user_config.zammad_mcp_http_token}",
+        "PRINTING_PRESS_CLIENT_PROFILE": "${user_config.printing_press_client_profile}"
       }
     }
   },
@@ -40,6 +42,19 @@
       "title": "Zammad API base URL",
       "description": "Explicit full API base, e.g. https://support.example.com/api/v1. Overrides the instance URL above. Leave blank unless your instance serves the API somewhere non-standard.",
       "required": false
+    },
+    "zammad_mcp_http_token": {
+      "type": "string",
+      "title": "MCP HTTP transport bearer token",
+      "description": "Required only when running the MCP server with --transport http (a remote/hosted deployment). Callers must send a matching Authorization: Bearer header. Not needed for the default local stdio transport that Claude Desktop uses.",
+      "required": false,
+      "sensitive": true
+    },
+    "printing_press_client_profile": {
+      "type": "string",
+      "title": "Client profile",
+      "description": "Binds this MCP server to one tenant-gated client profile, so every call answers for that customer. Leave blank to use the profile configured as default_client_profile.",
+      "required": false
     }
   },
   "compatibility": {
@@ -50,10 +65,10 @@
       "win32"
     ]
   },
-  "printing_press_version": "4.28.0",
+  "printing_press_version": "4.32.5",
   "press_provenance": {
-    "printing_press_version": "4.28.0",
-    "generated_at": "2026-07-11T16:52:58.361606Z",
+    "printing_press_version": "4.32.5",
+    "generated_at": "2026-09-28T17:11:52.557878Z",
     "spec_checksum": "sha256:e521e79949543778dfddb523bbe85f9e2d838763cb46c9f490826adee6802f77",
     "spec_format": "internal"
   }

@@ -3,7 +3,7 @@
 BIN_EXT := $(if $(filter windows,$(shell go env GOOS)),.exe,)
 
 build:
-	go build -o bin/zammad-cli$(BIN_EXT) ./cmd/zammad-cli
+	go build -trimpath -o bin/zammad-cli$(BIN_EXT) ./cmd/zammad-cli
 
 test:
 	go test ./...
@@ -18,7 +18,7 @@ clean:
 	rm -rf bin/
 
 build-mcp:
-	go build -o bin/zammad-mcp$(BIN_EXT) ./cmd/zammad-mcp
+	go build -trimpath -o bin/zammad-mcp$(BIN_EXT) ./cmd/zammad-mcp
 
 install-mcp:
 	go install ./cmd/zammad-mcp

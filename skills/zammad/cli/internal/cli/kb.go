@@ -11,8 +11,7 @@ func newKbCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "kb",
 		Short:       "Knowledge Base categories and answers",
-		Hidden:      true,
-		Annotations: map[string]string{"mcp:read-only": "true", "pp:typed-exit-codes": "0,2"},
+		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:api-resource": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 
@@ -22,8 +21,8 @@ func newKbCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newKbAnswerPublishCmd(flags))
 	cmd.AddCommand(newKbCategoryCreateCmd(flags))
 	cmd.AddCommand(newKbInitCmd(flags))
-	cmd.AddCommand(newNovelKbBrowseCmd(flags))
-	cmd.AddCommand(newNovelKbGetCmd(flags))
-	cmd.AddCommand(newNovelKbSearchCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelKbBrowseCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelKbGetCmd(flags))
+	addNovelCommandIfAbsent(cmd, newNovelKbSearchCmd(flags))
 	return cmd
 }

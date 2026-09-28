@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,12 +16,13 @@ import (
 )
 
 type Config struct {
-	BaseURL            string            `toml:"base_url"`
-	AuthHeaderVal      string            `toml:"auth_header"`
-	Headers            map[string]string `toml:"headers,omitempty"`
-	AuthSource         string            `toml:"-"`
-	CredentialSource   string            `toml:"-"`
-	AgentcookieManaged bool              `toml:"-"`
+	BaseURL            string                      `toml:"base_url"`
+	AuthHeaderVal      string                      `toml:"auth_header"`
+	Headers            map[string]string           `toml:"headers,omitempty"`
+	AuthSource         string                      `toml:"-"`
+	CredentialSource   string                      `toml:"-"`
+	AgentcookieManaged bool                        `toml:"-"`
+	CredentialRefusals []cliutil.CredentialRefusal `toml:"-"`
 	// configOwner records which on-disk file parseConfigData populated this
 	// config from ("config-kind path" or "legacy config path") so the
 	// credential-source fallback below reports where config-stored
@@ -54,8 +56,28 @@ func Load(configPath string) (*Config, error) {
 	cfg.Path = path
 
 	if explicitConfigFile {
-		if err := readConfigFile(path, cfg, "config-kind path"); err != nil && !os.IsNotExist(err) {
-			return nil, err
+		// Keep non-secret settings from a readable config even when its permissions
+		// have drifted, but never trust credentials from that file. Canonicalizing
+		// first also makes a symlink inherit the target's permission verdict.
+		if real, evalErr := filepath.EvalSymlinks(path); evalErr == nil {
+			credentialPermErr := cliutil.VerifyCredsPerms(real)
+			parsed := *cfg
+			if err := readConfigFile(path, &parsed, "config-kind path"); err != nil {
+				if !os.IsNotExist(err) {
+					return nil, err
+				}
+			} else {
+				if credentialPermErr != nil && parsed.hasCredentialFields() {
+					parsed.addCredentialRefusal(cliutil.CredentialRefusal{
+						Source:             "config-kind path",
+						Path:               path,
+						Err:                credentialPermErr,
+						CredentialsPresent: true,
+					})
+					parsed.clearCredentialFields()
+				}
+				*cfg = parsed
+			}
 		}
 	} else {
 		legacyPath, err := LegacyConfigPath()
@@ -67,7 +89,8 @@ func Load(configPath string) (*Config, error) {
 			if !os.IsNotExist(err) {
 				return nil, err
 			}
-		} else {
+		} else if real, evalErr := filepath.EvalSymlinks(sourcePath); evalErr == nil {
+			credentialPermErr := cliutil.VerifyCredsPerms(real)
 			owner := "config-kind path"
 			if sourcePath == legacyPath {
 				owner = "legacy config path"
@@ -80,6 +103,15 @@ func Load(configPath string) (*Config, error) {
 					return nil, err
 				}
 			} else {
+				if credentialPermErr != nil && parsed.hasCredentialFields() {
+					parsed.addCredentialRefusal(cliutil.CredentialRefusal{
+						Source:             owner,
+						Path:               sourcePath,
+						Err:                credentialPermErr,
+						CredentialsPresent: true,
+					})
+					parsed.clearCredentialFields()
+				}
 				*cfg = parsed
 				if sourcePath == legacyPath {
 					cfg.legacySourcePath = legacyPath
@@ -91,16 +123,39 @@ func Load(configPath string) (*Config, error) {
 	if cfg.AgentcookieManagedByExternalStore() {
 		cfg.markAgentcookieManaged()
 	} else {
-		creds, ok, err := cliutil.LoadCredentials()
-		if err != nil {
-			return nil, err
-		}
-		if ok && creds.HasValues() {
-			cfg.clearCredentialFields()
-			cfg.applyCredentials(creds)
-			if cfg.hasCredentialFields() {
-				cfg.AuthSource = "config"
-				cfg.CredentialSource = "credentials file"
+		var creds *cliutil.Credentials
+		var ok bool
+		credentialsRefused := false
+		if !cfg.hasCompleteCredentialFields() {
+			if explicitConfigFile {
+				var status cliutil.CredentialLoadStatus
+				creds, status, err = cliutil.LoadCredentialsForConfigWithStatus(path)
+				if err != nil {
+					return nil, err
+				}
+				ok = status.Loaded
+				if status.Refusal != nil {
+					cfg.addCredentialRefusal(*status.Refusal)
+					credentialsRefused = status.Refusal.CredentialsPresent
+				}
+			}
+			if (!ok || creds == nil || !creds.HasValues()) && !credentialsRefused {
+				var status cliutil.CredentialLoadStatus
+				creds, status, err = cliutil.LoadCredentialsWithStatus()
+				if err != nil {
+					return nil, err
+				}
+				ok = status.Loaded
+				if status.Refusal != nil {
+					cfg.addCredentialRefusal(*status.Refusal)
+				}
+			}
+			if ok && creds.HasValues() {
+				cfg.applyCredentials(creds)
+				if cfg.hasCredentialFields() {
+					cfg.AuthSource = "config"
+					cfg.CredentialSource = "credentials file"
+				}
 			}
 		}
 	}
@@ -108,7 +163,7 @@ func Load(configPath string) (*Config, error) {
 	cfg.snapshotFileConfig()
 
 	// Env var overrides
-	if v := os.Getenv("ZAMMAD_API_TOKEN"); v != "" {
+	if v := cliutil.EnvOverride("ZAMMAD_API_TOKEN"); v != "" {
 		cfg.ZammadApiToken = v
 		cfg.markEnvOverride("ZammadApiToken")
 		cfg.AuthSource = "env:ZAMMAD_API_TOKEN"
@@ -152,20 +207,27 @@ func Load(configPath string) (*Config, error) {
 		}
 	}
 
-	// ZAMMAD_URL is the friendly per-instance override: it takes the instance
-	// ROOT (e.g. https://support.example.com) and appends the /api/v1 base path
-	// if it isn't already present. This matches how Zammad operators think about
-	// their instance and the ZAMMAD_URL convention used across Zammad tooling.
-	if v := strings.TrimSpace(os.Getenv("ZAMMAD_URL")); v != "" {
+	// Hand-wired (handfixes.json: instance-url-env-override). ZAMMAD_URL is the
+	// friendly per-instance override: it takes the instance ROOT (e.g.
+	// https://support.example.com) and appends the /api/v1 base path if it isn't
+	// already present. This matches how Zammad operators think about their
+	// instance and the ZAMMAD_URL convention used across Zammad tooling. Every
+	// install doc, the .mcpb prompt and the MCP Registry entry name it; without
+	// this block the shipped placeholder base_url is the only host the CLI
+	// knows. An unresolved `${user_config...}` placeholder from a bundle install
+	// counts as unset, exactly like the generated ZAMMAD_BASE_URL read below.
+	if v := cliutil.EffectiveEnv(strings.TrimSpace(os.Getenv("ZAMMAD_URL"))); v != "" {
 		v = strings.TrimRight(v, "/")
 		if !strings.HasSuffix(v, "/api/v1") {
 			v += "/api/v1"
 		}
 		cfg.BaseURL = v
 	}
-	// ZAMMAD_BASE_URL is the explicit full API base override (wins over ZAMMAD_URL);
-	// also used by printing-press verify to point at mock/test servers.
-	if v := os.Getenv("ZAMMAD_BASE_URL"); v != "" {
+	// ZAMMAD_BASE_URL is the explicit full API base override (wins over
+	// ZAMMAD_URL); also used by printing-press verify to point at mock/test
+	// servers. Read through os.Getenv so the manifest env-schema gate can see
+	// the name; EffectiveEnv keeps the generator's placeholder handling.
+	if v := cliutil.EffectiveEnv(os.Getenv("ZAMMAD_BASE_URL")); v != "" {
 		cfg.BaseURL = v
 	}
 	return cfg, nil
@@ -216,6 +278,37 @@ func FileHasCredentialFields(path string) (bool, error) {
 	return cfg.hasCredentialFields(), nil
 }
 
+func (c *Config) addCredentialRefusal(refusal cliutil.CredentialRefusal) {
+	if c == nil || !refusal.CredentialsPresent {
+		return
+	}
+	c.CredentialRefusals = append(c.CredentialRefusals, refusal)
+	cliutil.ReportCredentialRefusal(refusal)
+}
+
+func (c *Config) HasCredentialRefusals() bool {
+	return c != nil && len(c.CredentialRefusals) > 0
+}
+
+func (c *Config) CredentialRefusalSummaries() []string {
+	if c == nil || len(c.CredentialRefusals) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.CredentialRefusals))
+	for _, refusal := range c.CredentialRefusals {
+		out = append(out, refusal.Error())
+	}
+	return out
+}
+
+func (c *Config) CredentialRefusalError() error {
+	summaries := c.CredentialRefusalSummaries()
+	if len(summaries) == 0 {
+		return nil
+	}
+	return fmt.Errorf("stored credentials refused: %s", strings.Join(summaries, "; "))
+}
+
 func (c *Config) AuthHeader() string {
 	if c.AuthHeaderVal != "" {
 		return c.AuthHeaderVal
@@ -235,17 +328,67 @@ func (c *Config) AuthHeader() string {
 	return applyAuthFormat("Token token={token}", replacements)
 }
 
+func (c *Config) StoreScopeCredential() string {
+	if c == nil {
+		return ""
+	}
+	if header := c.AuthHeader(); header != "" {
+		return header
+	}
+
+	var parts []string
+	if c.AuthHeaderVal != "" {
+		parts = append(parts, "auth_header="+c.AuthHeaderVal)
+	}
+	if c.RefreshToken != "" {
+		parts = append(parts, "refresh_token="+c.RefreshToken)
+	}
+	if c.AccessToken != "" {
+		parts = append(parts, "access_token="+c.AccessToken)
+	}
+	if c.ClientID != "" {
+		parts = append(parts, "client_id="+c.ClientID)
+	}
+	if c.ClientSecret != "" {
+		parts = append(parts, "client_secret="+c.ClientSecret)
+	}
+	if c.ZammadApiToken != "" {
+		parts = append(parts, "api_token="+c.ZammadApiToken)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n")
+}
+
+// Raw browser-session values count as credentials even when no header
+// representation exists; hand-coded flows may also preserve a working header.
+func (c *Config) CredentialConfigured() bool {
+	if c == nil {
+		return false
+	}
+	return c.AuthHeader() != ""
+}
+
+var authFormatPlaceholderRe = regexp.MustCompile(`\{[A-Za-z0-9_]+\}`)
+
 func applyAuthFormat(format string, replacements map[string]string) string {
 	if format == "" {
 		return ""
 	}
-	for key, value := range replacements {
-		format = strings.ReplaceAll(format, "{"+key+"}", value)
-	}
-	if strings.Contains(format, "{") {
+	unresolved := false
+	out := authFormatPlaceholderRe.ReplaceAllStringFunc(format, func(match string) string {
+		value, ok := replacements[match[1:len(match)-1]]
+		if !ok {
+			unresolved = true
+			return match
+		}
+		return value
+	})
+	if unresolved {
 		return ""
 	}
-	return format
+	return out
 }
 
 func (c *Config) AgentcookieManagedByExternalStore() bool {
@@ -281,6 +424,19 @@ func (c *Config) hasCredentialFields() bool {
 	return false
 }
 
+func (c *Config) hasCompleteCredentialFields() bool {
+	if c.AuthHeaderVal != "" {
+		return true
+	}
+	if c.ZammadApiToken == "" {
+		return false
+	}
+	if c.ZammadApiToken == "" {
+		return false
+	}
+	return true
+}
+
 func (c *Config) clearCredentialFields() {
 	c.AuthHeaderVal = ""
 	c.AccessToken = ""
@@ -307,13 +463,27 @@ func (c *Config) applyCredentials(creds *cliutil.Credentials) {
 	if creds == nil {
 		return
 	}
-	c.AuthHeaderVal = creds.AuthHeaderVal
-	c.AccessToken = creds.AccessToken
-	c.RefreshToken = creds.RefreshToken
-	c.TokenExpiry = creds.TokenExpiry
-	c.ClientID = creds.ClientID
-	c.ClientSecret = creds.ClientSecret
-	c.ZammadApiToken = creds.ZammadApiToken
+	if c.AuthHeaderVal == "" {
+		c.AuthHeaderVal = creds.AuthHeaderVal
+	}
+	if c.AccessToken == "" {
+		c.AccessToken = creds.AccessToken
+	}
+	if c.RefreshToken == "" {
+		c.RefreshToken = creds.RefreshToken
+	}
+	if c.TokenExpiry.IsZero() {
+		c.TokenExpiry = creds.TokenExpiry
+	}
+	if c.ClientID == "" {
+		c.ClientID = creds.ClientID
+	}
+	if c.ClientSecret == "" {
+		c.ClientSecret = creds.ClientSecret
+	}
+	if c.ZammadApiToken == "" {
+		c.ZammadApiToken = creds.ZammadApiToken
+	}
 }
 
 func (c *Config) saveCredentialsFirst() error {
@@ -329,14 +499,130 @@ func (c *Config) saveCredentialsFirst() error {
 	return nil
 }
 
+type credentialsSnapshot struct {
+	path          string
+	data          []byte
+	perm          os.FileMode
+	symlinkTarget string
+	missing       bool
+}
+
+// Credentials and config are separate files. Publishing tokens first would
+// otherwise leave a new credentials.toml if the config write fails.
+func (c *Config) saveCredentialsThenConfig() error {
+	credsPath, err := cliutil.CredentialsFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(credsPath), 0o700); err != nil {
+		return err
+	}
+	return cliutil.WithFileLock(credsPath, func() error {
+		return c.saveCredentialsThenConfigLocked(credsPath)
+	})
+}
+
+func (c *Config) saveCredentialsThenConfigLocked(credsPath string) error {
+	snap, err := snapshotCredentialsFile(credsPath)
+	if err != nil {
+		return err
+	}
+	if err := c.saveCredentialsFirst(); err != nil {
+		return err
+	}
+	if err := c.save(); err != nil {
+		if restoreErr := restoreCredentialsFile(snap); restoreErr != nil {
+			return fmt.Errorf("%w (credentials file %s was replaced; restore failed: %v)", err, credsPath, restoreErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func snapshotCredentialsFile(path string) (credentialsSnapshot, error) {
+	snap := credentialsSnapshot{path: path}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			snap.missing = true
+			return snap, nil
+		}
+		return credentialsSnapshot{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return credentialsSnapshot{}, err
+		}
+		snap.symlinkTarget = target
+	}
+	targetInfo, err := os.Stat(path)
+	if err != nil {
+		return credentialsSnapshot{}, err
+	}
+	snap.perm = targetInfo.Mode().Perm()
+	data, err := os.ReadFile(filepath.Clean(path)) // #nosec G304 -- app-owned credentials path from cliutil.DataDir.
+	if err != nil {
+		return credentialsSnapshot{}, err
+	}
+	snap.data = data
+	return snap, nil
+}
+
+func restoreCredentialsFile(snap credentialsSnapshot) error {
+	if snap.path == "" {
+		return fmt.Errorf("credentials path unknown")
+	}
+	if snap.missing {
+		if err := os.Remove(snap.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if snap.symlinkTarget != "" {
+		if err := os.Remove(snap.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Symlink(snap.symlinkTarget, snap.path); err != nil {
+			return err
+		}
+		if err := os.WriteFile(snap.path, snap.data, 0o600); err != nil {
+			return err
+		}
+		if resolved, err := filepath.EvalSymlinks(snap.path); err == nil && snap.perm != 0 {
+			if err := os.Chmod(resolved, snap.perm); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	mode := snap.perm
+	if mode == 0 {
+		mode = 0o600
+	}
+	if err := cliutil.AtomicWritePrivateFile(snap.path, snap.data, mode, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(snap.path, mode)
+}
+
+// Explicit login flags intentionally opt these fields out of environment-value
+// filtering; capture their provenance before applying any fallback.
+func (c *Config) MarkCredentialsExplicit(clientID, clientSecret bool) {
+	if clientID {
+		delete(c.envOverrides, "ClientID")
+	}
+	if clientSecret {
+		delete(c.envOverrides, "ClientSecret")
+	}
+}
+
 func (c *Config) SaveTokens(clientID, clientSecret, accessToken, refreshToken string, expiry time.Time) error {
 	c.ClientID = clientID
 	c.ClientSecret = clientSecret
 	c.AccessToken = accessToken
 	c.RefreshToken = refreshToken
 	c.TokenExpiry = expiry
-	delete(c.envOverrides, "ClientID")
-	delete(c.envOverrides, "ClientSecret")
 	delete(c.envOverrides, "AccessToken")
 	delete(c.envOverrides, "RefreshToken")
 	delete(c.envOverrides, "TokenExpiry")
@@ -345,10 +631,7 @@ func (c *Config) SaveTokens(clientID, clientSecret, accessToken, refreshToken st
 	c.updateFileConfigField("AccessToken")
 	c.updateFileConfigField("RefreshToken")
 	c.updateFileConfigField("TokenExpiry")
-	if err := c.saveCredentialsFirst(); err != nil {
-		return err
-	}
-	return c.save()
+	return c.saveCredentialsThenConfig()
 }
 
 // SaveCredential persists a single API credential to the field that
@@ -373,10 +656,7 @@ func (c *Config) SaveCredential(token string) error {
 	c.ZammadApiToken = token
 	delete(c.envOverrides, "ZammadApiToken")
 	c.updateFileConfigField("ZammadApiToken")
-	if err := c.saveCredentialsFirst(); err != nil {
-		return err
-	}
-	return c.save()
+	return c.saveCredentialsThenConfig()
 }
 
 func (c *Config) ClearTokens() error {
