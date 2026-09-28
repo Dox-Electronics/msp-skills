@@ -17,74 +17,101 @@ func newCrmPutV4ObjectsObjectTypeObjectIdAssociationsToObjectTypeToObjectIdCreat
 	var stdinBody bool
 
 	cmd := &cobra.Command{
-		Use:   "put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create <objectId> <objectType> <toObjectId> <toObjectType>",
-		Short: "Set association labels between two records.",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  hubspot-cli crm put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create 550e8400-e29b-41d4-a716-446655440000 example-value 550e8400-e29b-41d4-a716-446655440000 example-value",
-		Annotations: map[string]string{"pp:endpoint": "crm.put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create", "pp:method": "PUT", "pp:path": "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}/{toObjectId}"},
+		Use:         "put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create <objectType> <objectId> <toObjectType> <toObjectId>",
+		Short:       "Set association labels between two records.",
+		Annotations: map[string]string{"pp:endpoint": "crm.put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create", "pp:method": "PUT", "pp:path": "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}/{toObjectId}", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help
 			// instead of pflag's terse "required flag not set" error. Optional-
 			// only read commands fall through so a bare call still executes.
-			if cmd.Flags().NFlag() == 0 && len(args) == 0 && !flags.dryRun {
+			// Machine callers (--json/--agent, which sets asJSON) get a usage
+			// error + exit 2 instead of silent exit-0 help, so an incomplete
+			// invocation is never mistaken for success.
+			if !hasChangedLocalFlags(cmd) && len(args) == 0 && !flags.dryRun {
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "requires input",
+						"usage": cmd.CommandPath() + " --help",
+					}, flags); printErr != nil {
+						return printErr
+					}
+					return usageErr(fmt.Errorf("%q requires input; run %q for usage", cmd.CommandPath(), cmd.CommandPath()+" --help"))
+				}
 				return cmd.Help()
 			}
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <objectType> <objectId> <toObjectType> <toObjectId>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <objectType> <objectId> <toObjectType> <toObjectId>"))
 			}
 			if !stdinBody {
-				if !cmd.Flags().Changed("body-json") && !flags.dryRun {
+				if !cmd.Flags().Changed("body-json") && flagBodyJSON == "" && !flags.dryRun {
 					return fmt.Errorf("required flag \"%s\" not set", "body-json")
 				}
 			}
+			path := "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}/{toObjectId}"
+			if len(args) < 2 || args[1] == "" {
+				return usageErr(fmt.Errorf("objectId is required\nUsage: %s <%s>", cmd.CommandPath(), "objectId"))
+			}
+			path = replacePathParam(path, "objectId", args[1])
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("objectType is required\nUsage: %s <%s>", cmd.CommandPath(), "objectType"))
+			}
+			path = replacePathParam(path, "objectType", args[0])
+			if len(args) < 4 || args[3] == "" {
+				return usageErr(fmt.Errorf("toObjectId is required\nUsage: %s <%s>", cmd.CommandPath(), "toObjectId"))
+			}
+			path = replacePathParam(path, "toObjectId", args[3])
+			if len(args) < 3 || args[2] == "" {
+				return usageErr(fmt.Errorf("toObjectType is required\nUsage: %s <%s>", cmd.CommandPath(), "toObjectType"))
+			}
+			path = replacePathParam(path, "toObjectType", args[2])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}/{toObjectId}"
-			path = replacePathParam(path, "objectId", args[0])
-			if len(args) < 2 {
-				return usageErr(fmt.Errorf("objectType is required\nUsage: %s <%s>", cmd.CommandPath(), "objectType"))
-			}
-			path = replacePathParam(path, "objectType", args[1])
-			if len(args) < 3 {
-				return usageErr(fmt.Errorf("toObjectId is required\nUsage: %s <%s>", cmd.CommandPath(), "toObjectId"))
-			}
-			path = replacePathParam(path, "toObjectId", args[2])
-			if len(args) < 4 {
-				return usageErr(fmt.Errorf("toObjectType is required\nUsage: %s <%s>", cmd.CommandPath(), "toObjectType"))
-			}
-			path = replacePathParam(path, "toObjectType", args[3])
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
 					return fmt.Errorf("reading stdin: %w", err)
 				}
-				var jsonBody map[string]any
+				var jsonBody []any
 				if err := json.Unmarshal(stdinData, &jsonBody); err != nil {
 					return fmt.Errorf("parsing stdin JSON: %w", err)
 				}
+				if jsonBody == nil {
+					return fmt.Errorf("parsing stdin JSON: expected JSON array, got null")
+				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
+				body = []any{}
 				if flagBodyJSON != "" {
 					var parsedBodyJSON any
 					if err := json.Unmarshal([]byte(flagBodyJSON), &parsedBodyJSON); err != nil {
 						return fmt.Errorf("parsing --body-json: %w", err)
 					}
-					asMap, ok := parsedBodyJSON.(map[string]any)
+					asArray, ok := parsedBodyJSON.([]any)
 					if !ok {
-						return fmt.Errorf("--body-json must be a JSON object, got JSON %T", parsedBodyJSON)
+						return fmt.Errorf("--body-json must be a JSON array, got JSON %T", parsedBodyJSON)
 					}
-					body = asMap
+					body = asArray
 				}
 			}
 			data, statusCode, err := c.PutWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -149,6 +176,9 @@ func newCrmPutV4ObjectsObjectTypeObjectIdAssociationsToObjectTypeToObjectIdCreat
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -174,51 +204,69 @@ func newCrmPutV4ObjectsObjectTypeObjectIdAssociationsToObjectTypeToObjectIdCreat
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"fromObjectId": true, "fromObjectTypeId": true, "toObjectId": true, "toObjectTypeId": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "crm", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"fromObjectId": true, "fromObjectTypeId": true, "toObjectId": true, "toObjectTypeId": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "crm", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
-	cmd.Flags().StringVar(&flagBodyJSON, "body-json", "", "Provide the full request body as a JSON object string (this endpoint accepts a polymorphic schema: oneOf/anyOf)")
+	cmd.Flags().StringVar(&flagBodyJSON, "body-json", "", "Provide the full request body as a JSON array string (this endpoint accepts a polymorphic schema: oneOf/anyOf)")
 	cmd.Flags().BoolVar(&stdinBody, "stdin", false, "Read request body as JSON from stdin")
 
 	return cmd

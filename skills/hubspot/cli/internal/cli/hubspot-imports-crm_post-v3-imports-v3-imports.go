@@ -21,25 +21,24 @@ func newHubspotImportsCrmPostV3ImportsV3ImportsCmd(flags *rootFlags) *cobra.Comm
 		Example:     "  hubspot-cli hubspot-imports-crm post-v3-imports-v3-imports",
 		Annotations: map[string]string{"pp:endpoint": "hubspot-imports-crm.post-v3-imports-v3-imports", "pp:method": "POST", "pp:path": "/crm/v3/imports"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := "/crm/v3/imports"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/imports"
 			params := map[string]string{}
 			fields := map[string]string{}
 			fileFields := map[string]string{}
-			if bodyFiles != "" {
+			if cmd.Flags().Changed("files") || bodyFiles != "" {
 				fileFields["files"] = bodyFiles
 			}
-			if bodyImportRequest != "" {
+			if cmd.Flags().Changed("import-request") || bodyImportRequest != "" {
 				fields["importRequest"] = bodyImportRequest
 			}
 
 			data, statusCode, err := c.PostMultipartWithParams(cmd.Context(), path, params, fields, fileFields)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -104,6 +103,9 @@ func newHubspotImportsCrmPostV3ImportsV3ImportsCmd(flags *rootFlags) *cobra.Comm
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -129,48 +131,66 @@ func newHubspotImportsCrmPostV3ImportsV3ImportsCmd(flags *rootFlags) *cobra.Comm
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"createdAt": true, "id": true, "importName": true, "state": true, "updatedAt": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-imports-crm", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"createdAt": true, "id": true, "importName": true, "state": true, "updatedAt": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-imports-crm", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyFiles, "files", "", "Files")

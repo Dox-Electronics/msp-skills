@@ -3,14 +3,15 @@
 
 // Package mcp — code-orchestration thin surface.
 //
-// Two tools cover the entire API: <api>_search to discover endpoints, and
-// <api>_execute to invoke one. This collapses a large API (50+ endpoints)
+// Three tools cover the entire API: <api>_search to discover endpoints,
+// <api>_get to inspect one GET endpoint, and <api>_execute to invoke one.
+// This collapses a large API (50+ endpoints)
 // to ~1K tokens of tool definitions while preserving full coverage — the
 // agent writes the composition logic in its own sandbox.
 //
 // Pattern source: Anthropic 2026-04-22 "Building agents that reach
 // production systems with MCP" — Cloudflare's MCP server covers ~2,500
-// endpoints in roughly 1K tokens via the same search+execute shape.
+// endpoints in roughly 1K tokens via the same search, get, and execute shape.
 
 package mcp
 
@@ -24,19 +25,35 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"hubspot-pp-cli/internal/cli"
+	"hubspot-pp-cli/internal/mcp/bound"
 )
 
-// RegisterCodeOrchestrationTools registers the two agent-facing tools that
-// cover the whole API surface. Called from RegisterTools in place of the
-// per-endpoint registrations when MCP.Orchestration is "code".
+// RegisterCodeOrchestrationTools registers the agent-facing tools that cover
+// the whole API surface. Called from RegisterTools in place of the per-endpoint
+// registrations when MCP.Orchestration is "code".
 func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("hubspot_search",
 			mcplib.WithDescription("Search the hubspot API for endpoints matching a natural-language query. Returns a ranked list of {endpoint_id, method, path, summary} entries. Call this first to find the endpoint to execute."),
 			mcplib.WithString("query", mcplib.Required(), mcplib.Description("Natural-language description of what you want to do.")),
-			mcplib.WithNumber("limit", mcplib.Description("Max endpoints to return (default 10).")),
+			mcplib.WithNumber("limit", mcplib.Description("Max endpoints to return (default 10, max 100).")),
+			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithDestructiveHintAnnotation(false),
+			mcplib.WithOpenWorldHintAnnotation(false),
 		),
 		handleCodeOrchSearch,
+	)
+
+	s.AddTool(
+		mcplib.NewTool("hubspot_get",
+			mcplib.WithDescription("Get metadata for one GET endpoint by its endpoint_id (from hubspot_search). This registry-only lookup never calls the API."),
+			mcplib.WithString("endpoint_id", mcplib.Required(), mcplib.Description("GET endpoint identifier returned by hubspot_search (e.g., \"users.list\").")),
+			mcplib.WithReadOnlyHintAnnotation(true),
+			mcplib.WithDestructiveHintAnnotation(false),
+			mcplib.WithOpenWorldHintAnnotation(false),
+		),
+		handleCodeOrchGet,
 	)
 
 	s.AddTool(
@@ -50,7 +67,7 @@ func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 }
 
 // codeOrchEndpoint captures the small slice of endpoint metadata the
-// search+execute pair needs at runtime. `keywords` is a precomputed
+// registry tools need at runtime. `keywords` is a precomputed
 // lowercase stream of description + path tokens used for naive ranking;
 // anything more sophisticated belongs on the agent side.
 type codeOrchEndpoint struct {
@@ -69,6 +86,9 @@ type codeOrchEndpoint struct {
 	// string instead of dumping them into the JSON body. Derived from the
 	// same mcpParamBindings location data the per-endpoint tools use.
 	QueryParams []codeOrchParamBinding
+	// Keep declared headers out of query/body routing so execution sends them
+	// through the request-header map.
+	HeaderParams []codeOrchParamBinding
 	// HeaderOverrides carries per-endpoint request headers (e.g. an
 	// Accept override for binary-only response endpoints). Without
 	// threading these through, the code-orchestration execute path
@@ -80,12 +100,17 @@ type codeOrchEndpoint struct {
 	// params object; a strict-mapping API rejects an object at the body
 	// root with HTTP 422 "Invalid json".
 	BodyIsArray bool
+	Mutating    bool
 	keywords    []string
 }
 
 type codeOrchParamBinding struct {
-	PublicName string
-	WireName   string
+	PublicName   string
+	WireName     string
+	Default      string
+	QueryArray   bool
+	QueryStyle   string
+	QueryExplode bool
 }
 
 // codeOrchEndpoints is the generator-populated registry covering every
@@ -100,6 +125,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("batch", "post-crm-v3-objects-object-type-archive-archive", "Archive a batch of objects by ID", "/crm/v3/objects/{objectType}/batch/archive"),
 	},
 	{
@@ -110,6 +137,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("batch", "post-crm-v3-objects-object-type-create-create", "Create a batch of objects", "/crm/v3/objects/{objectType}/batch/create"),
 	},
 	{
@@ -120,6 +149,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("batch", "post-crm-v3-objects-object-type-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/{objectType}/batch/read"),
 	},
 	{
@@ -130,6 +161,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("batch", "post-crm-v3-objects-object-type-update-update", "Update a batch of objects by internal ID, or unique property values", "/crm/v3/objects/{objectType}/batch/update"),
 	},
 	{
@@ -140,6 +173,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("batch", "post-crm-v3-objects-object-type-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/{objectType}/batch/upsert"),
 	},
 	{
@@ -150,6 +185,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectId", "objectType", "toObjectId", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "delete-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-archive", "deletes all associations between two records.", "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}/{toObjectId}"),
 	},
 	{
@@ -159,7 +196,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Retrieve all associations between a specific record and an object type. Limit 500 per call.",
 		Positional:     []string{"objectId", "objectType", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "limit", WireName: "limit"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "get-v4-objects-object-type-object-id-associations-to-object-type-get-page", "Retrieve all associations between a specific record and an object type. Limit 500 per call.", "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}"),
 	},
 	{
@@ -170,6 +209,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"fromObjectType", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "post-v4-associations-from-object-type-to-object-type-batch-archive-archive", "Batch delete associations for objects", "/crm/v4/associations/{fromObjectType}/{toObjectType}/batch/archive"),
 	},
 	{
@@ -180,6 +221,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"fromObjectType", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "post-v4-associations-from-object-type-to-object-type-batch-associate-default-create-default", "Create the default (most generic) association type between two object types", "/crm/v4/associations/{fromObjectType}/{toObjectType}/batch/associate/default"),
 	},
 	{
@@ -190,6 +233,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"fromObjectType", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "post-v4-associations-from-object-type-to-object-type-batch-create-create", "Batch create associations for objects", "/crm/v4/associations/{fromObjectType}/{toObjectType}/batch/create"),
 	},
 	{
@@ -200,6 +245,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"fromObjectType", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "post-v4-associations-from-object-type-to-object-type-batch-labels-archive-archive-labels", "Batch delete specific association labels for objects.", "/crm/v4/associations/{fromObjectType}/{toObjectType}/batch/labels/archive"),
 	},
 	{
@@ -210,6 +257,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"fromObjectType", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "post-v4-associations-from-object-type-to-object-type-batch-read-get-page", "Batch read associations for objects to specific object type.", "/crm/v4/associations/{fromObjectType}/{toObjectType}/batch/read"),
 	},
 	{
@@ -220,6 +269,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"userId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "post-v4-associations-usage-high-usage-report-user-id-request", "Requests a report of all objects in the portal which have a high usage of associations", "/crm/v4/associations/usage/high-usage-report/{userId}"),
 	},
 	{
@@ -230,6 +281,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"fromObjectId", "fromObjectType", "toObjectId", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "put-v4-objects-from-object-type-from-object-id-associations-default-to-object-type-to-object-id-create-default", "Create the default (most generic) association type between two object types", "/crm/v4/objects/{fromObjectType}/{fromObjectId}/associations/default/{toObjectType}/{toObjectId}"),
 	},
 	{
@@ -240,7 +293,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectId", "objectType", "toObjectId", "toObjectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
 		BodyIsArray:    true,
+		Mutating:       false,
 		keywords:       codeOrchKeywords("crm", "put-v4-objects-object-type-object-id-associations-to-object-type-to-object-id-create", "Set association labels between two records.", "/crm/v4/objects/{objectType}/{objectId}/associations/{toObjectType}/{toObjectId}"),
 	},
 	{
@@ -251,6 +306,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"groupName", "objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "delete-crm-v3-properties-object-type-name-archive", "Move a property group identified by {groupName} to the recycling bin.", "/crm/v3/properties/{objectType}/groups/{groupName}"),
 	},
 	{
@@ -261,6 +318,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "locale", WireName: "locale"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "get-crm-v3-properties-object-type-get-all", "Read all existing property groups for the specified object type and HubSpot account.", "/crm/v3/properties/{objectType}/groups"),
 	},
 	{
@@ -271,6 +330,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"groupName", "objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "locale", WireName: "locale"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "get-crm-v3-properties-object-type-name-get-by-name", "Read a property group identified by {groupName}.", "/crm/v3/properties/{objectType}/groups/{groupName}"),
 	},
 	{
@@ -281,6 +342,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"groupName", "objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "patch-crm-v3-properties-object-type-name-update", "Perform a partial update of a property group identified by {groupName}. Provided fields will be overwritten.", "/crm/v3/properties/{objectType}/groups/{groupName}"),
 	},
 	{
@@ -291,6 +354,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("groups", "post-crm-v3-properties-object-type-create", "Create and return a copy of a new property group.", "/crm/v3/properties/{objectType}/groups"),
 	},
 	{
@@ -301,6 +366,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"callId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "delete-v3-objects-calls-call-id-archive", "Move an Object identified by `{callId}` to the recycling bin.", "/crm/v3/objects/calls/{callId}"),
 	},
 	{
@@ -310,7 +377,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{callId}`.",
 		Positional:     []string{"callId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "get-v3-objects-calls-call-id-get-by-id", "Read an Object identified by `{callId}`.", "/crm/v3/objects/calls/{callId}"),
 	},
 	{
@@ -320,7 +389,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of calls. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "get-v3-objects-calls-get-page", "Read a page of calls. Control what is returned via the `properties` query param.", "/crm/v3/objects/calls"),
 	},
 	{
@@ -331,6 +402,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"callId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "patch-v3-objects-calls-call-id-update", "Perform a partial update of an Object identified by `{callId}`or optionally a unique property value as specified by the", "/crm/v3/objects/calls/{callId}"),
 	},
 	{
@@ -341,6 +414,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-batch-archive-archive", "Archive a batch of calls by ID.", "/crm/v3/objects/calls/batch/archive"),
 	},
 	{
@@ -351,6 +426,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-batch-create-create", "Create a batch of calls.", "/crm/v3/objects/calls/batch/create"),
 	},
 	{
@@ -361,6 +438,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-batch-read-read", "Read a batch of calls by internal ID, or unique property values", "/crm/v3/objects/calls/batch/read"),
 	},
 	{
@@ -371,6 +450,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-batch-update-update", "Update a batch of calls by internal ID, or unique property values", "/crm/v3/objects/calls/batch/update"),
 	},
 	{
@@ -381,6 +462,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/calls/batch/upsert"),
 	},
 	{
@@ -391,6 +474,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-create", "Create a call with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/calls"),
 	},
 	{
@@ -401,6 +486,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-calls-crm", "post-v3-objects-calls-search-do-search", "Search for calls by filtering on properties, searching through associations, and sorting results.", "/crm/v3/objects/calls/search"),
 	},
 	{
@@ -411,6 +498,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"companyId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "delete-v3-objects-companies-company-id-archive", "Delete a company by ID. Deleted companies can be restored within 90 days of deletion.", "/crm/v3/objects/companies/{companyId}"),
 	},
 	{
@@ -420,7 +509,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Retrieve a company by its ID (`companyId`) or by a unique property (`idProperty`).",
 		Positional:     []string{"companyId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "get-v3-objects-companies-company-id-get-by-id", "Retrieve a company by its ID (`companyId`) or by a unique property (`idProperty`).", "/crm/v3/objects/companies/{companyId}"),
 	},
 	{
@@ -430,7 +521,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Retrieve all companies, using query parameters to control the information that gets returned.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "get-v3-objects-companies-get-page", "Retrieve all companies, using query parameters to control the information that gets returned.", "/crm/v3/objects/companies"),
 	},
 	{
@@ -441,6 +534,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"companyId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "patch-v3-objects-companies-company-id-update", "Update a company by ID (`companyId`) or unique property value (`idProperty`).", "/crm/v3/objects/companies/{companyId}"),
 	},
 	{
@@ -451,6 +546,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-batch-archive-archive", "Delete a batch of companies by ID. Deleted companies can be restored within 90 days of deletion.", "/crm/v3/objects/companies/batch/archive"),
 	},
 	{
@@ -461,6 +558,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-batch-create-create", "Create a batch of companies.", "/crm/v3/objects/companies/batch/create"),
 	},
 	{
@@ -471,6 +570,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-batch-read-read", "Retrieve a batch of companies by ID (`companyId`) or by a unique property (`idProperty`).", "/crm/v3/objects/companies/batch/read"),
 	},
 	{
@@ -481,6 +582,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-batch-update-update", "Update a batch of companies by ID.", "/crm/v3/objects/companies/batch/update"),
 	},
 	{
@@ -491,6 +594,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-batch-upsert-upsert", "Create or update companies identified by a unique property value as specified by the `idProperty` query parameter.", "/crm/v3/objects/companies/batch/upsert"),
 	},
 	{
@@ -501,6 +606,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-create", "Create a single company. Include a `properties` object to define [property values](https://developers.hubspot.", "/crm/v3/objects/companies"),
 	},
 	{
@@ -511,6 +618,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-merge-merge", "Merge two company records. Learn more about [merging records](https://knowledge.hubspot.com/records/merge-records).", "/crm/v3/objects/companies/merge"),
 	},
 	{
@@ -521,6 +630,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-companies-crm", "post-v3-objects-companies-search-do-search", "Search for companies by filtering on properties, searching through associations, and sorting results.", "/crm/v3/objects/companies/search"),
 	},
 	{
@@ -531,6 +642,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"contactId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "delete-v3-objects-contacts-contact-id", "Move an Object identified by `{contactId}` to the recycling bin.", "/crm/v3/objects/contacts/{contactId}"),
 	},
 	{
@@ -540,7 +653,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of contacts. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "after", WireName: "after"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "archived", WireName: "archived"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "get-v3-objects-contacts", "Read a page of contacts. Control what is returned via the `properties` query param.", "/crm/v3/objects/contacts"),
 	},
 	{
@@ -550,7 +665,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{contactId}`.",
 		Positional:     []string{"contactId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "idProperty", WireName: "idProperty"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "archived", WireName: "archived"}, {PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "get-v3-objects-contacts-contact-id", "Read an Object identified by `{contactId}`.", "/crm/v3/objects/contacts/{contactId}"),
 	},
 	{
@@ -561,6 +678,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"contactId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "patch-v3-objects-contacts-contact-id", "Perform a partial update of an Object identified by `{contactId}`.", "/crm/v3/objects/contacts/{contactId}"),
 	},
 	{
@@ -571,6 +690,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts", "Create a contact with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/contacts"),
 	},
 	{
@@ -581,6 +702,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-batch-archive", "Archive a batch of contacts by ID", "/crm/v3/objects/contacts/batch/archive"),
 	},
 	{
@@ -591,6 +714,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-batch-create", "Create a batch of contacts", "/crm/v3/objects/contacts/batch/create"),
 	},
 	{
@@ -601,6 +726,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-batch-read", "Read a batch of contacts by internal ID, or unique property values", "/crm/v3/objects/contacts/batch/read"),
 	},
 	{
@@ -611,6 +738,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-batch-update", "Update a batch of contacts", "/crm/v3/objects/contacts/batch/update"),
 	},
 	{
@@ -621,6 +750,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-gdpr-delete", "Permanently delete a contact and all associated content to follow GDPR.", "/crm/v3/objects/contacts/gdpr-delete"),
 	},
 	{
@@ -631,6 +762,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-merge", "Merge two contacts with same type", "/crm/v3/objects/contacts/merge"),
 	},
 	{
@@ -641,6 +774,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-contacts-crm", "post-v3-objects-contacts-search", "Post v3 objects contacts search", "/crm/v3/objects/contacts/search"),
 	},
 	{
@@ -651,6 +786,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"dealId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "delete-v3-objects-0-3-deal-id-archive", "Move an Object identified by `{dealId}` to the recycling bin.", "/crm/v3/objects/0-3/{dealId}"),
 	},
 	{
@@ -660,7 +797,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{dealId}`.",
 		Positional:     []string{"dealId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "get-v3-objects-0-3-deal-id-get-by-id", "Read an Object identified by `{dealId}`.", "/crm/v3/objects/0-3/{dealId}"),
 	},
 	{
@@ -670,7 +809,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of deals. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "get-v3-objects-0-3-get-page", "Read a page of deals. Control what is returned via the `properties` query param.", "/crm/v3/objects/0-3"),
 	},
 	{
@@ -681,6 +822,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"dealId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "patch-v3-objects-0-3-deal-id-update", "Perform a partial update of an Object identified by `{dealId}`or optionally a unique property value as specified by the", "/crm/v3/objects/0-3/{dealId}"),
 	},
 	{
@@ -691,6 +834,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-batch-archive-archive", "Archive multiple deals using their IDs.", "/crm/v3/objects/0-3/batch/archive"),
 	},
 	{
@@ -701,6 +846,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-batch-create-create", "Create multiple deals in a single request.", "/crm/v3/objects/0-3/batch/create"),
 	},
 	{
@@ -711,6 +858,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/0-3/batch/read"),
 	},
 	{
@@ -721,6 +870,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-batch-update-update", "Update multiple deals using their internal IDs or unique property values.", "/crm/v3/objects/0-3/batch/update"),
 	},
 	{
@@ -731,6 +882,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/0-3/batch/upsert"),
 	},
 	{
@@ -741,6 +894,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-create", "Create a deal with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/0-3"),
 	},
 	{
@@ -751,6 +906,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-merge-merge", "Combine two deals of the same type into a single deal.", "/crm/v3/objects/0-3/merge"),
 	},
 	{
@@ -761,6 +918,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-deals-crm", "post-v3-objects-0-3-search-do-search", "Search for deals using various filters and criteria to retrieve specific records.", "/crm/v3/objects/0-3/search"),
 	},
 	{
@@ -771,6 +930,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"emailId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "delete-v3-objects-emails-email-id-archive", "Move an Object identified by `{emailId}` to the recycling bin.", "/crm/v3/objects/emails/{emailId}"),
 	},
 	{
@@ -780,7 +941,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{emailId}`.",
 		Positional:     []string{"emailId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "get-v3-objects-emails-email-id-get-by-id", "Read an Object identified by `{emailId}`.", "/crm/v3/objects/emails/{emailId}"),
 	},
 	{
@@ -790,7 +953,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of emails. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "get-v3-objects-emails-get-page", "Read a page of emails. Control what is returned via the `properties` query param.", "/crm/v3/objects/emails"),
 	},
 	{
@@ -801,6 +966,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"emailId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "patch-v3-objects-emails-email-id-update", "Perform a partial update of an Object identified by `{emailId}`or optionally a unique property value as specified by", "/crm/v3/objects/emails/{emailId}"),
 	},
 	{
@@ -811,6 +978,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-batch-archive-archive", "Archive a batch of emails identified by their IDs.", "/crm/v3/objects/emails/batch/archive"),
 	},
 	{
@@ -821,6 +990,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-batch-create-create", "Create a batch of emails with specified properties and return the created objects.", "/crm/v3/objects/emails/batch/create"),
 	},
 	{
@@ -831,6 +1002,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/emails/batch/read"),
 	},
 	{
@@ -841,6 +1014,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-batch-update-update", "Update a batch of emails using their internal IDs or unique property values.", "/crm/v3/objects/emails/batch/update"),
 	},
 	{
@@ -851,6 +1026,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/emails/batch/upsert"),
 	},
 	{
@@ -861,6 +1038,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-create", "Create a email with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/emails"),
 	},
 	{
@@ -871,6 +1050,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-emails-crm", "post-v3-objects-emails-search-do-search", "Perform a search for emails based on the provided query parameters and return matching results.", "/crm/v3/objects/emails/search"),
 	},
 	{
@@ -880,7 +1061,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get v3 imports import id errors v3 imports import id errors",
 		Positional:     []string{"importId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "includeErrorMessage", WireName: "includeErrorMessage"}, {PublicName: "includeRowData", WireName: "includeRowData"}, {PublicName: "limit", WireName: "limit"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "includeErrorMessage", WireName: "includeErrorMessage"}, {PublicName: "includeRowData", WireName: "includeRowData"}, {PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-imports-crm", "get-v3-imports-import-id-errors-v3-imports-import-id-errors", "Get v3 imports import id errors v3 imports import id errors", "/crm/v3/imports/{importId}/errors"),
 	},
 	{
@@ -891,6 +1074,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"importId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-imports-crm", "get-v3-imports-import-id-v3-imports-import-id", "Get v3 imports import id v3 imports import id", "/crm/v3/imports/{importId}"),
 	},
 	{
@@ -900,7 +1085,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get v3 imports v3 imports",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "limit", WireName: "limit"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-imports-crm", "get-v3-imports-v3-imports", "Get v3 imports v3 imports", "/crm/v3/imports"),
 	},
 	{
@@ -911,6 +1098,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"importId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-imports-crm", "post-v3-imports-import-id-cancel-v3-imports-import-id-cancel", "Post v3 imports import id cancel v3 imports import id cancel", "/crm/v3/imports/{importId}/cancel"),
 	},
 	{
@@ -921,6 +1110,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-imports-crm", "post-v3-imports-v3-imports", "Post v3 imports v3 imports", "/crm/v3/imports"),
 	},
 	{
@@ -931,6 +1122,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"leadsId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "delete-v3-objects-leads-leads-id-archive", "Move an Object identified by `{leadsId}` to the recycling bin.", "/crm/v3/objects/leads/{leadsId}"),
 	},
 	{
@@ -940,7 +1133,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of leads. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "get-v3-objects-leads-get-page", "Read a page of leads. Control what is returned via the `properties` query param.", "/crm/v3/objects/leads"),
 	},
 	{
@@ -950,7 +1145,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{leadsId}`.",
 		Positional:     []string{"leadsId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "get-v3-objects-leads-leads-id-get-by-id", "Read an Object identified by `{leadsId}`.", "/crm/v3/objects/leads/{leadsId}"),
 	},
 	{
@@ -961,6 +1158,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"leadsId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "patch-v3-objects-leads-leads-id-update", "Perform a partial update of an Object identified by `{leadsId}`or optionally a unique property value as specified by", "/crm/v3/objects/leads/{leadsId}"),
 	},
 	{
@@ -971,6 +1170,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-batch-archive-archive", "Archive multiple leads by their IDs in a single request, moving them to the recycling bin.", "/crm/v3/objects/leads/batch/archive"),
 	},
 	{
@@ -981,6 +1182,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-batch-create-create", "Create multiple lead records in a single request by providing a batch of lead data.", "/crm/v3/objects/leads/batch/create"),
 	},
 	{
@@ -991,6 +1194,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/leads/batch/read"),
 	},
 	{
@@ -1001,6 +1206,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-batch-update-update", "Update multiple lead records using their internal IDs or unique property values.", "/crm/v3/objects/leads/batch/update"),
 	},
 	{
@@ -1011,6 +1218,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/leads/batch/upsert"),
 	},
 	{
@@ -1021,6 +1230,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-create", "Create a lead with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/leads"),
 	},
 	{
@@ -1031,6 +1242,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-leads-crm", "post-v3-objects-leads-search-do-search", "Perform a search for leads based on the provided filter groups, properties, and sorting options.", "/crm/v3/objects/leads/search"),
 	},
 	{
@@ -1041,6 +1254,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"lineItemId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "delete-v3-objects-line-items-line-item-id-archive", "Move an Object identified by `{lineItemId}` to the recycling bin.", "/crm/v3/objects/line_items/{lineItemId}"),
 	},
 	{
@@ -1050,7 +1265,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of line items. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "get-v3-objects-line-items-get-page", "Read a page of line items. Control what is returned via the `properties` query param.", "/crm/v3/objects/line_items"),
 	},
 	{
@@ -1060,7 +1277,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{lineItemId}`.",
 		Positional:     []string{"lineItemId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "get-v3-objects-line-items-line-item-id-get-by-id", "Read an Object identified by `{lineItemId}`.", "/crm/v3/objects/line_items/{lineItemId}"),
 	},
 	{
@@ -1071,6 +1290,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"lineItemId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "patch-v3-objects-line-items-line-item-id-update", "Perform a partial update of an Object identified by `{lineItemId}`or optionally a unique property value as specified by", "/crm/v3/objects/line_items/{lineItemId}"),
 	},
 	{
@@ -1081,6 +1302,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-batch-archive-archive", "Archive multiple line items simultaneously by specifying their IDs in the request body.", "/crm/v3/objects/line_items/batch/archive"),
 	},
 	{
@@ -1091,6 +1314,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-batch-create-create", "Create multiple line items in a single request by providing the necessary properties and associations for each item.", "/crm/v3/objects/line_items/batch/create"),
 	},
 	{
@@ -1101,6 +1326,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/line_items/batch/read"),
 	},
 	{
@@ -1111,6 +1338,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-batch-update-update", "Update multiple line items using their internal IDs or unique property values.", "/crm/v3/objects/line_items/batch/update"),
 	},
 	{
@@ -1121,6 +1350,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/line_items/batch/upsert"),
 	},
 	{
@@ -1131,6 +1362,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-create", "Create a line item with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/line_items"),
 	},
 	{
@@ -1141,6 +1374,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-line-items-crm", "post-v3-objects-line-items-search-do-search", "Execute a search for line items based on filters, properties, and sorting options provided in the request body.", "/crm/v3/objects/line_items/search"),
 	},
 	{
@@ -1151,6 +1386,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"folderId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "delete-v3-lists-folders-folder-id-v3-lists-folders-folder-id", "Delete v3 lists folders folder id v3 lists folders folder id", "/crm/v3/lists/folders/{folderId}"),
 	},
 	{
@@ -1161,6 +1398,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "delete-v3-lists-list-id-memberships-v3-lists-list-id-memberships", "Delete v3 lists list id memberships v3 lists list id memberships", "/crm/v3/lists/{listId}/memberships"),
 	},
 	{
@@ -1171,6 +1410,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "delete-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion", "Delete v3 lists list id schedule conversion v3 lists list id schedule conversion", "/crm/v3/lists/{listId}/schedule-conversion"),
 	},
 	{
@@ -1181,6 +1422,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "delete-v3-lists-list-id-v3-lists-list-id", "Delete v3 lists list id v3 lists list id", "/crm/v3/lists/{listId}"),
 	},
 	{
@@ -1191,6 +1434,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "folderId", WireName: "folderId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-folders-v3-lists-folders", "Get v3 lists folders v3 lists folders", "/crm/v3/lists/folders"),
 	},
 	{
@@ -1201,6 +1446,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "legacyListId", WireName: "legacyListId"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-idmapping-v3-lists-idmapping", "Get v3 lists idmapping v3 lists idmapping", "/crm/v3/lists/idmapping"),
 	},
 	{
@@ -1210,7 +1457,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get v3 lists list id memberships join order v3 lists list id memberships join order",
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "before", WireName: "before"}, {PublicName: "limit", WireName: "limit"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "before", WireName: "before"}, {PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-list-id-memberships-join-order-v3-lists-list-id-memberships-join-order", "Get v3 lists list id memberships join order v3 lists list id memberships join order", "/crm/v3/lists/{listId}/memberships/join-order"),
 	},
 	{
@@ -1220,7 +1469,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get v3 lists list id memberships v3 lists list id memberships",
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "before", WireName: "before"}, {PublicName: "limit", WireName: "limit"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "before", WireName: "before"}, {PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-list-id-memberships-v3-lists-list-id-memberships", "Get v3 lists list id memberships v3 lists list id memberships", "/crm/v3/lists/{listId}/memberships"),
 	},
 	{
@@ -1231,6 +1482,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion", "Get v3 lists list id schedule conversion v3 lists list id schedule conversion", "/crm/v3/lists/{listId}/schedule-conversion"),
 	},
 	{
@@ -1241,6 +1494,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "endDate", WireName: "endDate"}, {PublicName: "startDate", WireName: "startDate"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-list-id-size-and-edits-history-between-v3-lists-list-id-size-and-edits-history-between", "Get v3 lists list id size and edits history between v3 lists list id size and edits history between", "/crm/v3/lists/{listId}/size-and-edits-history/between"),
 	},
 	{
@@ -1251,6 +1506,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "includeFilters", WireName: "includeFilters"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-list-id-v3-lists-list-id", "Get v3 lists list id v3 lists list id", "/crm/v3/lists/{listId}"),
 	},
 	{
@@ -1261,6 +1518,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listName", "objectTypeId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "includeFilters", WireName: "includeFilters"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-object-type-id-object-type-id-name-list-name-v3-lists-object-type-id-object-type-id-name-list-name", "Retrieve a specific list by its name and object type ID.", "/crm/v3/lists/object-type-id/{objectTypeId}/name/{listName}"),
 	},
 	{
@@ -1271,6 +1530,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectTypeId", "recordId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-records-object-type-id-record-id-memberships-v3-lists-records-object-type-id-record-id-memberships", "Get v3 lists records object type id record id memberships v3 lists records object type id record id memberships", "/crm/v3/lists/records/{objectTypeId}/{recordId}/memberships"),
 	},
 	{
@@ -1280,7 +1541,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get v3 lists v3 lists",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "includeFilters", WireName: "includeFilters"}, {PublicName: "listIds", WireName: "listIds"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "includeFilters", WireName: "includeFilters"}, {PublicName: "listIds", WireName: "listIds", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "get-v3-lists-v3-lists", "Get v3 lists v3 lists", "/crm/v3/lists"),
 	},
 	{
@@ -1291,6 +1554,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "post-v3-lists-folders-v3-lists-folders", "Post v3 lists folders v3 lists folders", "/crm/v3/lists/folders"),
 	},
 	{
@@ -1301,7 +1566,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
 		BodyIsArray:    true,
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "post-v3-lists-idmapping-v3-lists-idmapping", "Post v3 lists idmapping v3 lists idmapping", "/crm/v3/lists/idmapping"),
 	},
 	{
@@ -1312,6 +1579,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "post-v3-lists-records-memberships-batch-read-v3-lists-records-memberships-batch-read", "Post v3 lists records memberships batch read v3 lists records memberships batch read", "/crm/v3/lists/records/memberships/batch/read"),
 	},
 	{
@@ -1322,6 +1591,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "post-v3-lists-search-v3-lists-search", "Post v3 lists search v3 lists search", "/crm/v3/lists/search"),
 	},
 	{
@@ -1332,6 +1603,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "post-v3-lists-v3-lists", "Post v3 lists v3 lists", "/crm/v3/lists"),
 	},
 	{
@@ -1342,6 +1615,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"folderId", "newParentFolderId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-folders-folder-id-move-new-parent-folder-id-v3-lists-folders-folder-id-move-new-parent-folder-id", "Put v3 lists folders folder id move new parent folder id v3 lists folders folder id move new parent folder id", "/crm/v3/lists/folders/{folderId}/move/{newParentFolderId}"),
 	},
 	{
@@ -1352,6 +1627,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"folderId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "newFolderName", WireName: "newFolderName"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-folders-folder-id-rename-v3-lists-folders-folder-id-rename", "Put v3 lists folders folder id rename v3 lists folders folder id rename", "/crm/v3/lists/folders/{folderId}/rename"),
 	},
 	{
@@ -1362,6 +1639,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-folders-move-list-v3-lists-folders-move-list", "Put v3 lists folders move list v3 lists folders move list", "/crm/v3/lists/folders/move-list"),
 	},
 	{
@@ -1372,6 +1651,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-memberships-add-and-remove-v3-lists-list-id-memberships-add-and-remove", "Put v3 lists list id memberships add and remove v3 lists list id memberships add and remove", "/crm/v3/lists/{listId}/memberships/add-and-remove"),
 	},
 	{
@@ -1382,6 +1663,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId", "sourceListId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-memberships-add-from-source-list-id-v3-lists-list-id-memberships-add-from-source-list-id", "Put v3 lists list id memberships add from source list id v3 lists list id memberships add from source list id", "/crm/v3/lists/{listId}/memberships/add-from/{sourceListId}"),
 	},
 	{
@@ -1392,7 +1675,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
 		BodyIsArray:    true,
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-memberships-add-v3-lists-list-id-memberships-add", "Put v3 lists list id memberships add v3 lists list id memberships add", "/crm/v3/lists/{listId}/memberships/add"),
 	},
 	{
@@ -1403,7 +1688,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
 		BodyIsArray:    true,
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-memberships-remove-v3-lists-list-id-memberships-remove", "Put v3 lists list id memberships remove v3 lists list id memberships remove", "/crm/v3/lists/{listId}/memberships/remove"),
 	},
 	{
@@ -1414,6 +1701,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-restore-v3-lists-list-id-restore", "Put v3 lists list id restore v3 lists list id restore", "/crm/v3/lists/{listId}/restore"),
 	},
 	{
@@ -1424,6 +1713,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-schedule-conversion-v3-lists-list-id-schedule-conversion", "Put v3 lists list id schedule conversion v3 lists list id schedule conversion", "/crm/v3/lists/{listId}/schedule-conversion"),
 	},
 	{
@@ -1434,6 +1725,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "enrollObjectsInWorkflows", WireName: "enrollObjectsInWorkflows"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-update-list-filters-v3-lists-list-id-update-list-filters", "Put v3 lists list id update list filters v3 lists list id update list filters", "/crm/v3/lists/{listId}/update-list-filters"),
 	},
 	{
@@ -1444,6 +1737,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"listId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "includeFilters", WireName: "includeFilters"}, {PublicName: "listName", WireName: "listName"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-lists-crm", "put-v3-lists-list-id-update-list-name-v3-lists-list-id-update-list-name", "Put v3 lists list id update list name v3 lists list id update list name", "/crm/v3/lists/{listId}/update-list-name"),
 	},
 	{
@@ -1454,6 +1749,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"meetingId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "delete-v3-objects-meetings-meeting-id-archive", "Move an Object identified by `{meetingId}` to the recycling bin.", "/crm/v3/objects/meetings/{meetingId}"),
 	},
 	{
@@ -1463,7 +1760,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of meetings. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "get-v3-objects-meetings-get-page", "Read a page of meetings. Control what is returned via the `properties` query param.", "/crm/v3/objects/meetings"),
 	},
 	{
@@ -1473,7 +1772,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{meetingId}`.",
 		Positional:     []string{"meetingId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "get-v3-objects-meetings-meeting-id-get-by-id", "Read an Object identified by `{meetingId}`.", "/crm/v3/objects/meetings/{meetingId}"),
 	},
 	{
@@ -1484,6 +1785,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"meetingId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "patch-v3-objects-meetings-meeting-id-update", "Perform a partial update of an Object identified by `{meetingId}`or optionally a unique property value as specified by", "/crm/v3/objects/meetings/{meetingId}"),
 	},
 	{
@@ -1494,6 +1797,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-batch-archive-archive", "Archive a batch of meetings by ID", "/crm/v3/objects/meetings/batch/archive"),
 	},
 	{
@@ -1504,6 +1809,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-batch-create-create", "Create a batch of meetings", "/crm/v3/objects/meetings/batch/create"),
 	},
 	{
@@ -1514,6 +1821,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/meetings/batch/read"),
 	},
 	{
@@ -1524,6 +1833,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-batch-update-update", "Update a batch of meetings by internal ID, or unique property values", "/crm/v3/objects/meetings/batch/update"),
 	},
 	{
@@ -1534,6 +1845,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/meetings/batch/upsert"),
 	},
 	{
@@ -1544,6 +1857,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-create", "Create a meeting with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/meetings"),
 	},
 	{
@@ -1554,6 +1869,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-meetings-crm", "post-v3-objects-meetings-search-do-search", "Post v3 objects meetings search do search", "/crm/v3/objects/meetings/search"),
 	},
 	{
@@ -1564,6 +1881,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"noteId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "delete-v3-objects-notes-note-id-archive", "Move an Object identified by `{noteId}` to the recycling bin.", "/crm/v3/objects/notes/{noteId}"),
 	},
 	{
@@ -1573,7 +1892,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of notes. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "get-v3-objects-notes-get-page", "Read a page of notes. Control what is returned via the `properties` query param.", "/crm/v3/objects/notes"),
 	},
 	{
@@ -1583,7 +1904,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{noteId}`.",
 		Positional:     []string{"noteId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "get-v3-objects-notes-note-id-get-by-id", "Read an Object identified by `{noteId}`.", "/crm/v3/objects/notes/{noteId}"),
 	},
 	{
@@ -1594,6 +1917,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"noteId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "patch-v3-objects-notes-note-id-update", "Perform a partial update of an Object identified by `{noteId}`or optionally a unique property value as specified by the", "/crm/v3/objects/notes/{noteId}"),
 	},
 	{
@@ -1604,6 +1929,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-batch-archive-archive", "Archive multiple notes by their IDs in a single request.", "/crm/v3/objects/notes/batch/archive"),
 	},
 	{
@@ -1614,6 +1941,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-batch-create-create", "Create multiple notes in a single request by providing the necessary properties for each note.", "/crm/v3/objects/notes/batch/create"),
 	},
 	{
@@ -1624,6 +1953,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/notes/batch/read"),
 	},
 	{
@@ -1634,6 +1965,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-batch-update-update", "Update multiple notes using their internal IDs or unique property values.", "/crm/v3/objects/notes/batch/update"),
 	},
 	{
@@ -1644,6 +1977,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/notes/batch/upsert"),
 	},
 	{
@@ -1654,6 +1989,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-create", "Create a note with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/notes"),
 	},
 	{
@@ -1664,6 +2001,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-notes-crm", "post-v3-objects-notes-search-do-search", "Execute a search for notes using filters, sorting options, and other query parameters to refine the results.", "/crm/v3/objects/notes/search"),
 	},
 	{
@@ -1674,6 +2013,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectId", "objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-objects-crm", "delete-v3-objects-object-type-object-id-archive", "Move an Object identified by `{objectId}` to the recycling bin.", "/crm/v3/objects/{objectType}/{objectId}"),
 	},
 	{
@@ -1683,7 +2024,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of objects. Control what is returned via the `properties` query param.",
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-objects-crm", "get-v3-objects-object-type-get-page", "Read a page of objects. Control what is returned via the `properties` query param.", "/crm/v3/objects/{objectType}"),
 	},
 	{
@@ -1693,7 +2036,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{objectId}`.",
 		Positional:     []string{"objectId", "objectType"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-objects-crm", "get-v3-objects-object-type-object-id-get-by-id", "Read an Object identified by `{objectId}`.", "/crm/v3/objects/{objectType}/{objectId}"),
 	},
 	{
@@ -1704,6 +2049,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectId", "objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-objects-crm", "patch-v3-objects-object-type-object-id-update", "Perform a partial update of an Object identified by `{objectId}`or optionally a unique property value as specified by", "/crm/v3/objects/{objectType}/{objectId}"),
 	},
 	{
@@ -1714,6 +2061,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-objects-crm", "post-v3-objects-object-type-create", "Create a CRM object with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/{objectType}"),
 	},
 	{
@@ -1724,6 +2073,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"ownerId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-owners-crm", "get-v3-owners-owner-id-get-by-id", "Retrieve details of a specific owner using either their 'id' or 'userId'.", "/crm/v3/owners/{ownerId}"),
 	},
 	{
@@ -1733,7 +2084,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Get v3 owners v3 owners",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "email", WireName: "email"}, {PublicName: "limit", WireName: "limit"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "email", WireName: "email"}, {PublicName: "limit", WireName: "limit"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-owners-crm", "get-v3-owners-v3-owners", "Get v3 owners v3 owners", "/crm/v3/owners"),
 	},
 	{
@@ -1744,6 +2097,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "validateDealStageUsagesBeforeDelete", WireName: "validateDealStageUsagesBeforeDelete"}, {PublicName: "validateReferencesBeforeDelete", WireName: "validateReferencesBeforeDelete"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "delete-v3-pipelines-object-type-pipeline-id-archive", "Delete a pipeline", "/crm/v3/pipelines/{objectType}/{pipelineId}"),
 	},
 	{
@@ -1754,6 +2109,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId", "stageId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "delete-v3-pipelines-object-type-pipeline-id-stages-stage-id-archive", "Delete a pipeline stage", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages/{stageId}"),
 	},
 	{
@@ -1764,6 +2121,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "get-v3-pipelines-object-type-get-all", "Return all pipelines for the object type specified by `{objectType}`.", "/crm/v3/pipelines/{objectType}"),
 	},
 	{
@@ -1774,6 +2133,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "get-v3-pipelines-object-type-pipeline-id-audit-get-audit", "Return a reverse chronological list of all mutations that have occurred on the pipeline identified by `{pipelineId}`.", "/crm/v3/pipelines/{objectType}/{pipelineId}/audit"),
 	},
 	{
@@ -1784,6 +2145,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "get-v3-pipelines-object-type-pipeline-id-get-by-id", "Return a single pipeline object identified by its unique `{pipelineId}`.", "/crm/v3/pipelines/{objectType}/{pipelineId}"),
 	},
 	{
@@ -1794,6 +2157,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "get-v3-pipelines-object-type-pipeline-id-stages-get-all", "Return all the stages associated with the pipeline identified by `{pipelineId}`.", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages"),
 	},
 	{
@@ -1804,6 +2169,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId", "stageId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "get-v3-pipelines-object-type-pipeline-id-stages-stage-id-audit-get-audit", "Return a reverse chronological list of all mutations that have occurred on the pipeline stage identified by `{stageId}`.", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages/{stageId}/audit"),
 	},
 	{
@@ -1814,6 +2181,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId", "stageId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "get-v3-pipelines-object-type-pipeline-id-stages-stage-id-get-by-id", "Return a pipeline stage by ID", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages/{stageId}"),
 	},
 	{
@@ -1824,6 +2193,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId", "stageId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "patch-v3-pipelines-object-type-pipeline-id-stages-stage-id-update", "Patch v3 pipelines object type pipeline id stages stage id update", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages/{stageId}"),
 	},
 	{
@@ -1834,6 +2205,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "validateDealStageUsagesBeforeDelete", WireName: "validateDealStageUsagesBeforeDelete"}, {PublicName: "validateReferencesBeforeDelete", WireName: "validateReferencesBeforeDelete"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "patch-v3-pipelines-object-type-pipeline-id-update", "Perform a partial update of the pipeline identified by `{pipelineId}`.", "/crm/v3/pipelines/{objectType}/{pipelineId}"),
 	},
 	{
@@ -1844,6 +2217,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "post-v3-pipelines-object-type-create", "Create a new pipeline with the provided property values.", "/crm/v3/pipelines/{objectType}"),
 	},
 	{
@@ -1854,6 +2229,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "post-v3-pipelines-object-type-pipeline-id-stages-create", "Create a pipeline stage", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages"),
 	},
 	{
@@ -1864,6 +2241,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "validateDealStageUsagesBeforeDelete", WireName: "validateDealStageUsagesBeforeDelete"}, {PublicName: "validateReferencesBeforeDelete", WireName: "validateReferencesBeforeDelete"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "put-v3-pipelines-object-type-pipeline-id-replace", "Replace a pipeline", "/crm/v3/pipelines/{objectType}/{pipelineId}"),
 	},
 	{
@@ -1874,6 +2253,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "pipelineId", "stageId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-pipelines-crm", "put-v3-pipelines-object-type-pipeline-id-stages-stage-id-replace", "Replace all the properties of an existing pipeline stage with the values provided.", "/crm/v3/pipelines/{objectType}/{pipelineId}/stages/{stageId}"),
 	},
 	{
@@ -1884,6 +2265,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"productId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "delete-v3-objects-products-product-id-archive", "Move an Object identified by `{productId}` to the recycling bin.", "/crm/v3/objects/products/{productId}"),
 	},
 	{
@@ -1893,7 +2276,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of products. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "get-v3-objects-products-get-page", "Read a page of products. Control what is returned via the `properties` query param.", "/crm/v3/objects/products"),
 	},
 	{
@@ -1903,7 +2288,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{productId}`.",
 		Positional:     []string{"productId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "get-v3-objects-products-product-id-get-by-id", "Read an Object identified by `{productId}`.", "/crm/v3/objects/products/{productId}"),
 	},
 	{
@@ -1914,6 +2301,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"productId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "patch-v3-objects-products-product-id-update", "Perform a partial update of an Object identified by `{productId}`or optionally a unique property value as specified by", "/crm/v3/objects/products/{productId}"),
 	},
 	{
@@ -1924,6 +2313,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-batch-archive-archive", "Archive multiple products at once by providing their IDs.", "/crm/v3/objects/products/batch/archive"),
 	},
 	{
@@ -1934,6 +2325,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-batch-create-create", "Create multiple products in a single request by specifying their properties", "/crm/v3/objects/products/batch/create"),
 	},
 	{
@@ -1944,6 +2337,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/products/batch/read"),
 	},
 	{
@@ -1954,6 +2349,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-batch-update-update", "Update multiple products in a single request using their internal IDs or unique property values.", "/crm/v3/objects/products/batch/update"),
 	},
 	{
@@ -1964,6 +2361,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/products/batch/upsert"),
 	},
 	{
@@ -1974,6 +2373,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-create", "Create a product with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/products"),
 	},
 	{
@@ -1984,6 +2385,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-products-crm", "post-v3-objects-products-search-do-search", "Execute a search for products based on defined filters, properties, and sorting options.", "/crm/v3/objects/products/search"),
 	},
 	{
@@ -1994,6 +2397,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-batch", "post-crm-v3-properties-object-type-archive-archive", "Archive a provided list of properties.", "/crm/v3/properties/{objectType}/batch/archive"),
 	},
 	{
@@ -2004,6 +2409,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-batch", "post-crm-v3-properties-object-type-create-create", "Create a batch of properties using the same rules as when creating an individual property.", "/crm/v3/properties/{objectType}/batch/create"),
 	},
 	{
@@ -2014,6 +2421,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "locale", WireName: "locale"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-batch", "post-crm-v3-properties-object-type-read-read", "Read a provided list of properties.", "/crm/v3/properties/{objectType}/batch/read"),
 	},
 	{
@@ -2024,6 +2433,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "propertyName"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-crm", "delete-v3-properties-object-type-property-name-archive", "Move a property identified by {propertyName} to the recycling bin.", "/crm/v3/properties/{objectType}/{propertyName}"),
 	},
 	{
@@ -2034,6 +2445,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "dataSensitivity", WireName: "dataSensitivity"}, {PublicName: "locale", WireName: "locale"}, {PublicName: "properties", WireName: "properties"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-crm", "get-v3-properties-object-type-get-all", "Read all existing properties for the specified object type and HubSpot account.", "/crm/v3/properties/{objectType}"),
 	},
 	{
@@ -2044,6 +2457,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "propertyName"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "dataSensitivity", WireName: "dataSensitivity"}, {PublicName: "locale", WireName: "locale"}, {PublicName: "properties", WireName: "properties"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-crm", "get-v3-properties-object-type-property-name-get-by-name", "Read a property identified by {propertyName}.", "/crm/v3/properties/{objectType}/{propertyName}"),
 	},
 	{
@@ -2054,6 +2469,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType", "propertyName"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-crm", "patch-v3-properties-object-type-property-name-update", "Perform a partial update of a property identified by { propertyName }. Provided fields will be overwritten.", "/crm/v3/properties/{objectType}/{propertyName}"),
 	},
 	{
@@ -2064,6 +2481,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-properties-crm", "post-v3-properties-object-type-create", "Create and return a copy of a new property for the specified object type.", "/crm/v3/properties/{objectType}"),
 	},
 	{
@@ -2074,6 +2493,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"quoteId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "delete-v3-objects-quotes-quote-id-archive", "Move an Object identified by `{quoteId}` to the recycling bin.", "/crm/v3/objects/quotes/{quoteId}"),
 	},
 	{
@@ -2083,7 +2504,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of quotes. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "get-v3-objects-quotes-get-page", "Read a page of quotes. Control what is returned via the `properties` query param.", "/crm/v3/objects/quotes"),
 	},
 	{
@@ -2093,7 +2516,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{quoteId}`.",
 		Positional:     []string{"quoteId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "get-v3-objects-quotes-quote-id-get-by-id", "Read an Object identified by `{quoteId}`.", "/crm/v3/objects/quotes/{quoteId}"),
 	},
 	{
@@ -2104,6 +2529,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"quoteId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "patch-v3-objects-quotes-quote-id-update", "Perform a partial update of an Object identified by `{quoteId}`or optionally a unique property value as specified by", "/crm/v3/objects/quotes/{quoteId}"),
 	},
 	{
@@ -2114,6 +2541,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-batch-archive-archive", "Archive multiple quotes by their IDs in a single request, effectively moving them to the recycling bin.", "/crm/v3/objects/quotes/batch/archive"),
 	},
 	{
@@ -2124,6 +2553,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-batch-create-create", "Create multiple quotes in a single request by providing a batch of quote objects", "/crm/v3/objects/quotes/batch/create"),
 	},
 	{
@@ -2134,6 +2565,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/quotes/batch/read"),
 	},
 	{
@@ -2144,6 +2577,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-batch-update-update", "Update multiple quotes using their internal IDs or unique property values.", "/crm/v3/objects/quotes/batch/update"),
 	},
 	{
@@ -2154,6 +2589,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/quotes/batch/upsert"),
 	},
 	{
@@ -2164,6 +2601,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-create", "Create a quote with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/quotes"),
 	},
 	{
@@ -2174,6 +2613,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-quotes-crm", "post-v3-objects-quotes-search-do-search", "Execute a search for quotes based on the criteria defined in the request body, such as filters, properties", "/crm/v3/objects/quotes/search"),
 	},
 	{
@@ -2184,6 +2625,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"taskId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "delete-v3-objects-tasks-task-id-archive", "Move an Object identified by `{taskId}` to the recycling bin.", "/crm/v3/objects/tasks/{taskId}"),
 	},
 	{
@@ -2193,7 +2636,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of tasks. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "get-v3-objects-tasks-get-page", "Read a page of tasks. Control what is returned via the `properties` query param.", "/crm/v3/objects/tasks"),
 	},
 	{
@@ -2203,7 +2648,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{taskId}`.",
 		Positional:     []string{"taskId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "get-v3-objects-tasks-task-id-get-by-id", "Read an Object identified by `{taskId}`.", "/crm/v3/objects/tasks/{taskId}"),
 	},
 	{
@@ -2214,6 +2661,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"taskId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "patch-v3-objects-tasks-task-id-update", "Perform a partial update of an Object identified by `{taskId}`or optionally a unique property value as specified by the", "/crm/v3/objects/tasks/{taskId}"),
 	},
 	{
@@ -2224,6 +2673,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-batch-archive-archive", "Archive a batch of tasks by their IDs, moving them to the recycling bin.", "/crm/v3/objects/tasks/batch/archive"),
 	},
 	{
@@ -2234,6 +2685,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-batch-create-create", "Create multiple tasks in a single request by providing a batch of task properties and associations.", "/crm/v3/objects/tasks/batch/create"),
 	},
 	{
@@ -2244,6 +2697,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-batch-read-read", "Retrieve records by record ID or include the `idProperty` parameter to retrieve records by a custom unique value", "/crm/v3/objects/tasks/batch/read"),
 	},
 	{
@@ -2254,6 +2709,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-batch-update-update", "Update multiple tasks in a single request using their internal IDs or unique property values.", "/crm/v3/objects/tasks/batch/update"),
 	},
 	{
@@ -2264,6 +2721,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/tasks/batch/upsert"),
 	},
 	{
@@ -2274,6 +2733,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-create", "Create a task with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/tasks"),
 	},
 	{
@@ -2284,6 +2745,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tasks-crm", "post-v3-objects-tasks-search-do-search", "Execute a search for tasks based on the provided criteria, including filters, properties, and sorting options.", "/crm/v3/objects/tasks/search"),
 	},
 	{
@@ -2294,6 +2757,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"ticketId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "delete-v3-objects-tickets-ticket-id-archive", "Move an Object identified by `{ticketId}` to the recycling bin.", "/crm/v3/objects/tickets/{ticketId}"),
 	},
 	{
@@ -2303,7 +2768,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read a page of tickets. Control what is returned via the `properties` query param.",
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "after", WireName: "after"}, {PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "limit", WireName: "limit"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "get-v3-objects-tickets-get-page", "Read a page of tickets. Control what is returned via the `properties` query param.", "/crm/v3/objects/tickets"),
 	},
 	{
@@ -2313,7 +2780,9 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Summary:        "Read an Object identified by `{ticketId}`.",
 		Positional:     []string{"ticketId"},
 		TemplateParams: []codeOrchParamBinding{},
-		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations"}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties"}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory"}},
+		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}, {PublicName: "associations", WireName: "associations", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "idProperty", WireName: "idProperty"}, {PublicName: "properties", WireName: "properties", QueryArray: true, QueryStyle: "form", QueryExplode: true}, {PublicName: "propertiesWithHistory", WireName: "propertiesWithHistory", QueryArray: true, QueryStyle: "form", QueryExplode: true}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "get-v3-objects-tickets-ticket-id-get-by-id", "Read an Object identified by `{ticketId}`.", "/crm/v3/objects/tickets/{ticketId}"),
 	},
 	{
@@ -2324,6 +2793,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"ticketId"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "idProperty", WireName: "idProperty"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "patch-v3-objects-tickets-ticket-id-update", "Perform a partial update of an Object identified by `{ticketId}`or optionally a unique property value as specified by", "/crm/v3/objects/tickets/{ticketId}"),
 	},
 	{
@@ -2334,6 +2805,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-batch-archive-archive", "Delete a batch of tickets by ID. Deleted tickets can be restored within 90 days of deletion.", "/crm/v3/objects/tickets/batch/archive"),
 	},
 	{
@@ -2344,6 +2817,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-batch-create-create", "Create a batch of tickets.", "/crm/v3/objects/tickets/batch/create"),
 	},
 	{
@@ -2354,6 +2829,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{{PublicName: "archived", WireName: "archived"}},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-batch-read-read", "Retrieve a batch of tickets by ID (`ticketId`) or unique property value (`idProperty`).", "/crm/v3/objects/tickets/batch/read"),
 	},
 	{
@@ -2364,6 +2841,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-batch-update-update", "Update a batch of tickets by ID (`ticketId`) or unique property value (`idProperty`).", "/crm/v3/objects/tickets/batch/update"),
 	},
 	{
@@ -2374,6 +2853,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-batch-upsert-upsert", "Create or update records identified by a unique property value as specified by the `idProperty` query param.", "/crm/v3/objects/tickets/batch/upsert"),
 	},
 	{
@@ -2384,6 +2865,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-create", "Create a ticket with the given properties and return a copy of the object, including the ID.", "/crm/v3/objects/tickets"),
 	},
 	{
@@ -2394,6 +2877,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-merge-merge", "Merge two tickets, combining them into one ticket record.", "/crm/v3/objects/tickets/merge"),
 	},
 	{
@@ -2404,6 +2889,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("hubspot-tickets-crm", "post-v3-objects-tickets-search-do-search", "Search for tickets by filtering on properties, searching through associations, and sorting results.", "/crm/v3/objects/tickets/search"),
 	},
 	{
@@ -2414,6 +2901,8 @@ var codeOrchEndpoints = []codeOrchEndpoint{
 		Positional:     []string{"objectType"},
 		TemplateParams: []codeOrchParamBinding{},
 		QueryParams:    []codeOrchParamBinding{},
+		HeaderParams:   []codeOrchParamBinding{},
+		Mutating:       false,
 		keywords:       codeOrchKeywords("objects_search", "post-crm-v3-objects-object-type-search-do-search", "Post crm v3 objects object type search do search", "/crm/v3/objects/{objectType}/search"),
 	},
 }
@@ -2456,16 +2945,47 @@ func codeOrchKeywords(resource, endpoint, summary, path string) []string {
 	return out
 }
 
+func codeOrchEndpointMetadata(ep *codeOrchEndpoint) map[string]any {
+	out := map[string]any{
+		"endpoint_id": ep.ID,
+		"method":      ep.Method,
+		"path":        ep.Path,
+		"summary":     ep.Summary,
+	}
+	return out
+}
+
+func findCodeOrchEndpoint(id string) *codeOrchEndpoint {
+	for i := range codeOrchEndpoints {
+		if codeOrchEndpoints[i].ID == id {
+			return &codeOrchEndpoints[i]
+		}
+	}
+	return nil
+}
+
+const (
+	codeOrchSearchDefaultLimit = 10
+	codeOrchSearchMaxLimit     = 100
+)
+
+func codeOrchSearchLimit(args map[string]any) int {
+	if v, ok := args["limit"].(float64); ok && v > 0 {
+		if v > float64(codeOrchSearchMaxLimit) {
+			return codeOrchSearchMaxLimit
+		}
+		return int(v)
+	}
+	return codeOrchSearchDefaultLimit
+}
+
 func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
 	query, ok := args["query"].(string)
 	if !ok || strings.TrimSpace(query) == "" {
 		return mcplib.NewToolResultError("query is required"), nil
 	}
-	limit := 10
-	if v, ok := args["limit"].(float64); ok && v > 0 {
-		limit = int(v)
-	}
+	limit := codeOrchSearchLimit(args)
 
 	terms := codeOrchKeywords("", "", query, "")
 	type scored struct {
@@ -2496,16 +3016,35 @@ func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcp
 
 	out := make([]map[string]any, 0, len(results))
 	for _, r := range results {
-		out = append(out, map[string]any{
-			"endpoint_id": r.ep.ID,
-			"method":      r.ep.Method,
-			"path":        r.ep.Path,
-			"summary":     r.ep.Summary,
-			"score":       r.score,
-		})
+		item := codeOrchEndpointMetadata(r.ep)
+		item["score"] = r.score
+		out = append(out, item)
 	}
-	data, _ := json.Marshal(map[string]any{"count": len(out), "results": out})
-	return mcplib.NewToolResultText(string(data)), nil
+	text, err := bound.JSON(map[string]any{"count": len(out), "results": out})
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("encoding search results: %v", err)), nil
+	}
+	return mcplib.NewToolResultText(text), nil
+}
+
+func handleCodeOrchGet(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	args := req.GetArguments()
+	id, ok := args["endpoint_id"].(string)
+	if !ok || id == "" {
+		return mcplib.NewToolResultError("endpoint_id is required (call hubspot_search first)"), nil
+	}
+	ep := findCodeOrchEndpoint(id)
+	if ep == nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("unknown endpoint_id %q — call hubspot_search to discover valid ids", id)), nil
+	}
+	if ep.Method != "GET" {
+		return mcplib.NewToolResultError(fmt.Sprintf("endpoint_id %q is %s, but hubspot_get only permits GET endpoints", id, ep.Method)), nil
+	}
+	text, err := bound.JSON(codeOrchEndpointMetadata(ep))
+	if err != nil {
+		return mcplib.NewToolResultError(fmt.Sprintf("encoding endpoint metadata: %v", err)), nil
+	}
+	return mcplib.NewToolResultText(text), nil
 }
 
 func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -2515,13 +3054,7 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		return mcplib.NewToolResultError("endpoint_id is required (call hubspot_search first)"), nil
 	}
 
-	var ep *codeOrchEndpoint
-	for i := range codeOrchEndpoints {
-		if codeOrchEndpoints[i].ID == id {
-			ep = &codeOrchEndpoints[i]
-			break
-		}
-	}
+	ep := findCodeOrchEndpoint(id)
 	if ep == nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("unknown endpoint_id %q — call hubspot_search to discover valid ids", id)), nil
 	}
@@ -2531,17 +3064,44 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		params = map[string]any{}
 	}
 
-	c, err := newMCPClient()
+	c, platformSession, err := newMCPClient(ctx)
 	if err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
+
+	if platformSession != nil {
+		defer platformSession.ZeroCredentials()
+	}
+	if err := cli.AdoptMCPOutputSemantics(platformSession, params); err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
 
 	path := ep.Path
 	for _, p := range ep.Positional {
-		if v, ok := params[p]; ok {
-			path = strings.ReplaceAll(path, "{"+p+"}", formatMCPParamValue(v))
+		if v, ok := params[p]; ok && strings.Contains(path, "{"+p+"}") {
+			path = strings.ReplaceAll(path, "{"+p+"}", mcpPathValue(v))
 			delete(params, p)
 		}
+	}
+
+	hdrs := make(map[string]string, len(ep.HeaderOverrides)+len(ep.HeaderParams))
+	for k, v := range ep.HeaderOverrides {
+		hdrs[k] = v
+	}
+	for _, binding := range ep.HeaderParams {
+		if binding.Default != "" {
+			hdrs[binding.WireName] = binding.Default
+		}
+		for _, key := range []string{binding.PublicName, binding.WireName} {
+			if v, ok := params[key]; ok {
+				hdrs[binding.WireName] = formatMCPParamValue(v)
+				delete(params, key)
+				break
+			}
+		}
+	}
+	if len(hdrs) == 0 {
+		hdrs = nil
 	}
 
 	// Route params to their runtime slots. GET/DELETE params are query
@@ -2549,6 +3109,7 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	// remaining params used as the request body below.
 	query := map[string]string{}
 	if ep.Method == "GET" || ep.Method == "DELETE" {
+		path = codeOrchSplitQuery(path, ep.QueryParams, params)
 		for k, v := range params {
 			query[codeOrchWireQueryName(ep.QueryParams, k)] = formatMCPParamValue(v)
 		}
@@ -2558,16 +3119,9 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		// PUT /ledger/voucher/{id}) wrongly lands in the JSON body and the
 		// API silently ignores it or rejects the request. The remaining
 		// params stay in the map for codeOrchWriteBody (the JSON body).
-		if enc := codeOrchSplitQuery(ep.QueryParams, params); enc != "" {
-			sep := "?"
-			if strings.Contains(path, "?") {
-				sep = "&"
-			}
-			path += sep + enc
-		}
+		path = codeOrchSplitQuery(path, ep.QueryParams, params)
 	}
 
-	hdrs := ep.HeaderOverrides
 	writeBody := func() any {
 		if ep.BodyIsArray {
 			return codeOrchArrayBody(params)
@@ -2578,9 +3132,17 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	switch ep.Method {
 	case "GET":
 		if len(hdrs) > 0 {
-			data, err = c.GetWithHeaders(ctx, path, query, hdrs)
+			if ep.Mutating {
+				data, err = c.GetMutatingWithHeaders(ctx, path, query, hdrs)
+			} else {
+				data, err = c.GetWithHeaders(ctx, path, query, hdrs)
+			}
 		} else {
-			data, err = c.Get(ctx, path, query)
+			if ep.Mutating {
+				data, err = c.GetMutating(ctx, path, query)
+			} else {
+				data, err = c.Get(ctx, path, query)
+			}
 		}
 	case "DELETE":
 		if len(hdrs) > 0 {
@@ -2615,7 +3177,11 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	if err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
 	}
-	return mcplib.NewToolResultText(string(data)), nil
+	text := bound.EndpointResponse(ep.Method, data)
+	if platformSession != nil {
+		text = bound.WithMetadata(text, platformSession.OutputMetadata())
+	}
+	return mcplib.NewToolResultText(text), nil
 }
 
 // codeOrchWriteBody returns the value handed to the client layer as the
@@ -2650,11 +3216,11 @@ func codeOrchArrayBody(params map[string]any) any {
 }
 
 // codeOrchSplitQuery removes spec-declared in:query params from params and
-// returns them URL-encoded for appending to the request path. The remaining
+// appends them URL-encoded to the request path. The remaining
 // entries stay in the map for codeOrchWriteBody (the JSON body), so a write
 // method's query parameters never get buried in the body. Mutates params by
 // design (deletes the consumed query keys).
-func codeOrchSplitQuery(queryParams []codeOrchParamBinding, params map[string]any) string {
+func codeOrchSplitQuery(path string, queryParams []codeOrchParamBinding, params map[string]any) string {
 	uv := neturl.Values{}
 	for _, q := range queryParams {
 		for _, key := range []string{q.PublicName, q.WireName} {
@@ -2662,13 +3228,24 @@ func codeOrchSplitQuery(queryParams []codeOrchParamBinding, params map[string]an
 				continue
 			}
 			if v, ok := params[key]; ok {
-				uv.Set(q.WireName, formatMCPParamValue(v))
+				if q.QueryArray {
+					path = appendMCPArrayQueryParam(path, q.WireName, v, q.QueryStyle, q.QueryExplode)
+				} else {
+					uv.Set(q.WireName, formatMCPParamValue(v))
+				}
 				delete(params, key)
 				break
 			}
 		}
 	}
-	return uv.Encode()
+	if enc := uv.Encode(); enc != "" {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		path += sep + enc
+	}
+	return path
 }
 
 func codeOrchWireQueryName(queryParams []codeOrchParamBinding, name string) string {

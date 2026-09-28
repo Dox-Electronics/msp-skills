@@ -21,36 +21,48 @@ func newHubspotPipelinesCrmPatchV3PipelinesObjectTypePipelineIdUpdateCmd(flags *
 	var stdinBody bool
 
 	cmd := &cobra.Command{
-		Use:   "patch-v3-pipelines-object-type-pipeline-id-update <objectType> <pipelineId>",
-		Short: "Perform a partial update of the pipeline identified by `{pipelineId}`.",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  hubspot-cli hubspot-pipelines-crm patch-v3-pipelines-object-type-pipeline-id-update example-value 550e8400-e29b-41d4-a716-446655440000",
+		Use:         "patch-v3-pipelines-object-type-pipeline-id-update <objectType> <pipelineId>",
+		Short:       "Perform a partial update of the pipeline identified by `{pipelineId}`.",
 		Annotations: map[string]string{"pp:endpoint": "hubspot-pipelines-crm.patch-v3-pipelines-object-type-pipeline-id-update", "pp:method": "PATCH", "pp:path": "/crm/v3/pipelines/{objectType}/{pipelineId}"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <objectType> <pipelineId>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <objectType> <pipelineId>"))
 			}
 			if !stdinBody {
 			}
+			path := "/crm/v3/pipelines/{objectType}/{pipelineId}"
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("objectType is required\nUsage: %s <%s>", cmd.CommandPath(), "objectType"))
+			}
+			path = replacePathParam(path, "objectType", args[0])
+			if len(args) < 2 || args[1] == "" {
+				return usageErr(fmt.Errorf("pipelineId is required\nUsage: %s <%s>", cmd.CommandPath(), "pipelineId"))
+			}
+			path = replacePathParam(path, "pipelineId", args[1])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/crm/v3/pipelines/{objectType}/{pipelineId}"
-			path = replacePathParam(path, "objectType", args[0])
-			if len(args) < 2 {
-				return usageErr(fmt.Errorf("pipelineId is required\nUsage: %s <%s>", cmd.CommandPath(), "pipelineId"))
-			}
-			path = replacePathParam(path, "pipelineId", args[1])
 			params := map[string]string{}
-			if flagValidateDealStageUsagesBeforeDelete != false {
+			if cmd.Flags().Changed("validate-deal-stage-usages-before-delete") || flagValidateDealStageUsagesBeforeDelete != false {
 				params["validateDealStageUsagesBeforeDelete"] = formatCLIParamValue(flagValidateDealStageUsagesBeforeDelete)
 			}
-			if flagValidateReferencesBeforeDelete != false {
+			if cmd.Flags().Changed("validate-references-before-delete") || flagValidateReferencesBeforeDelete != false {
 				params["validateReferencesBeforeDelete"] = formatCLIParamValue(flagValidateReferencesBeforeDelete)
 			}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -62,20 +74,21 @@ func newHubspotPipelinesCrmPatchV3PipelinesObjectTypePipelineIdUpdateCmd(flags *
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
+				bodyMap := map[string]any{}
+				body = bodyMap
 				if cmd.Flags().Changed("archived") {
-					body["archived"] = bodyArchived
+					bodyMap["archived"] = bodyArchived
 				}
-				if bodyDisplayOrder != 0 {
-					body["displayOrder"] = bodyDisplayOrder
+				if cmd.Flags().Changed("display-order") || bodyDisplayOrder != 0 {
+					bodyMap["displayOrder"] = bodyDisplayOrder
 				}
-				if bodyLabel != "" {
-					body["label"] = bodyLabel
+				if cmd.Flags().Changed("label") || bodyLabel != "" {
+					bodyMap["label"] = bodyLabel
 				}
 			}
 			data, statusCode, err := c.PatchWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -140,6 +153,9 @@ func newHubspotPipelinesCrmPatchV3PipelinesObjectTypePipelineIdUpdateCmd(flags *
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -165,48 +181,66 @@ func newHubspotPipelinesCrmPatchV3PipelinesObjectTypePipelineIdUpdateCmd(flags *
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"archivedAt": true, "createdAt": true, "id": true, "updatedAt": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-pipelines-crm", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"archivedAt": true, "createdAt": true, "id": true, "updatedAt": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "hubspot-pipelines-crm", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().BoolVar(&flagValidateDealStageUsagesBeforeDelete, "validate-deal-stage-usages-before-delete", false, "Validate deal stage usages before delete")
