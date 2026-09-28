@@ -52,7 +52,7 @@ Big install base, but an honest heads-up: these are the **remote / enterprise** 
 
 > **Claude Desktop bundle:** the `.mcpb` launches on macOS (Intel and Apple Silicon), Windows x64 and Linux x64. Every tool shells out to the companion `datto-bcdr-cli`. Releases cut from 2026-09-18 on ship that CLI inside the bundle; older bundles contain only the MCP server, so if yours lacks the companion, run the Path A or Path B installer below first (or set `DATTO_BCDR_CLI_PATH` to an existing binary). Details: [#331](https://github.com/Servosity/msp-skills/issues/331).
 
-[**Download Datto BCDR MCP (.mcpb)**](https://github.com/servosity/msp-skills/releases/download/datto-bcdr-v0.1.5/datto-bcdr-mcp.mcpb) - then open **Claude Desktop > Settings > Extensions** and select the file. One click, no JSON, no shell. (Browse every Datto BCDR release on the [releases page](https://github.com/servosity/msp-skills/releases?q=datto-bcdr).)
+[**Download Datto BCDR MCP (.mcpb)**](https://github.com/servosity/msp-skills/releases/download/datto-bcdr-v0.1.6/datto-bcdr-mcp.mcpb) - then open **Claude Desktop > Settings > Extensions** and select the file. One click, no JSON, no shell. (Browse every Datto BCDR release on the [releases page](https://github.com/servosity/msp-skills/releases?q=datto-bcdr).)
 
 Prefer the Claude Code plugin? Add the marketplace once, then install - works immediately, no directory listing required:
 
@@ -224,8 +224,9 @@ Free. Apache-2.0 licensed. You pay only for whichever AI agent you use (Claude, 
 | Tier | Examples | Recommended agent policy |
 | --- | --- | --- |
 | Read | `screenshots`, `stale-backups`, `recoverability`, `client-risk`, `alert-triage`, `storage-runway`, `forgotten-assets`, `agent-versions`, `client-report`, `device`, `agent`, `asset`, `shares`, `alert`, `vm-restore`, `sync`, `search`, `analytics` | Allow |
-| Write (routine) | `import` (POST each record to the Datto BCDR API) | Preview with `--dry-run`, then a reviewed write |
-| Credential / config | `auth set-token`, `auth logout` (replace or clear stored credentials) | Human-in-the-loop only |
+| Write (routine) | (none - the Datto BCDR API exposes no write endpoints) | n/a |
+| Local state | `sync`, `export` (GET from Datto, write the SQLite mirror or a local file), `teach*`, `learnings`, `playbook amend`, `profile`, `feedback` (local learning store and settings; never contact Datto) | Allow |
+| Credential / config | `auth set-credentials`, `auth logout` (replace or clear stored credentials) | Human-in-the-loop only |
 
 The strongest control is the **scope you grant the Datto BCDR credentials** - the CLI can only do what the credentials are permitted to do. Full details, including how to lock it down, are in [governance.md](./governance.md).
 

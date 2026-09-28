@@ -27,11 +27,22 @@ func newAccountsSignalsGetV1AccountsAccountIdCmd(flags *rootFlags) *cobra.Comman
 		Use:         "get-v1-accounts-account-id <account_id>",
 		Aliases:     []string{"get"},
 		Short:       "Shows details of Signals belonging to the account associated with your API credentials.",
-		Example:     "  huntress-cli accounts signals get-v1-accounts-account-id 550e8400-e29b-41d4-a716-446655440000",
 		Annotations: map[string]string{"pp:endpoint": "signals.get-v1-accounts-account-id", "pp:method": "GET", "pp:path": "/v1/accounts/{account_id}/signals", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <account_id>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <account_id>"))
 			}
 			if cmd.Flags().Changed("entity-type") {
 				allowedEntityType := []string{"user_entity", "source", "mailbox", "service_principal", "agent", "identity"}
@@ -46,14 +57,16 @@ func newAccountsSignalsGetV1AccountsAccountIdCmd(flags *rootFlags) *cobra.Comman
 					return fmt.Errorf("invalid value %q for --%s: must be one of %v", flagEntityType, "entity-type", allowedEntityType)
 				}
 			}
+			path := "/v1/accounts/{account_id}/signals"
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("account_id is required\nUsage: %s <%s>", cmd.CommandPath(), "account_id"))
+			}
+			path = replacePathParam(path, "account_id", args[0])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/v1/accounts/{account_id}/signals"
-			path = replacePathParam(path, "account_id", args[0])
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "signals", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "live", "signals", path, retainCLIQueryParams(cmd, map[string]string{
 				"limit":               formatCLIParamValue(flagLimit),
 				"page_token":          formatCLIParamValue(flagPageToken),
 				"investigated_at_min": formatCLIParamValue(flagInvestigatedAtMin),
@@ -63,10 +76,11 @@ func newAccountsSignalsGetV1AccountsAccountIdCmd(flags *rootFlags) *cobra.Comman
 				"organization_id":     formatCLIParamValue(flagOrganizationId),
 				"types":               formatCLIParamValue(flagTypes),
 				"statuses":            formatCLIParamValue(flagStatuses),
-			}, nil, flagAll, "page_token", "page_token", "limit", "nextPageToken", "", cmd.ErrOrStderr())
+			}, map[string][]string{"limit": {"limit"}, "page_token": {"page-token"}, "investigated_at_min": {"investigated-at-min"}, "investigated_at_max": {"investigated-at-max"}, "entity_type": {"entity-type"}, "entity_id": {"entity-id"}, "organization_id": {"organization-id"}, "types": {"types"}, "statuses": {"statuses"}}, "page_token", "page_token"), nil, flagAll, "page_token", "page_token", "limit", 10, "pagination.next_page_token", "", "signals", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -74,7 +88,7 @@ func newAccountsSignalsGetV1AccountsAccountIdCmd(flags *rootFlags) *cobra.Comman
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -83,22 +97,31 @@ func newAccountsSignalsGetV1AccountsAccountIdCmd(flags *rootFlags) *cobra.Comman
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"created_at": true, "id": true, "investigated_at": true, "name": true, "status": true, "type": true, "updated_at": true})
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -108,7 +131,11 @@ func newAccountsSignalsGetV1AccountsAccountIdCmd(flags *rootFlags) *cobra.Comman
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, map[string]bool{"created_at": true, "id": true, "investigated_at": true, "name": true, "status": true, "type": true, "updated_at": true})
 		},
 	}
 	cmd.Flags().IntVar(&flagLimit, "limit", 10, "Max number of resources returned in a paged collection. Defaults to 10, with a minimum of 1 and maximum 500.")

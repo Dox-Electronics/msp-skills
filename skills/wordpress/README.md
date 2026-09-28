@@ -48,7 +48,7 @@ Big install base, but an honest heads-up: these are the **remote / enterprise** 
 
 > **Claude Desktop bundle:** the `.mcpb` launches on macOS (Intel and Apple Silicon), Windows x64 and Linux x64. Every tool shells out to the companion `wordpress-cli`. Releases cut from 2026-09-18 on ship that CLI inside the bundle; older bundles contain only the MCP server, so if yours lacks the companion, run the Path A or Path B installer below first (or set `WORDPRESS_CLI_PATH` to an existing binary). Details: [#331](https://github.com/Servosity/msp-skills/issues/331).
 
-[**Download WordPress MCP (.mcpb)**](https://github.com/servosity/msp-skills/releases/download/wordpress-v0.1.4/wordpress-mcp.mcpb) - then open **Claude Desktop > Settings > Extensions** and select the file. One click, no JSON, no shell. (Browse every WordPress release on the [releases page](https://github.com/servosity/msp-skills/releases?q=wordpress).)
+[**Download WordPress MCP (.mcpb)**](https://github.com/servosity/msp-skills/releases/download/wordpress-v0.1.5/wordpress-mcp.mcpb) - then open **Claude Desktop > Settings > Extensions** and select the file. One click, no JSON, no shell. (Browse every WordPress release on the [releases page](https://github.com/servosity/msp-skills/releases?q=wordpress).)
 
 Prefer the Claude Code plugin? Add the marketplace once, then install - works immediately, no directory listing required:
 
@@ -183,7 +183,7 @@ See [pain-point.md](./pain-point.md) for the longer narrative.
 
 ### Does this work with ChatGPT?
 
-Yes, on **Plus, Pro, Team, Business, Enterprise, and Education** plans (Free tier does not yet expose Developer Mode). ChatGPT connects to **remote** MCP servers over HTTPS, not local stdio binaries. The WordPress MCP server runs locally, but it speaks HTTP natively: start it with `wordpress-mcp --transport http --addr :7777` and put it behind an HTTPS tunnel or your own reverse proxy. No bridge package is involved. Step-by-step in [mcp-install.md](./mcp-install.md).
+Yes, on **Plus, Pro, Team, Business, Enterprise, and Education** plans (Free tier does not yet expose Developer Mode). ChatGPT connects to **remote** MCP servers over HTTPS, not local stdio binaries. The WordPress MCP server runs locally, but it speaks HTTP natively: start it with `WORDPRESS_MCP_HTTP_TOKEN=<token> wordpress-mcp --transport http` (it binds loopback and requires that bearer token) and put it behind an HTTPS tunnel or your own reverse proxy. No bridge package is involved. Step-by-step in [mcp-install.md](./mcp-install.md).
 
 ### Does this work with Codex, Cursor, Windsurf, Cline, Copilot, or Gemini?
 

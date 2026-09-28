@@ -236,19 +236,28 @@ func toFloat(v interface{}) (float64, bool) {
 	return 0, false
 }
 
-func registerTranscendence(cmd *cobra.Command, flags *rootFlags) {
-	cmd.AddCommand(newFleetIncidentsCmd(flags))
-	cmd.AddCommand(newCoverageGapsCmd(flags))
-	cmd.AddCommand(newBlastRadiusCmd(flags))
-	cmd.AddCommand(newTriageAgeCmd(flags))
-	cmd.AddCommand(newBillingReconcileCmd(flags))
-	cmd.AddCommand(newDriftCmd(flags))
-	cmd.AddCommand(newMttrCmd(flags))
-	cmd.AddCommand(newCanaryWatchCmd(flags))
-	cmd.AddCommand(newOrgScorecardCmd(flags))
-	cmd.AddCommand(newStaleAgentsCmd(flags))
-	cmd.AddCommand(newHandoffCmd(flags))
+// Wiring. cli-printing-press 4.32 scaffolds every research.json novel as a
+// separate internal/cli/<novel>.go file whose constructor is named
+// newNovel<Feature>Cmd and registers it from the generated root.go via
+// addNovelCommandIfAbsent. The eleven commands below are implemented in THIS
+// file instead of eleven scaffold files (they share the SQLite helpers above),
+// so each newNovel* constructor the generated root expects is a one-line shim
+// onto the real constructor. That keeps root.go byte-identical to what the
+// press emits: a reprint regenerates root.go untouched, deletes the eleven
+// scaffold files, and this file supplies the symbols.
+func newNovelFleetIncidentsCmd(flags *rootFlags) *cobra.Command { return newFleetIncidentsCmd(flags) }
+func newNovelCoverageGapsCmd(flags *rootFlags) *cobra.Command   { return newCoverageGapsCmd(flags) }
+func newNovelBlastRadiusCmd(flags *rootFlags) *cobra.Command    { return newBlastRadiusCmd(flags) }
+func newNovelTriageAgeCmd(flags *rootFlags) *cobra.Command      { return newTriageAgeCmd(flags) }
+func newNovelBillingReconcileCmd(flags *rootFlags) *cobra.Command {
+	return newBillingReconcileCmd(flags)
 }
+func newNovelDriftCmd(flags *rootFlags) *cobra.Command        { return newDriftCmd(flags) }
+func newNovelMttrCmd(flags *rootFlags) *cobra.Command         { return newMttrCmd(flags) }
+func newNovelCanaryWatchCmd(flags *rootFlags) *cobra.Command  { return newCanaryWatchCmd(flags) }
+func newNovelOrgScorecardCmd(flags *rootFlags) *cobra.Command { return newOrgScorecardCmd(flags) }
+func newNovelStaleAgentsCmd(flags *rootFlags) *cobra.Command  { return newStaleAgentsCmd(flags) }
+func newNovelHandoffCmd(flags *rootFlags) *cobra.Command      { return newHandoffCmd(flags) }
 
 // orgJoin is the standard LEFT JOIN from an aliased incident/agent row to the
 // organization name, matching json organization_id to the org's id.

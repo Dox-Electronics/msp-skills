@@ -35,23 +35,36 @@ func newAccountsUpdateParametersCmd(flags *rootFlags) *cobra.Command {
 		Use:         "update-parameters <account_id>",
 		Aliases:     []string{"update"},
 		Short:       "Updates the details of a specific account.",
-		Example:     "  huntress-cli accounts update-parameters 550e8400-e29b-41d4-a716-446655440000",
 		Annotations: map[string]string{"pp:endpoint": "accounts.update-parameters", "pp:method": "PATCH", "pp:path": "/v1/accounts/{account_id}"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				return cmd.Help()
+				// A missing required positional is a usage error in every output
+				// mode (matches command_promoted.go.tmpl). Machine callers
+				// (--json/--agent) also get a JSON error envelope on stdout;
+				// usageErr sets exit 2.
+				if flags.asJSON {
+					if printErr := printJSONFiltered(cmd.OutOrStdout(), map[string]any{
+						"error": "missing required argument",
+						"usage": fmt.Sprintf("%s%s", cmd.CommandPath(), " <account_id>"),
+					}, flags); printErr != nil {
+						return printErr
+					}
+				}
+				return usageErr(fmt.Errorf("missing required argument\nUsage: %s%s", cmd.CommandPath(), " <account_id>"))
 			}
 			if !stdinBody {
 			}
+			path := "/v1/accounts/{account_id}"
+			if len(args) < 1 || args[0] == "" {
+				return usageErr(fmt.Errorf("account_id is required\nUsage: %s <%s>", cmd.CommandPath(), "account_id"))
+			}
+			path = replacePathParam(path, "account_id", args[0])
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/v1/accounts/{account_id}"
-			path = replacePathParam(path, "account_id", args[0])
 			params := map[string]string{}
-			var body map[string]any
+			var body any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
 				if err != nil {
@@ -63,71 +76,72 @@ func newAccountsUpdateParametersCmd(flags *rootFlags) *cobra.Command {
 				}
 				body = jsonBody
 			} else {
-				body = map[string]any{}
+				bodyMap := map[string]any{}
+				body = bodyMap
 				{
 					nestedBillingAddress := map[string]any{}
-					if bodyBillingAddressCity != "" {
+					if cmd.Flags().Changed("billing-address-city") || bodyBillingAddressCity != "" {
 						nestedBillingAddress["city"] = bodyBillingAddressCity
 					}
-					if bodyBillingAddressCountry != "" {
+					if cmd.Flags().Changed("billing-address-country") || bodyBillingAddressCountry != "" {
 						nestedBillingAddress["country"] = bodyBillingAddressCountry
 					}
-					if bodyBillingAddressLine1 != "" {
+					if cmd.Flags().Changed("billing-address-line1") || bodyBillingAddressLine1 != "" {
 						nestedBillingAddress["line1"] = bodyBillingAddressLine1
 					}
-					if bodyBillingAddressLine2 != "" {
+					if cmd.Flags().Changed("billing-address-line2") || bodyBillingAddressLine2 != "" {
 						nestedBillingAddress["line2"] = bodyBillingAddressLine2
 					}
-					if bodyBillingAddressPostalCode != "" {
+					if cmd.Flags().Changed("billing-address-postal-code") || bodyBillingAddressPostalCode != "" {
 						nestedBillingAddress["postal_code"] = bodyBillingAddressPostalCode
 					}
-					if bodyBillingAddressState != "" {
+					if cmd.Flags().Changed("billing-address-state") || bodyBillingAddressState != "" {
 						nestedBillingAddress["state"] = bodyBillingAddressState
 					}
 					if len(nestedBillingAddress) > 0 {
-						body["billing_address"] = nestedBillingAddress
+						bodyMap["billing_address"] = nestedBillingAddress
 					}
 				}
-				if bodyName != "" {
-					body["name"] = bodyName
+				if cmd.Flags().Changed("name") || bodyName != "" {
+					bodyMap["name"] = bodyName
 				}
-				if bodyPhoneNumber != "" {
-					body["phone_number"] = bodyPhoneNumber
+				if cmd.Flags().Changed("phone-number") || bodyPhoneNumber != "" {
+					bodyMap["phone_number"] = bodyPhoneNumber
 				}
 				{
 					nestedShippingAddress := map[string]any{}
-					if bodyShippingAddressCity != "" {
+					if cmd.Flags().Changed("shipping-address-city") || bodyShippingAddressCity != "" {
 						nestedShippingAddress["city"] = bodyShippingAddressCity
 					}
-					if bodyShippingAddressCountry != "" {
+					if cmd.Flags().Changed("shipping-address-country") || bodyShippingAddressCountry != "" {
 						nestedShippingAddress["country"] = bodyShippingAddressCountry
 					}
-					if bodyShippingAddressLine1 != "" {
+					if cmd.Flags().Changed("shipping-address-line1") || bodyShippingAddressLine1 != "" {
 						nestedShippingAddress["line1"] = bodyShippingAddressLine1
 					}
-					if bodyShippingAddressLine2 != "" {
+					if cmd.Flags().Changed("shipping-address-line2") || bodyShippingAddressLine2 != "" {
 						nestedShippingAddress["line2"] = bodyShippingAddressLine2
 					}
-					if bodyShippingAddressPostalCode != "" {
+					if cmd.Flags().Changed("shipping-address-postal-code") || bodyShippingAddressPostalCode != "" {
 						nestedShippingAddress["postal_code"] = bodyShippingAddressPostalCode
 					}
-					if bodyShippingAddressState != "" {
+					if cmd.Flags().Changed("shipping-address-state") || bodyShippingAddressState != "" {
 						nestedShippingAddress["state"] = bodyShippingAddressState
 					}
 					if len(nestedShippingAddress) > 0 {
-						body["shipping_address"] = nestedShippingAddress
+						bodyMap["shipping_address"] = nestedShippingAddress
 					}
 				}
-				if bodySubdomain != "" {
-					body["subdomain"] = bodySubdomain
+				if cmd.Flags().Changed("subdomain") || bodySubdomain != "" {
+					bodyMap["subdomain"] = bodySubdomain
 				}
-				if bodySupportType != "" {
-					body["support_type"] = bodySupportType
+				if cmd.Flags().Changed("support-type") || bodySupportType != "" {
+					bodyMap["support_type"] = bodySupportType
 				}
 			}
 			data, statusCode, err := c.PatchWithParams(cmd.Context(), path, params, body)
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
 			// Inspect the mutate response body for a partial-failure-shaped
 			// field (e.g. Google Ads `partialFailureError`). Several Google
@@ -192,6 +206,9 @@ func newAccountsUpdateParametersCmd(flags *rootFlags) *cobra.Command {
 					"status":   statusCode,
 					"success":  statusCode >= 200 && statusCode < 300 && (partialFailure == nil || flags.allowPartialFailure),
 				}
+				if flags.agent {
+					envelope["meta"] = map[string]any{"source": "live"}
+				}
 				if partialFailure != nil {
 					envelope["partial_failure"] = partialFailure
 				}
@@ -217,48 +234,66 @@ func newAccountsUpdateParametersCmd(flags *rootFlags) *cobra.Command {
 						}
 					}
 				}
+				// Mutation-riding reads (POST search, RPC-over-POST lists) return
+				// the same single-key collection envelopes as GET reads. Unwrap
+				// before filtering so rows nest once under the result key and
+				// --select filters rows, not envelope keys; plain created-object
+				// responses pass through unwrapSingleKeyArray untouched.
 				// Apply --compact and --select to the API response before wrapping.
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
-				filtered := data
+				var selectErr error
+				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"id": true, "name": true, "status": true})
 				}
 				if len(filtered) > 0 {
 					var parsed any
 					if err := json.Unmarshal(filtered, &parsed); err == nil {
-						envelope["data"] = parsed
+						if flags.agent {
+							envelope["results"] = parsed
+						} else {
+							envelope["data"] = parsed
+						}
 					}
 				}
 				envelopeJSON, err := json.Marshal(envelope)
 				if err != nil {
 					return err
 				}
-				if perr := printOutput(cmd.OutOrStdout(), json.RawMessage(envelopeJSON), true); perr != nil {
+				resultKey := "data"
+				if flags.agent {
+					resultKey = "results"
+				}
+				structured, err := wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)
+				if err != nil {
+					return err
+				}
+				if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil {
 					return perr
 				}
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "accounts", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
-			// raw output. printOutputWithFlags renders the body, then the
-			// typed partial-failure exit fires unless --allow-partial-failure
-			// downgrades it. Without this guard a partial failure would exit
-			// 0 for these output modes — the exact silent-swallow regression
-			// the surrounding patch is preventing for asJSON / piped output.
-			if perr := printOutputWithFlags(cmd.OutOrStdout(), data, flags); perr != nil {
-				return perr
-			}
+			// raw output. printOutputWithFlagsMeta renders the body with live
+			// provenance, then the typed partial-failure exit fires unless
+			// --allow-partial-failure downgrades it. Without this guard a
+			// partial failure would exit 0 for these output modes — the exact
+			// silent-swallow regression the surrounding patch is preventing
+			// for asJSON / piped output.
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, map[string]bool{"id": true, "name": true, "status": true})
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "accounts", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&bodyBillingAddressCity, "billing-address-city", "", "City")

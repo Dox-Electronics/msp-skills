@@ -56,13 +56,12 @@ func newIdentitiesGetV1Cmd(flags *rootFlags) *cobra.Command {
 					return fmt.Errorf("invalid value %q for --%s: must be one of %v", flagRiskLevel, "risk-level", allowedRiskLevel)
 				}
 			}
+			path := "/v1/identities"
 			c, err := flags.newClient()
 			if err != nil {
 				return err
 			}
-
-			path := "/v1/identities"
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "identities", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "identities", path, retainCLIQueryParams(cmd, map[string]string{
 				"limit":           formatCLIParamValue(flagLimit),
 				"page_token":      formatCLIParamValue(flagPageToken),
 				"organization_id": formatCLIParamValue(flagOrganizationId),
@@ -72,10 +71,11 @@ func newIdentitiesGetV1Cmd(flags *rootFlags) *cobra.Command {
 				"external":        formatCLIParamValue(flagExternal),
 				"risk_level":      formatCLIParamValue(flagRiskLevel),
 				"mfa_enabled":     formatCLIParamValue(flagMfaEnabled),
-			}, nil, flagAll, "page_token", "page_token", "limit", "nextPageToken", "", cmd.ErrOrStderr())
+			}, map[string][]string{"limit": {"limit"}, "page_token": {"page-token"}, "organization_id": {"organization-id"}, "tenant_type": {"tenant-type"}, "billable": {"billable"}, "enabled": {"enabled"}, "external": {"external"}, "risk_level": {"risk-level"}, "mfa_enabled": {"mfa-enabled"}}, "page_token", "page_token"), nil, flagAll, "page_token", "page_token", "limit", 10, "pagination.next_page_token", "", "identities", cmd.ErrOrStderr())
 			if err != nil {
-				return classifyAPIError(err, flags)
+				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
+			outputData := collectionItemsForOutput(data, path)
 			// Print provenance to stderr for human-facing output only.
 			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
 			// --select) and piped stdout suppress this line; the JSON envelope
@@ -83,7 +83,7 @@ func newIdentitiesGetV1Cmd(flags *rootFlags) *cobra.Command {
 			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
-				_ = json.Unmarshal(data, &countItems)
+				_ = json.Unmarshal(outputData, &countItems)
 				printProvenance(cmd, len(countItems), prov)
 			}
 			// For JSON output, wrap with provenance envelope before passing through flags.
@@ -92,22 +92,31 @@ func newIdentitiesGetV1Cmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
-					filtered = compactFields(filtered)
+					filtered = compactFields(filtered, map[string]bool{"created_at": true, "email": true, "id": true, "password_last_changed_at": true, "risk_last_updated_at": true, "risk_state": true, "updated_at": true})
 				}
 				wrapped, wrapErr := wrapWithProvenance(filtered, prov)
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				wrapped, wrapErr = wrapPlatformStructuredOutput(wrapped, flags, "results", true)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any
-				if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+				if json.Unmarshal(outputData, &items) == nil && len(items) > 0 {
 					if err := printAutoTable(cmd.OutOrStdout(), items); err != nil {
 						return err
 					}
@@ -117,7 +126,11 @@ func newIdentitiesGetV1Cmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
-			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
+			formatData := data
+			if flags.csv || flags.plain {
+				formatData = outputData
+			}
+			return printOutputWithFlagsMeta(cmd.OutOrStdout(), formatData, flags, map[string]any{"source": "live"}, map[string]bool{"created_at": true, "email": true, "id": true, "password_last_changed_at": true, "risk_last_updated_at": true, "risk_state": true, "updated_at": true})
 		},
 	}
 	cmd.Flags().IntVar(&flagLimit, "limit", 10, "Max number of resources returned in a paged collection. Defaults to 10, with a minimum of 1 and maximum 500.")

@@ -1,6 +1,6 @@
 {
   "name": "wordpress",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Publish and manage WordPress pages, posts, media",
   "author": {
     "name": "Servosity",
@@ -11,6 +11,7 @@
   "license": "Apache-2.0",
   "keywords": [
     "wordpress",
+    "marketing",
     "msp",
     "mcp",
     "claude-code",
