@@ -37,8 +37,9 @@ agent.
   send `Authorization: Bearer <token>`) and binds loopback `127.0.0.1:7777` by default;
   a non-loopback `--addr` needs `--tls-cert` and `--tls-key`. `mcp-install.md` and the
   ChatGPT FAQ now show the working command (the old `--addr :7777` line is refused).
-- **Two new optional install prompts** on every channel (`.mcpb`, MCP Registry,
-  `mcp-install.md`): `WORDPRESS_MCP_HTTP_TOKEN` and `PRINTING_PRESS_CLIENT_PROFILE`.
+- **Three new optional install prompts** on every channel (`.mcpb`, MCP Registry,
+  `mcp-install.md`): `WORDPRESS_MCP_HTTP_TOKEN`, `PRINTING_PRESS_CLIENT_PROFILE` and
+  `WORDPRESS_USER_AGENT` (override the User-Agent some hosts block).
   `WORDPRESS_BASE_URL` and `WORDPRESS_BASIC_AUTH` are unchanged.
 - **Release artifacts:** the `.mcpb` bundle carries the companion `wordpress-cli`, and
   `wordpress-mcp` reports its real version (`0.1.5`) instead of `0.0.0-dev`.
